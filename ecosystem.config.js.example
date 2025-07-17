@@ -1,0 +1,29 @@
+// ecosystem.config.js.example
+// THIS IS A TEMPLATE. DO NOT PUT SECRETS HERE.
+// RENAME THIS FILE to ecosystem.config.js ON YOUR VM and add your keys.
+module.exports = {
+  apps: [
+    {
+      name: 'listener',
+      script: 'bybit_listener.js',
+      watch: false,
+      restart_delay: 5000,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
+    },
+    {
+      name: 'trader',
+      script: 'delta_trader.js',
+      watch: false,
+      restart_delay: 5000,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      // The trader script will read API keys from the environment.
+      // On your VM, you will create a real ecosystem.config.js file
+      // and add the 'env' block with your real keys.
+      env: {
+        "NODE_ENV": "production",
+        "DELTA_API_KEY": "PASTE_YOUR_DELTA_API_KEY_ON_THE_VM",
+        "DELTA_API_SECRET": "PASTE_YOUR_DELTA_API_SECRET_ON_THE_VM"
+      }
+    }
+  ]
+};
