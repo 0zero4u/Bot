@@ -1,105 +1,129 @@
 // bybit_listener.js
-// ROLE: Connects to Bybit's public WebSocket, listens for small price ticks,
-// and forwards them to the delta_trader.js script running on the same machine.
+// Enhanced Bybit WebSocket listener to forward price ticks to the Delta trading bot
 
 const WebSocket = require('ws');
+const winston = require('winston');
+require('dotenv').config();
 
-// --- Global Error Handlers ---
-process.on('uncaughtException', (err, origin) => {
-    console.error(`[Listener] PID: ${process.pid} --- FATAL: UNCAUGHT EXCEPTION`);
-    console.error(err.stack || err);
-    process.exit(1);
+// --- Configuration ---
+const config = {
+  symbol: process.env.BYBIT_SYMBOL || 'BTCUSDT',
+  bybitStreamUrl: process.env.BYBIT_STREAM_URL || 'wss://stream.bybit.com/v5/public/spot',
+  reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
+  internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
+  minimumTickSize: parseFloat(process.env.MINIMUM_TICK_SIZE || '0.1'),
+  logLevel: process.env.LOG_LEVEL || 'info'
+};
+
+// --- Logging Setup ---
+const logger = winston.createLogger({
+  level: config.logLevel,
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.colorize(),
+    winston.format.printf(({ timestamp, level, message }) => `${timestamp} [${level}]: ${message}`)
+  ),
+  transports: [
+    new winston.transports.Console()
+  ]
 });
-process.on('unhandledRejection', (reason, promise) => {
-    console.error(`[Listener] PID: ${process.pid} --- FATAL: UNHANDLED PROMISE REJECTION`);
-    console.error('[Listener] Reason:', reason instanceof Error ? reason.stack : reason);
-    process.exit(1);
-});
 
-// --- Listener Configuration ---
-const SYMBOL = 'BTCUSDT'; // Bybit uses uppercase symbols
-const RECONNECT_INTERVAL_MS = 5000;
-const MINIMUM_TICK_SIZE = 0.1; // Sends a signal for every $0.10 price change
+let internalWsClient = null;
+let bybitWsClient = null;
+let lastSentSpotBidPrice = null;
 
-// --- Connection URLs ---
-// ** MODIFIED: This now points to the trader script on the SAME machine (localhost) **
-const internalReceiverUrl = 'ws://localhost:8082';
-const BYBIT_STREAM_URL = 'wss://stream.bybit.com/v5/public/spot';
-
-// --- State Variables ---
-let internalWsClient, bybitWsClient;
-let last_sent_spot_bid_price = null; // Tracks the last price that triggered a signal
-
-// --- Internal Receiver Connection (to delta_trader.js) ---
 function connectToInternalReceiver() {
-    if (internalWsClient && (internalWsClient.readyState === WebSocket.OPEN || internalWsClient.readyState === WebSocket.CONNECTING)) return;
-    internalWsClient = new WebSocket(internalReceiverUrl);
-    internalWsClient.on('error', (err) => console.error(`[Internal] WebSocket error: ${err.message}`));
-    internalWsClient.on('close', () => {
-        console.error('[Internal] Connection to trader script closed. Reconnecting...');
-        internalWsClient = null;
-        setTimeout(connectToInternalReceiver, RECONNECT_INTERVAL_MS);
-    });
-    internalWsClient.on('open', () => console.log('[Internal] Connection to trader script established.'));
+  if (internalWsClient && (internalWsClient.readyState === WebSocket.OPEN || internalWsClient.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  internalWsClient = new WebSocket(config.internalReceiverUrl);
+
+  internalWsClient.on('open', () => {
+    logger.info('Connected to internal trader WebSocket');
+  });
+
+  internalWsClient.on('close', () => {
+    logger.warn('Internal trader WebSocket closed. Reconnecting...');
+    setTimeout(connectToInternalReceiver, config.reconnectInterval);
+  });
+
+  internalWsClient.on('error', (error) => {
+    logger.error('Internal trader WebSocket error:', error.message);
+  });
 }
 
-// --- Data Forwarding ---
 function sendToInternalClient(payload) {
-    if (internalWsClient && internalWsClient.readyState === WebSocket.OPEN) {
-        try {
-            internalWsClient.send(JSON.stringify(payload));
-        } catch (e) { console.error(`[Internal] Failed to send message to trader: ${e.message}`); }
+  if (internalWsClient && internalWsClient.readyState === WebSocket.OPEN) {
+    try {
+      internalWsClient.send(JSON.stringify(payload));
+    } catch (error) {
+      logger.error('Failed to send message to trader:', error.message);
     }
+  }
 }
 
-// --- Bybit Exchange Connection ---
 function connectToBybit() {
-    bybitWsClient = new WebSocket(BYBIT_STREAM_URL);
-    
-    bybitWsClient.on('open', () => {
-        console.log('[Bybit] Connection established.');
-        last_sent_spot_bid_price = null; // Reset on new connection
-        const subscriptionMessage = { op: "subscribe", args: [`orderbook.1.${SYMBOL}`] };
-        bybitWsClient.send(JSON.stringify(subscriptionMessage));
-        console.log(`[Bybit] Sent subscription for: ${subscriptionMessage.args[0]}`);
-    });
-    
-    bybitWsClient.on('message', (data) => {
-        try {
-            const message = JSON.parse(data.toString());
-            if (message.op === 'ping') {
-                bybitWsClient.send(JSON.stringify({ op: 'pong', req_id: message.req_id }));
-                return;
-            }
-            if (message.topic && message.topic.startsWith('orderbook.1') && message.data) {
-                const topBid = message.data.b && message.data.b[0];
-                if (!topBid) return;
-                const current_spot_bid_price = parseFloat(topBid[0]);
-                if (!current_spot_bid_price) return;
-                if (last_sent_spot_bid_price === null) {
-                    last_sent_spot_bid_price = current_spot_bid_price;
-                    return;
-                }
-                const price_difference = current_spot_bid_price - last_sent_spot_bid_price;
-                if (Math.abs(price_difference) >= MINIMUM_TICK_SIZE) {
-                    const payload = { type: 'S', p: current_spot_bid_price };
-                    sendToInternalClient(payload);
-                    last_sent_spot_bid_price = current_spot_bid_price;
-                }
-            }
-        } catch (e) { console.error(`[Bybit] Error processing message: ${e.message}`); }
-    });
+  bybitWsClient = new WebSocket(config.bybitStreamUrl);
 
-    bybitWsClient.on('error', (err) => console.error('[Bybit] Connection error:', err.message));
-    
-    bybitWsClient.on('close', () => {
-        console.error('[Bybit] Connection closed. Reconnecting...');
-        bybitWsClient = null;
-        setTimeout(connectToBybit, RECONNECT_INTERVAL_MS);
-    });
+  bybitWsClient.on('open', () => {
+    logger.info('Bybit WebSocket connection established');
+    lastSentSpotBidPrice = null;
+
+    const subscriptionMessage = {
+      op: 'subscribe',
+      args: [`orderbook.1.${config.symbol}`]
+    };
+
+    bybitWsClient.send(JSON.stringify(subscriptionMessage));
+    logger.info(`Subscribed to: ${subscriptionMessage.args[0]}`);
+  });
+
+  bybitWsClient.on('message', (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+
+      if (message.op === 'ping') {
+        bybitWsClient.send(JSON.stringify({ op: 'pong', req_id: message.req_id }));
+        return;
+      }
+
+      if (message.topic && message.topic.startsWith('orderbook.1') && message.data) {
+        const topBid = message.data.b && message.data.b[0];
+        if (!topBid) return;
+
+        const currentSpotBidPrice = parseFloat(topBid[0]);
+        if (!currentSpotBidPrice) return;
+
+        if (lastSentSpotBidPrice === null) {
+          lastSentSpotBidPrice = currentSpotBidPrice;
+          return;
+        }
+
+        const priceDifference = currentSpotBidPrice - lastSentSpotBidPrice;
+
+        if (Math.abs(priceDifference) >= config.minimumTickSize) {
+          const payload = { type: 'S', p: currentSpotBidPrice };
+          sendToInternalClient(payload);
+          lastSentSpotBidPrice = currentSpotBidPrice;
+        }
+      }
+    } catch (error) {
+      logger.error('Error processing Bybit message:', error.message);
+    }
+  });
+
+  bybitWsClient.on('error', (error) => {
+    logger.error('Bybit WebSocket error:', error.message);
+  });
+
+  bybitWsClient.on('close', () => {
+    logger.warn('Bybit WebSocket connection closed. Reconnecting...');
+    setTimeout(connectToBybit, config.reconnectInterval);
+  });
 }
 
-// --- Start all connections ---
-console.log(`[Listener] Starting... PID: ${process.pid}`);
+// --- Start Connections ---
+logger.info('Starting Bybit listener');
 connectToInternalReceiver();
 connectToBybit();
