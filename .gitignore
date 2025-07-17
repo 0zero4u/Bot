@@ -1,11 +1,13 @@
 # .gitignore
 
-# Ignore node_modules directory
+# Node.js
 node_modules
+npm-debug.log
 
-# Ignore the actual ecosystem config file that contains secrets
-ecosystem.config.js
+# Environment variables
+.env
 
-# Ignore pm2 logs and process IDs
+# PM2 process files
 *.log
 *.pid
+ecosystem.config.js
