@@ -10,4 +10,3 @@ npm-debug.log
 # PM2 process files
 *.log
 *.pid
-ecosystem.config.js
