@@ -17,7 +17,7 @@ const config = {
   // Trading - CRITICAL: These are for Delta Exchange
   productId: parseInt(process.env.DELTA_PRODUCT_ID),
   productSymbol: process.env.DELTA_PRODUCT_SYMBOL,
-  priceThreshold: parseFloat(process.env.PRICE_THRESHOLD || '40.00'),
+  priceThreshold: parseFloat(process.env.PRICE_THRESHOLD || '20.00'),
   orderSize: parseInt(process.env.ORDER_SIZE || '100'),
 
   // Strategy & Risk Management
