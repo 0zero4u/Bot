@@ -17,11 +17,11 @@ const config = {
   // Trading - CRITICAL: These are for Delta Exchange
   productId: parseInt(process.env.DELTA_PRODUCT_ID),
   productSymbol: process.env.DELTA_PRODUCT_SYMBOL,
-  priceThreshold: parseFloat(process.env.PRICE_THRESHOLD || '20.00'),
-  orderSize: parseInt(process.env.ORDER_SIZE || '100'),
+  priceThreshold: parseFloat(process.env.PRICE_THRESHOLD || '1.00'),
+  orderSize: parseInt(process.env.ORDER_SIZE || '1'),
 
   // Strategy & Risk Management
-  leverage: parseInt(process.env.DELTA_LEVERAGE || '25'),
+  leverage: parseInt(process.env.DELTA_LEVERAGE || '50'),
   orderPlacementStrategy: process.env.ORDER_PLACEMENT_STRATEGY || 'limit_bbo',
   useBracketOrders: process.env.USE_BRACKET_ORDERS === 'true',
   takeProfitOffset: parseFloat(process.env.TAKE_PROFIT_OFFSET || '100.0'),
