@@ -1,7 +1,7 @@
 {
   "name": "bybit-delta-trading-bot",
-  "version": "1.2.1",
-  "description": "An improved trading bot that listens for Bybit price changes to execute orders on Delta Exchange.",
+  "version": "5.0.0",
+  "description": "A state-aware trading bot that uses Bybit signals to execute single, controlled trades on Delta Exchange with a cooldown period.",
   "main": "trader.js",
   "scripts": {
     "start": "pm2 start ecosystem.config.js",
@@ -19,6 +19,7 @@
     "axios": "^1.6.0",
     "dotenv": "^16.3.1",
     "pm2": "^5.4.1",
+    "uuid": "^9.0.1",
     "ws": "^8.18.0",
     "winston": "^3.11.0"
   },
