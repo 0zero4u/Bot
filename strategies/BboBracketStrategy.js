@@ -1,5 +1,5 @@
 // strategies/BboBracketStrategy.js
-// Version 8.1.0 - Added time anchor reset for urgency feature.
+// Version 8.0.1 - Corrected API response handling for bracket orders.
 const { v4: uuidv4 } = require('uuid');
 
 class BboBracketStrategy {
@@ -51,10 +51,7 @@ class BboBracketStrategy {
                 // by the main trader.js 'handleOrderUpdate' function when they arrive.
                 this.bot.registerOrder(response.result, 'main', clientOrderId);
 
-                // Reset price and time anchors for the next trade signal window
                 this.bot.priceAtLastTrade = currentPrice;
-                this.bot.timeOfLastTradePrice = Date.now(); // Reset time anchor
-
                 this.bot.startCooldown();
             } else {
                  throw new Error('API call failed or returned unexpected format: ' + JSON.stringify(response));
