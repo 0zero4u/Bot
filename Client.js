@@ -1,4 +1,4 @@
-// DeltaClient.js
+// Client.js
 const axios = require('axios');
 const crypto = require('crypto');
 
