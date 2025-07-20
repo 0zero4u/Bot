@@ -39,7 +39,7 @@ const config = {
     reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
     urgencyTimeframeMs: parseInt(process.env.URGENCY_TIMEFRAME_MS || '1000'),
     logThrottleIntervalMs: parseInt(process.env.LOG_THROTTLE_INTERVAL_MS || '60000'),
-    heartbeatIntervalMs: parseInt(process.env.HEARTBEAT_INTERVAL_MS || '35000') // 35 seconds as recommended
+    heartbeatIntervalMs: parseInt(process.env.HEARTBEAT_INTERVAL_MS || '30000') // 30 seconds as recommended
 };
 
 // --- Logging Setup ---
