@@ -1,4 +1,5 @@
 // strategies/TimeInForceStrategy.js
+// Version 1.1.0 - Added Price Aggression Offset for Slippage Control
 const { v4: uuidv4 } = require('uuid');
 
 class TimeInForceStrategy {
@@ -17,15 +18,24 @@ class TimeInForceStrategy {
             const clientOrderId = uuidv4();
             const book = side === 'buy' ? this.bot.orderBook.asks : this.bot.orderBook.bids;
             if (!book?.[0]?.[0]) throw new Error(`No L1 data for side '${side}'.`);
-            const limitPrice = parseFloat(book[0][0]);
             
+            const bboPrice = parseFloat(book[0][0]);
+
+            // --- SLIPPAGE CONTROL ---
+            const aggressionOffset = side === 'buy' 
+                ? this.bot.config.priceAggressionOffset 
+                : -this.bot.config.priceAggressionOffset;
+            const aggressiveLimitPrice = bboPrice + aggressionOffset;
+
             const orderData = {
                 product_id: this.bot.config.productId, size: this.bot.config.orderSize, side,
-                order_type: 'limit_order', limit_price: limitPrice.toString(), client_order_id: clientOrderId,
-                time_in_force: this.bot.config.timeInForce, // The key parameter for this strategy
+                order_type: 'limit_order', 
+                limit_price: aggressiveLimitPrice.toString(), // Use the aggressive price
+                client_order_id: clientOrderId,
+                time_in_force: this.bot.config.timeInForce,
             };
             
-            this.logger.info(`[${this.getName()}] Placing order with Time-In-Force: ${this.bot.config.timeInForce}`);
+            this.logger.info(`[${this.getName()}] Applying aggression offset. BBO: ${bboPrice}, Placing aggressive limit order at ${aggressiveLimitPrice.toFixed(4)} with TIF: ${this.bot.config.timeInForce}`);
             const response = await this.bot.placeOrder(orderData);
             
             if (response.success) {
