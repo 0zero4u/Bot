@@ -1,5 +1,5 @@
 // strategies/MomentumRiderStrategy.js
-// Version 1.3.0 - Added breadcrumb logging for deep debugging
+// Version 1.4.0 - Final Production Version with State-Sync Fix
 
 class MomentumRiderStrategy {
     constructor(bot) {
@@ -25,15 +25,27 @@ class MomentumRiderStrategy {
     
     /**
      * Handles order updates from the WebSocket stream to track our position.
+     * This now correctly handles orders that are immediately filled and closed.
      */
     onOrderUpdate(order) {
-        if (order.state === 'filled' && !this.position) {
-            // Our entry order was filled, so we now have a position
+        // A position is entered if our entry order fills. This can happen in two ways:
+        // 1. A resting limit order is partially or fully filled (state: 'filled').
+        // 2. A limit order acts as a taker and is filled and closed instantly (state: 'closed', unfilled_size: 0).
+        const isOrderFilled = order.state === 'filled' || (order.state === 'closed' && order.unfilled_size === 0);
+
+        // Only create the position object if it doesn't already exist and the order was filled.
+        if (isOrderFilled && !this.position) {
+            // Check if the filled order matches the product this bot is trading.
+            if (order.product_id !== this.bot.config.productId) {
+                return;
+            }
+
             this.position = {
                 side: order.side,
-                entryPrice: parseFloat(order.avg_fill_price)
+                entryPrice: parseFloat(order.avg_fill_price),
+                size: parseFloat(order.size)
             };
-            this.logger.info(`[${this.getName()}] POSITION OPENED: Side=${this.position.side}, Entry Price=${this.position.entryPrice}`);
+            this.logger.info(`[${this.getName()}] STRATEGY POSITION CONFIRMED: Side=${this.position.side}, Entry Price=${this.position.entryPrice}`);
         }
     }
 
@@ -46,7 +58,6 @@ class MomentumRiderStrategy {
             
             this.logger.info(`[${this.getName()}] --- STEP 1: Entered the 'tryEnterPosition' block.`);
 
-            // --- SLIPPAGE CONTROL (ENTRY) ---
             const book = side === 'buy' ? this.bot.orderBook.asks : this.bot.orderBook.bids;
             if (!book?.[0]?.[0]) {
                 throw new Error(`No L1 order book data available for entry side '${side}'.`);
@@ -71,16 +82,15 @@ class MomentumRiderStrategy {
 
             if (response && response.result) {
                 this.logger.info(`[${this.getName()}] Entry order placed successfully. Waiting for fill.`);
-                this.bot.priceAtLastTrade = currentPrice; // Update baseline price only on successful placement
+                this.bot.priceAtLastTrade = currentPrice;
             } else {
                 throw new Error(`Exchange rejected order or returned unexpected format: ${JSON.stringify(response)}`);
             }
 
         } catch (error) {
-            this.logger.error(`[${this.getName()}] --- STEP 4 (FAIL): Caught an error in 'tryEnterPosition'.`, { message: error.message, stack: error.stack });
+            this.logger.error(`[${this.getName()}] --- STEP 4 (FAIL): Caught an error in 'tryEnterPosition'.`, { message: error.message });
         } finally {
             this.logger.info(`[${this.getName()}] --- STEP 5: Executing 'finally' block. Resetting flag.`);
-            // This is critical: always reset the flag so the bot can trade again.
             this.bot.isOrderInProgress = false;
         }
     }
@@ -92,7 +102,7 @@ class MomentumRiderStrategy {
         if (!this.position) return;
 
         const pnl = (currentPrice - this.position.entryPrice) * (this.position.side === 'buy' ? 1 : -1);
-        const adverseMovement = -pnl; // PnL is negative when price moves against us
+        const adverseMovement = -pnl;
 
         if (adverseMovement >= this.bot.config.adverseMovementThreshold) {
             this.logger.warn(`[${this.getName()}] ADVERSE MOVEMENT threshold of $${this.bot.config.adverseMovementThreshold} met. Exiting position.`, { currentPrice, adverseMovement });
@@ -104,11 +114,15 @@ class MomentumRiderStrategy {
      * Places a reduce-only order to exit the current position.
      */
     async exitPosition() {
+        if (!this.position) {
+            this.logger.warn(`[${this.getName()}] 'exitPosition' called, but no position exists. Ignoring.`);
+            return;
+        }
+
         const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
         try {
             this.logger.info(`[${this.getName()}] --- EXIT STEP 1: Entered 'exitPosition' block.`);
             
-            // --- SLIPPAGE CONTROL (EXIT) ---
             const book = exitSide === 'buy' ? this.bot.orderBook.asks : this.bot.orderBook.bids;
             if (!book?.[0]?.[0]) {
                 throw new Error(`No L1 order book data available for exit side '${exitSide}'.`);
@@ -135,13 +149,12 @@ class MomentumRiderStrategy {
             if (response && response.result) {
                 this.logger.info(`[${this.getName()}] Exit order placed successfully.`);
                 this.position = null; // Clear position state
-                this.bot.startCooldown(); // Start cooldown after a successful exit
+                this.bot.startCooldown();
             } else {
                 throw new Error(`Exchange rejected exit order: ${JSON.stringify(response)}`);
             }
         } catch (error) {
-            this.logger.error(`[${this.getName()}] --- EXIT STEP 4 (FAIL): Caught an error in 'exitPosition'.`, { message: error.message, stack: error.stack });
-            // If exit fails, we don't clear the position so we can try again.
+            this.logger.error(`[${this.getName()}] --- EXIT STEP 4 (FAIL): Caught an error in 'exitPosition'.`, { message: error.message });
         }
     }
 }
