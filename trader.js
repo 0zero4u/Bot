@@ -34,7 +34,7 @@ const config = {
     reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
     urgencyTimeframeMs: parseInt(process.env.URGENCY_TIMEFRAME_MS || '1000'),
     // NEW: Time in ms to throttle repetitive log messages
-    logThrottleIntervalMs: parseInt(process.env.LOG_THROTTLE_INTERVAL_MS || '60000'),
+    logThrottleIntervalMs: parseInt(process.env.LOG_THROTTLE_INTERVAL_MS || '15000'),
 };
 
 // --- Logging Setup ---
