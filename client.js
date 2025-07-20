@@ -1,12 +1,9 @@
 // client.js
-// Version 1.2.0 - Added getPositions method for startup synchronization
+// Version 1.4.0 - FINAL PRODUCTION VERSION
 
 const axios = require('axios');
 const crypto = require('crypto');
 
-/**
- * A dedicated client for handling all communication with the Delta Exchange API.
- */
 class DeltaClient {
     #apiKey;
     #apiSecret;
@@ -22,33 +19,20 @@ class DeltaClient {
         this.#logger = logger;
         this.#axiosInstance = axios.create({
             baseURL: baseURL,
-            timeout: 10000, // Apply a timeout to all requests
+            timeout: 10000,
             headers: { 'Content-Type': 'application/json' }
         });
     }
 
-    /**
-     * Generates the required signature for an authenticated API request.
-     * @private
-     */
     #signRequest(method, path, data = null, query = null) {
         const timestamp = Math.floor(Date.now() / 1000).toString();
-        let signatureData = method.toUpperCase() + timestamp + path;
-        if (query) {
-            // Ensure query parameters are correctly encoded for the signature
-            signatureData += '?' + new URLSearchParams(query).toString();
-        }
-        if (data) {
-            signatureData += JSON.stringify(data);
-        }
+        const queryString = query ? '?' + new URLSearchParams(query).toString() : '';
+        const bodyString = data ? JSON.stringify(data) : '';
+        const signatureData = method.toUpperCase() + timestamp + path + queryString + bodyString;
         const signature = crypto.createHmac('sha256', this.#apiSecret).update(signatureData).digest('hex');
         return { timestamp, signature };
     }
 
-    /**
-     * The core private method for making a signed API request.
-     * @private
-     */
     async #request(method, path, data = null, query = null) {
         const { timestamp, signature } = this.#signRequest(method, path, data, query);
         try {
@@ -63,37 +47,20 @@ class DeltaClient {
                 params: query,
                 data: data
             });
-            // The API wraps successful responses in a 'result' object
-            return response.data.result;
+            return response.data;
         } catch (error) {
             this.#logger.error(`[DeltaClient] API request failed: ${method} ${path}`, {
                 status: error.response?.status,
                 data: error.response?.data
             });
-            throw error; // Re-throw for the caller to handle
+            throw error;
         }
     }
     
-    // --- NEWLY ADDED FUNCTION ---
-    /**
-     * Fetches open positions for a specific product.
-     * @param {number} productId - The product ID to fetch positions for.
-     * @returns {Promise<Array>} A promise that resolves to an array of position objects.
-     */
-    async getPositions(productId) {
-        return this.#request('GET', '/v2/positions', null, { product_id: productId });
-    }
-    
-    /**
-     * Places a new order.
-     */
     async placeOrder(orderData) {
         return this.#request('POST', '/v2/orders', orderData);
     }
 
-    /**
-     * Cancels a batch of open orders for a given product.
-     */
     async batchCancelOrders(productId, orderIds) {
         if (!orderIds || orderIds.length === 0) {
             return Promise.resolve();
