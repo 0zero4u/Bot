@@ -1,4 +1,6 @@
-// Client.js
+// client.js
+// Version 1.2.0 - Added getPositions method for startup synchronization
+
 const axios = require('axios');
 const crypto = require('crypto');
 
@@ -20,7 +22,7 @@ class DeltaClient {
         this.#logger = logger;
         this.#axiosInstance = axios.create({
             baseURL: baseURL,
-            timeout: 10000,
+            timeout: 10000, // Apply a timeout to all requests
             headers: { 'Content-Type': 'application/json' }
         });
     }
@@ -33,6 +35,7 @@ class DeltaClient {
         const timestamp = Math.floor(Date.now() / 1000).toString();
         let signatureData = method.toUpperCase() + timestamp + path;
         if (query) {
+            // Ensure query parameters are correctly encoded for the signature
             signatureData += '?' + new URLSearchParams(query).toString();
         }
         if (data) {
@@ -60,7 +63,8 @@ class DeltaClient {
                 params: query,
                 data: data
             });
-            return response.data;
+            // The API wraps successful responses in a 'result' object
+            return response.data.result;
         } catch (error) {
             this.#logger.error(`[DeltaClient] API request failed: ${method} ${path}`, {
                 status: error.response?.status,
@@ -69,11 +73,19 @@ class DeltaClient {
             throw error; // Re-throw for the caller to handle
         }
     }
-
+    
+    // --- NEWLY ADDED FUNCTION ---
+    /**
+     * Fetches open positions for a specific product.
+     * @param {number} productId - The product ID to fetch positions for.
+     * @returns {Promise<Array>} A promise that resolves to an array of position objects.
+     */
+    async getPositions(productId) {
+        return this.#request('GET', '/v2/positions', null, { product_id: productId });
+    }
+    
     /**
      * Places a new order.
-     * @param {object} orderData - The order payload.
-     * @returns {Promise<object>} The API response from the exchange.
      */
     async placeOrder(orderData) {
         return this.#request('POST', '/v2/orders', orderData);
@@ -81,20 +93,15 @@ class DeltaClient {
 
     /**
      * Cancels a batch of open orders for a given product.
-     * @param {number} productId - The product ID for the orders being cancelled.
-     * @param {Array<string|number>} orderIds - An array of order IDs to cancel.
-     * @returns {Promise<object>} The API response from the exchange.
      */
     async batchCancelOrders(productId, orderIds) {
         if (!orderIds || orderIds.length === 0) {
-            this.#logger.info("[DeltaClient] batchCancelOrders called with no IDs. Skipping.");
             return Promise.resolve();
         }
         const payload = {
             product_id: productId,
             orders: orderIds.map(id => ({ id }))
         };
-        this.#logger.info(`[DeltaClient] Batch cancelling orders:`, orderIds);
         return this.#request('DELETE', '/v2/orders/batch', payload);
     }
 }
