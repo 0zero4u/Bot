@@ -7,7 +7,7 @@ const winston = require('winston');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
-const DeltaClient = require('./DeltaClient.js');
+const DeltaClient = require('./Client.js');
 
 // --- Configuration ---
 const config = {
