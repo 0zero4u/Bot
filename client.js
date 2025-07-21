@@ -1,5 +1,5 @@
 // client.js
-// Version 1.6.0 - FINAL: Corrected signature generation and error propagation.
+// Version 1.7.0 - FINAL: Added User-Agent to satisfy API firewall (CloudFront).
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -17,23 +17,23 @@ class DeltaClient {
         this.#apiKey = apiKey;
         this.#apiSecret = apiSecret;
         this.#logger = logger;
+        
+        // <<< THE DEFINITIVE FIX: Add a User-Agent to all requests >>>
         this.#axiosInstance = axios.create({
             baseURL: baseURL,
             timeout: 10000,
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 
+                'Content-Type': 'application/json',
+                'User-Agent': 'trading-bot-v10' // This makes our requests look legitimate.
+            }
         });
     }
 
     #signRequest(method, path, data = null, query = null) {
         const timestamp = Math.floor(Date.now() / 1000).toString();
-        
-        // The query string for the signature MUST start with '?' if it exists.
         const queryStringForSig = query ? '?' + new URLSearchParams(query).toString() : '';
         const bodyString = data ? JSON.stringify(data) : '';
-
-        // The signature is always composed of METHOD, timestamp, path, query, and body.
         const signatureData = method.toUpperCase() + timestamp + path + queryStringForSig + bodyString;
-        
         const signature = crypto.createHmac('sha256', this.#apiSecret).update(signatureData).digest('hex');
         return { timestamp, signature };
     }
@@ -58,13 +58,12 @@ class DeltaClient {
                 status: error.response?.status,
                 data: error.response?.data
             });
-            // <<< THE FIX: The error MUST be thrown to be caught by the calling function. >>>
             throw error;
         }
     }
     
     async placeOrder(orderData) {
-        return this.#request('POST', '/v2/orders', orderData);
+        return this.#request('POST', '/v2/orders', orderData, null);
     }
 
     async getLiveOrders(productId) {
@@ -74,20 +73,18 @@ class DeltaClient {
 
     async batchCancelOrders(productId, orderIds) {
         if (!orderIds || orderIds.length === 0) {
-            this.#logger.info('[DeltaClient] batchCancelOrders called with no order IDs.');
             return Promise.resolve({ success: true, result: 'No orders to cancel.' });
         }
         const payload = {
             product_id: productId,
             orders: orderIds.map(id => ({ id }))
         };
-        return this.#request('DELETE', '/v2/orders/batch', payload);
+        return this.#request('DELETE', '/v2/orders/batch', payload, null);
     }
     
     async cancelAllOrders(productId) {
         this.#logger.info(`[DeltaClient] Requesting to cancel all orders for product ${productId}...`);
         
-        // This function now correctly handles errors because #request will throw them.
         const liveOrdersResponse = await this.getLiveOrders(productId);
         
         if (liveOrdersResponse && liveOrdersResponse.result && liveOrdersResponse.result.length > 0) {
