@@ -1,5 +1,5 @@
 // strategies/MomentumRiderStrategy.js
-// Version 5.2.0 - FINAL: SL is now correctly calculated from Delta's L1 BBO, not the signal price.
+// Version 5.3.0 - FINAL: Added pre-emptive cancellation to prevent 'option_exists' error.
 
 const { v4: uuidv4 } = require('uuid');
 
@@ -67,25 +67,21 @@ class MomentumRiderStrategy {
     async tryEnterPosition(currentPrice) {
         this.bot.isOrderInProgress = true;
         try {
+            // <<< THE DEFINITIVE FIX: Pre-emptively cancel any orphaned orders >>>
+            this.logger.info(`[${this.getName()}] Pre-emptively cancelling any existing orders for ${this.bot.config.productSymbol} to prevent conflicts.`);
+            await this.bot.client.cancelAllOrders(this.bot.config.productId);
+            
             const side = currentPrice > this.bot.priceAtLastTrade ? 'buy' : 'sell';
             
-            // <<< THE DEFINITIVE FIX: Use Delta's L1 Order Book for SL calculation >>>
             if (!this.bot.isOrderbookReady || !this.bot.orderBook.bids?.[0]?.[0] || !this.bot.orderBook.asks?.[0]?.[0]) {
                 throw new Error("Delta L1 order book is not ready. Cannot calculate a safe SL.");
             }
 
-            // Use the BEST BID as the reference for a LONG trade's SL.
-            // Use the BEST ASK as the reference for a SHORT trade's SL.
-            const deltaReferencePrice = side === 'buy' 
-                ? parseFloat(this.bot.orderBook.bids[0][0]) 
-                : parseFloat(this.bot.orderBook.asks[0][0]);
-            
-            const stopLossPrice = side === 'buy' 
-                ? deltaReferencePrice - this.bot.config.stopLossOffset 
-                : deltaReferencePrice + this.bot.config.stopLossOffset;
+            const deltaReferencePrice = side === 'buy' ? parseFloat(this.bot.orderBook.bids[0][0]) : parseFloat(this.bot.orderBook.asks[0][0]);
+            const stopLossPrice = side === 'buy' ? deltaReferencePrice - this.bot.config.stopLossOffset : deltaReferencePrice + this.bot.config.stopLossOffset;
 
             if (stopLossPrice <= 0) {
-                this.logger.error(`[${this.getName()}] ABORTING: Invalid Stop-Loss Price (<=0) calculated from Delta BBO.`, { deltaReferencePrice, stopLossPrice });
+                this.logger.error(`[${this.getName()}] ABORTING: Invalid Stop-Loss Price (<=0) calculated.`, { deltaReferencePrice, stopLossPrice });
                 return;
             }
             
