@@ -1,7 +1,5 @@
 // trader.js
-// Version 10.2.0 - CRITICAL FIX for Position Management Deadlock
-// Restored the correct signal handling logic to allow price updates while a position is open.
-
+// Version 10.2.0 
 const WebSocket = require('ws');
 const winston = require('winston');
 const { v4: uuidv4 } = require('uuid');
