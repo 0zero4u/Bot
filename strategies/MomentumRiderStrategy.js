@@ -1,5 +1,6 @@
 // strategies/MomentumRiderStrategy.js
-// Version 2.0.0 - UPGRADED to a Trailing Stop-Loss Mechanism
+// Version 2.0.1 - Fixed race condition on position creation.
+
 class MomentumRiderStrategy {
     constructor(bot) {
         this.bot = bot;
@@ -31,6 +32,7 @@ class MomentumRiderStrategy {
                 peakPrice: this.lastEntrySignalPrice 
             };
             this.logger.info(`[${this.getName()}] STRATEGY POSITION SYNCED. Trailing stop initialized at peak price: ${this.position.peakPrice}`);
+        
         } else if (!positionIsOpen && this.position) {
             this.logger.info(`[${this.getName()}] STRATEGY POSITION CLEARED.`);
             this.position = null;
@@ -67,22 +69,31 @@ class MomentumRiderStrategy {
                 side, 
                 order_type: 'market_order',
             };
+            
+            // --- THE FIX: Set the price BEFORE the await call ---
+            this.lastEntrySignalPrice = currentPrice;
+
+            this.logger.info(`[${this.getName()}] Placing entry order...`);
             const response = await this.bot.placeOrder(orderData);
+
             if (response.result) {
                 this.logger.info(`[${this.getName()}] Entry order placed successfully.`);
                 this.bot.priceAtLastTrade = currentPrice;
-                this.lastEntrySignalPrice = currentPrice;
                 this.bot.startCooldown();
-            } else { throw new Error(`Exchange rejected order: ${JSON.stringify(response)}`); }
+            } else { 
+                this.lastEntrySignalPrice = null; // Clear price on failure
+                throw new Error(`Exchange rejected order: ${JSON.stringify(response)}`); 
+            }
         } catch (error) {
             this.logger.error(`[${this.getName()}] Failed to enter position:`, { message: error.message });
+            this.lastEntrySignalPrice = null; // Also clear on error
         } finally {
             this.bot.isOrderInProgress = false;
         }
     }
 
     async exitPosition() {
-        if (!this.position) return;
+        if (!this.position || this.isExitInProgress) return;
         this.isExitInProgress = true;
         const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
         try {
@@ -94,9 +105,10 @@ class MomentumRiderStrategy {
                 reduce_only: true 
             };
             const response = await this.bot.placeOrder(orderData);
-            if (response.result) {
-                this.logger.info(`[${this.getName()}] Exit order placed successfully.`);
-            } else { throw new Error(`Exchange rejected exit order: ${JSON.stringify(response)}`); }
+            if (!response.result) {
+                throw new Error(`Exchange rejected exit order: ${JSON.stringify(response)}`);
+            }
+            this.logger.info(`[${this.getName()}] Exit order placed successfully.`);
         } catch (error) {
             this.logger.error(`[${this.getName()}] Failed to place exit order:`, { message: error.message });
             this.isExitInProgress = false; 
