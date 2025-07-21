@@ -1,5 +1,5 @@
 // strategies/MomentumRiderStrategy.js
-// Version 5.1.0 - Correctly implements algorithmic exit by fetching and cancelling the hard SL.
+// Version 5.2.0 - FINAL: SL is now correctly calculated from Delta's L1 BBO, not the signal price.
 
 const { v4: uuidv4 } = require('uuid');
 
@@ -68,10 +68,24 @@ class MomentumRiderStrategy {
         this.bot.isOrderInProgress = true;
         try {
             const side = currentPrice > this.bot.priceAtLastTrade ? 'buy' : 'sell';
-            const stopLossPrice = side === 'buy' ? currentPrice - this.bot.config.stopLossOffset : currentPrice + this.bot.config.stopLossOffset;
+            
+            // <<< THE DEFINITIVE FIX: Use Delta's L1 Order Book for SL calculation >>>
+            if (!this.bot.isOrderbookReady || !this.bot.orderBook.bids?.[0]?.[0] || !this.bot.orderBook.asks?.[0]?.[0]) {
+                throw new Error("Delta L1 order book is not ready. Cannot calculate a safe SL.");
+            }
+
+            // Use the BEST BID as the reference for a LONG trade's SL.
+            // Use the BEST ASK as the reference for a SHORT trade's SL.
+            const deltaReferencePrice = side === 'buy' 
+                ? parseFloat(this.bot.orderBook.bids[0][0]) 
+                : parseFloat(this.bot.orderBook.asks[0][0]);
+            
+            const stopLossPrice = side === 'buy' 
+                ? deltaReferencePrice - this.bot.config.stopLossOffset 
+                : deltaReferencePrice + this.bot.config.stopLossOffset;
 
             if (stopLossPrice <= 0) {
-                this.logger.error(`[${this.getName()}] ABORTING: Invalid Stop-Loss Price (<=0) calculated.`, { currentPrice, stopLossPrice });
+                this.logger.error(`[${this.getName()}] ABORTING: Invalid Stop-Loss Price (<=0) calculated from Delta BBO.`, { deltaReferencePrice, stopLossPrice });
                 return;
             }
             
@@ -83,7 +97,11 @@ class MomentumRiderStrategy {
                 bracket_stop_loss_price: stopLossPrice.toString()
             };
             
-            this.logger.info(`[${this.getName()}] Placing ATOMIC market order with SERVER-SIDE fail-safe SL at ≈${stopLossPrice.toFixed(4)}.`);
+            this.logger.info(`[${this.getName()}] Placing ATOMIC market order with fail-safe SL based on Delta BBO.`, {
+                signalPrice: currentPrice,
+                deltaBBO: deltaReferencePrice,
+                stopLoss: stopLossPrice.toFixed(4)
+            });
             this.lastEntrySignalPrice = currentPrice;
             
             const response = await this.bot.placeOrder(orderData);
@@ -107,29 +125,16 @@ class MomentumRiderStrategy {
         if (!this.position || this.isExitInProgress) return;
         this.isExitInProgress = true;
         
-        this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Fetching and cancelling hard SL before placing final exit order.`);
-        
+        this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Cancelling all open orders for ${this.bot.config.productSymbol} to remove the hard SL.`);
         try {
-            // <<< THE DEFINITIVE FIX >>>
-            // 1. Get all live orders for the symbol.
-            const liveOrdersResponse = await this.bot.client.getLiveOrders(this.bot.config.productId);
-            if (liveOrdersResponse.result && liveOrdersResponse.result.length > 0) {
-                const orderIdsToCancel = liveOrdersResponse.result.map(o => o.id);
-                this.logger.info(`[${this.getName()}] Found open orders to cancel: ${orderIdsToCancel.join(', ')}`);
-                
-                // 2. Batch cancel all found orders.
-                await this.bot.client.batchCancelOrders(this.bot.config.productId, orderIdsToCancel);
-                this.logger.info(`[${this.getName()}] Hard SL and any other open orders cancelled successfully.`);
-            } else {
-                this.logger.info(`[${this.getName()}] No open orders found to cancel.`);
-            }
+            await this.bot.client.cancelAllOrders(this.bot.config.productId);
+            this.logger.info(`[${this.getName()}] Hard SL cancelled successfully.`);
         } catch (error) {
             this.logger.error(`[${this.getName()}] Could not cancel hard SL, but proceeding with exit order anyway. Manual check may be required.`, { message: error.message });
         }
         
         const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
         try {
-            // 3. Place the final market order to close the position.
             const orderData = { 
                 product_id: this.bot.config.productId, 
                 size: this.position.size, 
