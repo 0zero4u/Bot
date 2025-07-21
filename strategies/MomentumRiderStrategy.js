@@ -1,5 +1,5 @@
 // strategies/MomentumRiderStrategy.js
-// Version 5.2.0 - FINAL: SL is now correctly calculated from Delta's L1 BBO, not the signal price.
+// Version 5.3.0 - FINAL: Refactored to use the bot's centralized safeCancelAll method.
 
 const { v4: uuidv4 } = require('uuid');
 
@@ -14,6 +14,7 @@ class MomentumRiderStrategy {
 
     getName() { return "MomentumRiderStrategy"; }
 
+    // --- onPriceUpdate and onPositionUpdate are unchanged, omitted for brevity ---
     async onPriceUpdate(currentPrice, priceDifference) {
         if (this.position) {
             this.manageOpenPosition(currentPrice);
@@ -69,13 +70,10 @@ class MomentumRiderStrategy {
         try {
             const side = currentPrice > this.bot.priceAtLastTrade ? 'buy' : 'sell';
             
-            // <<< THE DEFINITIVE FIX: Use Delta's L1 Order Book for SL calculation >>>
             if (!this.bot.isOrderbookReady || !this.bot.orderBook.bids?.[0]?.[0] || !this.bot.orderBook.asks?.[0]?.[0]) {
                 throw new Error("Delta L1 order book is not ready. Cannot calculate a safe SL.");
             }
 
-            // Use the BEST BID as the reference for a LONG trade's SL.
-            // Use the BEST ASK as the reference for a SHORT trade's SL.
             const deltaReferencePrice = side === 'buy' 
                 ? parseFloat(this.bot.orderBook.bids[0][0]) 
                 : parseFloat(this.bot.orderBook.asks[0][0]);
@@ -125,14 +123,14 @@ class MomentumRiderStrategy {
         if (!this.position || this.isExitInProgress) return;
         this.isExitInProgress = true;
         
-        this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Cancelling all open orders for ${this.bot.config.productSymbol} to remove the hard SL.`);
-        try {
-            await this.bot.client.cancelAllOrders(this.bot.config.productId);
-            this.logger.info(`[${this.getName()}] Hard SL cancelled successfully.`);
-        } catch (error) {
-            this.logger.error(`[${this.getName()}] Could not cancel hard SL, but proceeding with exit order anyway. Manual check may be required.`, { message: error.message });
-        }
+        this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Cancelling all open orders for ${this.bot.config.productSymbol} to remove any hard SL.`);
         
+        // --- UPDATED ---
+        // Use the high-level, safe helper on the bot instance.
+        // This abstracts away the direct client call and adds robust logging.
+        await this.bot.safeCancelAll(this.bot.config.productId);
+        this.logger.info(`[${this.getName()}] Proceeding with market exit order.`);
+
         const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
         try {
             const orderData = { 
@@ -148,6 +146,7 @@ class MomentumRiderStrategy {
             }
             this.logger.info(`[${this.getName()}] Algorithmic exit order to close position has been placed.`);
         } catch (error) {
+            // This logging is still valuable in the case of a critical failure to place the closing order.
             this.logger.error(`[${this.getName()}] CRITICAL: Failed to place algorithmic exit order. Manual intervention may be required.`, { message: error.message });
         }
     }
