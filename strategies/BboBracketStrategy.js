@@ -1,5 +1,5 @@
 // strategies/BboBracketStrategy.js
-// Version 8.2.0 - Works with client-side bracket management and is race-condition safe.
+// Version 8.2.1 - Cooldown logic centralized in main bot.
 const { v4: uuidv4 } = require('uuid');
 
 class BboBracketStrategy {
@@ -45,7 +45,7 @@ class BboBracketStrategy {
                 this.bot.confirmRegisteredOrder(clientOrderId, response.result);
                 this.logger.info(`[${this.getName()}] Main order placement successful. Handing off to OrderManager.`);
                 this.bot.priceAtLastTrade = currentPrice;
-                this.bot.startCooldown();
+                // this.bot.startCooldown(); // <<< REMOVED
             } else {
                  // If the order fails, cancel the pending registration.
                  this.bot.cancelPendingOrder(clientOrderId);
