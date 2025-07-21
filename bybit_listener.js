@@ -1,5 +1,5 @@
 // bybit_listener.js
-// v1.1.0 - Added proactive client-side heartbeat for connection stability.
+// v1.4.0 - Correctly implemented LOG throttling, not signal throttling.
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -12,7 +12,8 @@ const config = {
   reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
   internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
   minimumTickSize: parseFloat(process.env.MINIMUM_TICK_SIZE || '0.1'),
-  logLevel: process.env.LOG_LEVEL || 'info'
+  logLevel: process.env.LOG_LEVEL || 'info',
+  logThrottleMs: 45 * 1000 // 45 seconds for throttling logs
 };
 
 // --- Logging Setup ---
@@ -31,7 +32,8 @@ const logger = winston.createLogger({
 let internalWsClient = null;
 let bybitWsClient = null;
 let lastSentSpotBidPrice = null;
-let pingInterval = null; // <<< ADDED: To hold our heartbeat interval
+let pingInterval = null;
+let canLog = true; // Log throttling flag
 
 function connectToInternalReceiver() {
   if (internalWsClient && (internalWsClient.readyState === WebSocket.OPEN || internalWsClient.readyState === WebSocket.CONNECTING)) {
@@ -71,14 +73,12 @@ function connectToBybit() {
     logger.info('Bybit WebSocket connection established');
     lastSentSpotBidPrice = null;
 
-    // --- HEARTBEAT ---
-    // Bybit V5 requires the client to send a ping at least every 20 seconds.
     pingInterval = setInterval(() => {
         if (bybitWsClient.readyState === WebSocket.OPEN) {
             bybitWsClient.send(JSON.stringify({ op: 'ping' }));
             logger.debug('Sent ping to Bybit');
         }
-    }, 20 * 1000); // 20 seconds
+    }, 20 * 1000);
 
     const subscriptionMessage = {
       op: 'subscribe',
@@ -93,7 +93,6 @@ function connectToBybit() {
     try {
       const message = JSON.parse(data.toString());
       
-      // Pong response is still good practice, although we now send our own pings.
       if (message.op === 'ping') {
         bybitWsClient.send(JSON.stringify({ op: 'pong', req_id: message.req_id }));
         return;
@@ -115,9 +114,20 @@ function connectToBybit() {
 
         if (Math.abs(priceDifference) >= config.minimumTickSize) {
           const payload = { type: 'S', p: currentSpotBidPrice };
-          logger.info(`Significant price move detected. Sending price ${currentSpotBidPrice} to trader.`);
+          
+          // --- CORRECTED LOGIC ---
+          // Always send the signal to the bot.
           sendToInternalClient(payload);
           lastSentSpotBidPrice = currentSpotBidPrice;
+
+          // Only log the message if the throttle period has passed.
+          if (canLog) {
+            logger.info(`Significant price move detected. Sending price ${currentSpotBidPrice} to trader. (Logs will be throttled for ${config.logThrottleMs / 1000}s)`);
+            canLog = false;
+            setTimeout(() => {
+                canLog = true;
+            }, config.logThrottleMs);
+          }
         }
       }
     } catch (error) {
@@ -131,7 +141,7 @@ function connectToBybit() {
 
   bybitWsClient.on('close', () => {
     logger.warn('Bybit WebSocket connection closed. Reconnecting...');
-    clearInterval(pingInterval); // <<< ADDED: Stop the heartbeat on close
+    clearInterval(pingInterval);
     setTimeout(connectToBybit, config.reconnectInterval);
   });
 }
