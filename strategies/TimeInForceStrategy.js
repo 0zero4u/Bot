@@ -36,7 +36,7 @@ class TimeInForceStrategy {
             if (response.result) {
                 this.logger.info(`[${this.getName()}] Order placement successful.`);
                 this.bot.priceAtLastTrade = currentPrice;
-                this.bot.startCooldown();
+                // this.bot.startCooldown(); // <<< REMOVED
             } else {
                  throw new Error('API call failed: ' + JSON.stringify(response));
             }
