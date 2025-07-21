@@ -1,12 +1,13 @@
 // strategies/MomentumRiderStrategy.js
-// Version 1.7.0 - FINAL PRODUCTION VERSION
+// Version 1.8.0 - FINAL PRODUCTION VERSION
+// Removed redundant safety check causing logical deadlock.
 
 class MomentumRiderStrategy {
     constructor(bot) {
         this.bot = bot;
         this.logger = bot.logger;
         this.position = null;
-        this.isExitInProgress = false; // Flag to prevent exit loops
+        this.isExitInProgress = false;
     }
 
     getName() { return "MomentumRiderStrategy"; }
@@ -15,33 +16,28 @@ class MomentumRiderStrategy {
         if (this.position) {
             this.manageOpenPosition(currentPrice);
         } else {
-            // Only try to enter if we are not in cooldown from a previous trade
-            if (!this.bot.isCoolingDown && !this.bot.isOrderInProgress) {
-                await this.tryEnterPosition(currentPrice);
-            }
+            // --- FIX: Removed the redundant, conflicting check ---
+            // The trader.js file is the gatekeeper. If this function is called,
+            // it's because the trader has already decided it's safe to proceed.
+            await this.tryEnterPosition(currentPrice);
         }
     }
 
-    /**
-     * This is the primary and most reliable way to sync the strategy's state with the exchange.
-     */
     onPositionUpdate(positionUpdate) {
         const positionSize = parseFloat(positionUpdate.size);
         const positionIsOpen = positionSize !== 0;
 
         if (positionIsOpen && !this.position) {
-            // --- FIX: Correctly derive the side from the position size ---
             this.position = {
-                side: positionSize > 0 ? 'buy' : 'sell', // DERIVE from size, not a non-existent field
+                side: positionSize > 0 ? 'buy' : 'sell',
                 entryPrice: parseFloat(positionUpdate.entry_price),
-                size: Math.abs(positionSize) // Always use a positive size for internal tracking
+                size: Math.abs(positionSize)
             };
             this.logger.info(`[${this.getName()}] STRATEGY POSITION SYNCED: Side=${this.position.side}, Entry Price=${this.position.entryPrice}`);
         } else if (!positionIsOpen && this.position) {
-            // Position is now confirmed closed, reset everything.
             this.logger.info(`[${this.getName()}] STRATEGY POSITION CLEARED.`);
             this.position = null;
-            this.isExitInProgress = false; // Reset the exit flag
+            this.isExitInProgress = false;
         }
     }
 
@@ -69,21 +65,20 @@ class MomentumRiderStrategy {
             if (response && response.result) {
                 this.logger.info(`[${this.getName()}] Entry order placed successfully.`);
                 this.bot.priceAtLastTrade = currentPrice;
-                this.bot.startCooldown(); // <<< CRITICAL: Start cooldown to allow state to sync
+                this.bot.startCooldown();
             } else {
                 throw new Error(`Exchange rejected order: ${JSON.stringify(response)}`);
             }
         } catch (error) {
             this.logger.error(`[${this.getName()}] Failed to enter position:`, { message: error.message });
         } finally {
+            // This is now guaranteed to run, resetting the flag.
             this.bot.isOrderInProgress = false;
         }
     }
 
     manageOpenPosition(currentPrice) {
-        if (!this.position || this.isExitInProgress) {
-            return; // Don't do anything if we have no position or are already trying to exit.
-        }
+        if (!this.position || this.isExitInProgress) return;
 
         const pnl = (currentPrice - this.position.entryPrice) * (this.position.side === 'buy' ? 1 : -1);
         const adverseMovement = -pnl;
@@ -96,13 +91,11 @@ class MomentumRiderStrategy {
 
     async exitPosition() {
         if (!this.position) return;
-
-        this.isExitInProgress = true; // Set flag to prevent looping
+        this.isExitInProgress = true;
         const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
 
         try {
             this.logger.info(`[${this.getName()}] Placing exit order...`);
-            
             const book = exitSide === 'buy' ? this.bot.orderBook.asks : this.bot.orderBook.bids;
             if (!book?.[0]?.[0]) throw new Error(`No L1 data for exit side '${exitSide}'.`);
             const bboPrice = parseFloat(book[0][0]);
@@ -121,14 +114,12 @@ class MomentumRiderStrategy {
             const response = await this.bot.placeOrder(orderData);
 
             if (response && response.result) {
-                this.logger.info(`[${this.getName()}] Exit order placed successfully. Waiting for position update to confirm closure.`);
-                // The 'isExitInProgress' flag will now be reliably reset by onPositionUpdate when the position is confirmed closed.
+                this.logger.info(`[${this.getName()}] Exit order placed successfully. Waiting for confirmation.`);
             } else {
                 throw new Error(`Exchange rejected exit order: ${JSON.stringify(response)}`);
             }
         } catch (error) {
             this.logger.error(`[${this.getName()}] Failed to place exit order:`, { message: error.message });
-            // On failure, we now allow the bot to retry on the next tick if needed, but the flag prevents spamming.
             this.isExitInProgress = false; 
         }
     }
