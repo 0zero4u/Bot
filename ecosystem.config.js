@@ -5,7 +5,7 @@ module.exports = {
       name: 'bybit-listener',
       script: 'bybit_listener.js',
       // This is correct and necessary for robust pathing
-      cwd: '/home/arshtripathi/trading-bot/Bot/', 
+      cwd: '/home/arshhtripathi/trading-bot/Bot/', 
       watch: false,
       restart_delay: 5000,
       max_restarts: 10,
@@ -22,7 +22,7 @@ module.exports = {
       name: 'delta-trader',
       script: 'trader.js',
       // This is correct and necessary for robust pathing
-      cwd: '/home/arshtripathi/trading-bot/Bot/',
+      cwd: '/home/arshhtripathi/trading-bot/Bot/',
       watch: false,
       restart_delay: 5000,
       max_restarts: 10,
