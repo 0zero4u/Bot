@@ -1,5 +1,5 @@
 // strategies/MomentumRiderStrategy.js
-// Version 6.0.0 - FINAL: Rearchitected to use WebSocket state and avoid failing REST calls.
+// Version 8.0.0 - FINAL: Correctly uses limit orders for entry and simplifies exit logic.
 
 const { v4: uuidv4 } = require('uuid');
 
@@ -15,6 +15,11 @@ class MomentumRiderStrategy {
     getName() { return "MomentumRiderStrategy"; }
 
     async onPriceUpdate(currentPrice, priceDifference) {
+        if (this.bot.isOrderInProgress) {
+            this.logger.debug("Ignoring signal: Order already in progress.");
+            return;
+        }
+
         if (this.position) {
             this.manageOpenPosition(currentPrice);
         } else {
@@ -33,16 +38,12 @@ class MomentumRiderStrategy {
                 size: Math.abs(positionSize),
                 peakPrice: this.lastEntrySignalPrice
             };
-            this.logger.info(`[${this.getName()}] POSITION SYNCED via WebSocket. Algorithmic trailing stop is now active.`, {
-                entry: this.position.entryPrice,
-                peak: this.position.peakPrice
-            });
+            this.logger.info(`[${this.getName()}] POSITION SYNCED. Algorithmic trailing stop is now active.`);
         
         } else if (!positionIsOpen && this.position) {
             this.logger.info(`[${this.getName()}] POSITION CLEARED via WebSocket.`);
             this.position = null;
             this.isExitInProgress = false;
-            this.lastEntrySignalPrice = null;
         }
     }
 
@@ -59,7 +60,7 @@ class MomentumRiderStrategy {
         }
 
         if (drawdown >= this.bot.config.momentumReversalThreshold) {
-            this.logger.warn(`[${this.getName()}] ALGORITHMIC TRAILING STOP TRIGGERED! Peak: ${this.position.peakPrice}, Current: ${currentPrice}. Exiting.`);
+            this.logger.warn(`[${this.getName()}] ALGORITHMIC TRAILING STOP TRIGGERED! Exiting.`);
             this.exitPosition();
         }
     }
@@ -67,51 +68,46 @@ class MomentumRiderStrategy {
     async tryEnterPosition(currentPrice) {
         this.bot.isOrderInProgress = true;
         try {
-            // <<< THE DEFINITIVE FIX: REMOVED the failing pre-emptive cancel call >>>
-            // We now rely on the WebSocket position state to prevent new trades if already in a position.
-            
             const side = currentPrice > this.bot.priceAtLastTrade ? 'buy' : 'sell';
             
             if (!this.bot.isOrderbookReady || !this.bot.orderBook.bids?.[0]?.[0] || !this.bot.orderBook.asks?.[0]?.[0]) {
-                throw new Error("Delta L1 order book is not ready. Cannot calculate a safe SL.");
+                throw new Error("Delta L1 order book is not ready.");
             }
 
-            const deltaReferencePrice = side === 'buy' ? parseFloat(this.bot.orderBook.bids[0][0]) : parseFloat(this.bot.orderBook.asks[0][0]);
-            const stopLossPrice = side === 'buy' ? deltaReferencePrice - this.bot.config.stopLossOffset : deltaReferencePrice + this.bot.config.stopLossOffset;
+            const limitPrice = side === 'buy' 
+                ? parseFloat(this.bot.orderBook.asks[0][0])
+                : parseFloat(this.bot.orderBook.bids[0][0]);
 
-            if (stopLossPrice <= 0) {
-                this.logger.error(`[${this.getName()}] ABORTING: Invalid Stop-Loss Price (<=0) calculated.`, { deltaReferencePrice, stopLossPrice });
-                return;
+            const stopLossPrice = side === 'buy' 
+                ? limitPrice - this.bot.config.stopLossOffset 
+                : limitPrice + this.bot.config.stopLossOffset;
+
+            if (stopLossPrice <= 0 || limitPrice <= 0) {
+                throw new Error(`Invalid price calculated. Limit: ${limitPrice}, SL: ${stopLossPrice}`);
             }
             
             const orderData = { 
                 product_id: this.bot.config.productId, 
                 size: this.bot.config.orderSize, 
                 side, 
-                order_type: 'market_order',
+                order_type: 'limit_order',
+                limit_price: limitPrice.toString(),
                 bracket_stop_loss_price: stopLossPrice.toString()
             };
             
-            this.logger.info(`[${this.getName()}] Placing ATOMIC market order with fail-safe SL based on Delta BBO.`, {
-                signalPrice: currentPrice,
-                deltaBBO: deltaReferencePrice,
-                stopLoss: stopLossPrice.toFixed(4)
-            });
+            this.logger.info(`[${this.getName()}] Placing ATOMIC limit order with fail-safe SL.`);
             this.lastEntrySignalPrice = currentPrice;
             
             const response = await this.bot.placeOrder(orderData);
 
             if (response.result) {
-                this.logger.info(`[${this.getName()}] Atomic entry order placed successfully. Exchange is managing the fail-safe SL.`);
+                this.logger.info(`[${this.getName()}] Atomic entry order placed successfully.`);
                 this.bot.priceAtLastTrade = currentPrice;
             } else { 
-                this.lastEntrySignalPrice = null;
-                // If the error is 'option_exists', it means an old SL was orphaned. Manual cleanup needed.
                 throw new Error(`Exchange rejected order: ${JSON.stringify(response)}`); 
             }
         } catch (error) {
             this.logger.error(`[${this.getName()}] Failed to enter position:`, { message: error.message });
-            this.lastEntrySignalPrice = null;
         } finally {
             this.bot.isOrderInProgress = false;
         }
@@ -121,9 +117,7 @@ class MomentumRiderStrategy {
         if (!this.position || this.isExitInProgress) return;
         this.isExitInProgress = true;
         
-        // <<< THE DEFINITIVE FIX: REMOVED the failing cancelAllOrders call. >>>
-        // We simply place a reduce_only order. The exchange will handle the state.
-        this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Placing a reduce_only market order.`);
+        this.logger.warn(`[${this.getName()}] Algorithmic exit: Placing a reduce_only market order.`);
         
         const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
         try {
@@ -135,16 +129,15 @@ class MomentumRiderStrategy {
                 reduce_only: true 
             };
             const response = await this.bot.placeOrder(orderData);
-            if (!response.result) {
-                // This can happen if the hard SL was already triggered. This is not a critical error.
-                this.logger.warn(`[${this.getName()}] Algorithmic exit order was rejected. The position may have already been closed by the hard SL.`, {
+            if (response.result) {
+                this.logger.info(`[${this.getName()}] Algorithmic exit order placed successfully.`);
+            } else {
+                this.logger.warn(`[${this.getName()}] Exit order rejected. Position may have been closed by hard SL.`, {
                     response: JSON.stringify(response)
                 });
-            } else {
-                this.logger.info(`[${this.getName()}] Algorithmic exit order to close position has been placed successfully.`);
             }
         } catch (error) {
-            this.logger.error(`[${this.getName()}] CRITICAL: An unexpected error occurred while placing the algorithmic exit order.`, { message: error.message });
+            this.logger.error(`[${this.getName()}] CRITICAL: Error placing algorithmic exit order.`, { message: error.message });
         }
     }
 }
