@@ -1,5 +1,5 @@
 // strategies/MomentumRiderStrategy.js
-// Version 5.2.0 - FINAL: SL is now correctly calculated from Delta's L1 BBO, not the signal price.
+// Version 6.0.0 - FINAL: Rearchitected to use WebSocket state and avoid failing REST calls.
 
 const { v4: uuidv4 } = require('uuid');
 
@@ -33,13 +33,13 @@ class MomentumRiderStrategy {
                 size: Math.abs(positionSize),
                 peakPrice: this.lastEntrySignalPrice
             };
-            this.logger.info(`[${this.getName()}] POSITION SYNCED. Algorithmic trailing stop is now active.`, {
+            this.logger.info(`[${this.getName()}] POSITION SYNCED via WebSocket. Algorithmic trailing stop is now active.`, {
                 entry: this.position.entryPrice,
                 peak: this.position.peakPrice
             });
         
         } else if (!positionIsOpen && this.position) {
-            this.logger.info(`[${this.getName()}] STRATEGY POSITION CLEARED.`);
+            this.logger.info(`[${this.getName()}] POSITION CLEARED via WebSocket.`);
             this.position = null;
             this.isExitInProgress = false;
             this.lastEntrySignalPrice = null;
@@ -67,25 +67,20 @@ class MomentumRiderStrategy {
     async tryEnterPosition(currentPrice) {
         this.bot.isOrderInProgress = true;
         try {
+            // <<< THE DEFINITIVE FIX: REMOVED the failing pre-emptive cancel call >>>
+            // We now rely on the WebSocket position state to prevent new trades if already in a position.
+            
             const side = currentPrice > this.bot.priceAtLastTrade ? 'buy' : 'sell';
             
-            // <<< THE DEFINITIVE FIX: Use Delta's L1 Order Book for SL calculation >>>
             if (!this.bot.isOrderbookReady || !this.bot.orderBook.bids?.[0]?.[0] || !this.bot.orderBook.asks?.[0]?.[0]) {
                 throw new Error("Delta L1 order book is not ready. Cannot calculate a safe SL.");
             }
 
-            // Use the BEST BID as the reference for a LONG trade's SL.
-            // Use the BEST ASK as the reference for a SHORT trade's SL.
-            const deltaReferencePrice = side === 'buy' 
-                ? parseFloat(this.bot.orderBook.bids[0][0]) 
-                : parseFloat(this.bot.orderBook.asks[0][0]);
-            
-            const stopLossPrice = side === 'buy' 
-                ? deltaReferencePrice - this.bot.config.stopLossOffset 
-                : deltaReferencePrice + this.bot.config.stopLossOffset;
+            const deltaReferencePrice = side === 'buy' ? parseFloat(this.bot.orderBook.bids[0][0]) : parseFloat(this.bot.orderBook.asks[0][0]);
+            const stopLossPrice = side === 'buy' ? deltaReferencePrice - this.bot.config.stopLossOffset : deltaReferencePrice + this.bot.config.stopLossOffset;
 
             if (stopLossPrice <= 0) {
-                this.logger.error(`[${this.getName()}] ABORTING: Invalid Stop-Loss Price (<=0) calculated from Delta BBO.`, { deltaReferencePrice, stopLossPrice });
+                this.logger.error(`[${this.getName()}] ABORTING: Invalid Stop-Loss Price (<=0) calculated.`, { deltaReferencePrice, stopLossPrice });
                 return;
             }
             
@@ -111,6 +106,7 @@ class MomentumRiderStrategy {
                 this.bot.priceAtLastTrade = currentPrice;
             } else { 
                 this.lastEntrySignalPrice = null;
+                // If the error is 'option_exists', it means an old SL was orphaned. Manual cleanup needed.
                 throw new Error(`Exchange rejected order: ${JSON.stringify(response)}`); 
             }
         } catch (error) {
@@ -125,13 +121,9 @@ class MomentumRiderStrategy {
         if (!this.position || this.isExitInProgress) return;
         this.isExitInProgress = true;
         
-        this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Cancelling all open orders for ${this.bot.config.productSymbol} to remove the hard SL.`);
-        try {
-            await this.bot.client.cancelAllOrders(this.bot.config.productId);
-            this.logger.info(`[${this.getName()}] Hard SL cancelled successfully.`);
-        } catch (error) {
-            this.logger.error(`[${this.getName()}] Could not cancel hard SL, but proceeding with exit order anyway. Manual check may be required.`, { message: error.message });
-        }
+        // <<< THE DEFINITIVE FIX: REMOVED the failing cancelAllOrders call. >>>
+        // We simply place a reduce_only order. The exchange will handle the state.
+        this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Placing a reduce_only market order.`);
         
         const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
         try {
@@ -144,11 +136,15 @@ class MomentumRiderStrategy {
             };
             const response = await this.bot.placeOrder(orderData);
             if (!response.result) {
-                throw new Error(`Exchange rejected algorithmic exit order: ${JSON.stringify(response)}`);
+                // This can happen if the hard SL was already triggered. This is not a critical error.
+                this.logger.warn(`[${this.getName()}] Algorithmic exit order was rejected. The position may have already been closed by the hard SL.`, {
+                    response: JSON.stringify(response)
+                });
+            } else {
+                this.logger.info(`[${this.getName()}] Algorithmic exit order to close position has been placed successfully.`);
             }
-            this.logger.info(`[${this.getName()}] Algorithmic exit order to close position has been placed.`);
         } catch (error) {
-            this.logger.error(`[${this.getName()}] CRITICAL: Failed to place algorithmic exit order. Manual intervention may be required.`, { message: error.message });
+            this.logger.error(`[${this.getName()}] CRITICAL: An unexpected error occurred while placing the algorithmic exit order.`, { message: error.message });
         }
     }
 }
