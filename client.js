@@ -1,104 +1,108 @@
-// client.js
-// Version 8.0.0 - FINAL: A direct and correct implementation based on official documentation.
-
+// client.js – v8.1.0 (406-safe REST adapter)
 const axios = require('axios');
 const crypto = require('crypto');
 
 class DeltaClient {
-    #apiKey;
-    #apiSecret;
-    #axiosInstance;
-    #logger;
+  #apiKey; #apiSecret; #axios; #logger;
+  constructor(apiKey, apiSecret, baseURL, logger) {
+    if (!apiKey || !apiSecret || !baseURL || !logger) {
+      throw new Error('DeltaClient requires apiKey, apiSecret, baseURL and logger');
+    }
+    this.#apiKey = apiKey;
+    this.#apiSecret = apiSecret;
+    this.#logger = logger;
+    this.#axios = axios.create({ baseURL, timeout: 15000 });
+  }
 
-    constructor(apiKey, apiSecret, baseURL, logger) {
-        if (!apiKey || !apiSecret || !baseURL || !logger) {
-            throw new Error("DeltaClient requires apiKey, apiSecret, baseURL, and a logger.");
-        }
-        this.#apiKey = apiKey;
-        this.#apiSecret = apiSecret;
-        this.#logger = logger;
-        
-        this.#axiosInstance = axios.create({
-            baseURL: baseURL,
-            timeout: 15000,
-            headers: { 
-                'Content-Type': 'application/json',
-                'User-Agent': 'trading-bot-v10.8' // Required by API firewall
-            }
-        });
+  /* ---------- PRIVATE CORE ---------- */
+  async #request(method, path, data = null, query = null, attempt = 1) {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const qs = query ? new URLSearchParams(query).toString() : '';
+    const body = data ? JSON.stringify(data) : '';
+    const sigStr = method.toUpperCase() + timestamp + path + (qs ? `?${qs}` : '') + body;
+    const signature = crypto.createHmac('sha256', this.#apiSecret).update(sigStr).digest('hex');
+
+    const headers = {
+      'api-key': this.#apiKey,
+      timestamp,
+      signature,
+      Accept: 'application/json'
+    };
+    // Only attach Content-Type if we are really sending a body
+    if (body) headers['Content-Type'] = 'application/json';
+
+    try {
+      const resp = await this.#axios({
+        method,
+        url: path,
+        params: query,
+        data: body ? JSON.parse(body) : undefined,
+        headers
+      });
+      return resp.data;
+    } catch (err) {
+      const status = err.response?.status;
+      const responseData = err.response?.data;
+      this.#logger.error(`[DeltaClient] ${method} ${path} attempt ${attempt} failed with status ${status}.`, { responseData });
+      
+      // Retry on 5xx server errors or 406 (Not Acceptable), which might be a transient firewall issue.
+      if ((status >= 500 || status === 406) && attempt < 3) {
+        this.#logger.warn(`[DeltaClient] Retrying in ${250 * attempt}ms...`);
+        await new Promise(r => setTimeout(r, 250 * attempt));  // exponential back-off
+        return this.#request(method, path, data, query, attempt + 1);
+      }
+      throw err; // Re-throw the error if it's not retryable or retries are exhausted.
+    }
+  }
+
+  /* ---------- PUBLIC WRAPPERS ---------- */
+  placeOrder(payload) { return this.#request('POST', '/v2/orders', payload); }
+
+  getLiveOrders(productId) {
+    return this.#request('GET', '/v2/orders', null, { product_id: productId });
+  }
+
+  async batchCancelOrders(productId, ids) {
+    if (!ids?.length) {
+        this.#logger.info('[DeltaClient] batchCancelOrders called with no IDs.');
+        return { success: true, result: 'nothing-to-do' };
+    }
+    // Delta API might have a limit on the number of orders in a single batch request.
+    // Chunking the requests is a safe way to handle large numbers of cancellations.
+    const chunks = [];
+    for (let i = 0; i < ids.length; i += 20) { // Using a conservative chunk size of 20
+        chunks.push(ids.slice(i, i + 20));
     }
 
-    async #request(method, path, data = null, query = null) {
-        const timestamp = Math.floor(Date.now() / 1000).toString();
-        const queryString = query ? new URLSearchParams(query).toString() : '';
-        const bodyString = data ? JSON.stringify(data) : '';
-        const queryStringForSig = queryString ? '?' + queryString : '';
-        const signatureData = method.toUpperCase() + timestamp + path + queryStringForSig + bodyString;
-        
-        this.#logger.debug(`[DeltaClient] Signing string: "${signatureData}"`);
-
-        const signature = crypto.createHmac('sha256', this.#apiSecret).update(signatureData).digest('hex');
-
-        try {
-            const response = await this.#axiosInstance({
-                method,
-                url: path,
-                params: query,
-                data: data,
-                headers: {
-                    'api-key': this.#apiKey,
-                    'timestamp': timestamp,
-                    'signature': signature,
-                }
-            });
-            return response.data;
-        } catch (error) {
-            this.#logger.error(`[DeltaClient] API Request Failed: ${method} ${path}`, {
-                status: error.response?.status,
-                data: error.response?.data
-            });
-            throw error;
-        }
-    }
-    
-    placeOrder(orderData) {
-        return this.#request('POST', '/v2/orders', orderData, null);
-    }
-
-    getLiveOrders(productId) {
-        if (!productId) throw new Error("productId is required for getLiveOrders.");
-        return this.#request('GET', '/v2/orders', null, { product_id: productId });
-    }
-
-    batchCancelOrders(productId, orderIds) {
-        if (!orderIds || orderIds.length === 0) {
-            return Promise.resolve({ success: true, result: 'No orders to cancel.' });
-        }
-        const payload = {
+    const results = [];
+    for (const slice of chunks) {
+      this.#logger.info(`[DeltaClient] Batch cancelling ${slice.length} orders...`);
+      const payload = {
             product_id: productId,
-            orders: orderIds.map(id => ({ id }))
-        };
-        return this.#request('DELETE', '/v2/orders/batch', payload, null);
+            orders: slice.map(id => ({ id }))
+      };
+      // The DELETE method for batch cancellation sends the product_id in the body, not query.
+      const res = await this.#request('DELETE', '/v2/orders/batch', payload, null);
+      results.push(res);
     }
-    
-    async cancelAllOrders(productId) {
-        this.#logger.info(`[DeltaClient] Requesting to cancel all orders for product ${productId}...`);
-        
-        try {
-            const liveOrdersResponse = await this.getLiveOrders(productId);
-            if (liveOrdersResponse && liveOrdersResponse.result && liveOrdersResponse.result.length > 0) {
-                const orderIdsToCancel = liveOrdersResponse.result.map(o => o.id);
-                this.#logger.info(`[DeltaClient] Found open orders to cancel: ${orderIdsToCancel.join(', ')}`);
-                return this.batchCancelOrders(productId, orderIdsToCancel);
-            } else {
-                this.#logger.info(`[DeltaClient] No live orders found for product ${productId}.`);
-                return Promise.resolve({ success: true, result: 'No live orders found.' });
-            }
-        } catch (error) {
-            this.#logger.error(`[DeltaClient] Failed to execute cancelAllOrders due to an API error.`);
-            return Promise.resolve({ success: false, error: 'API error during getLiveOrders prevented cancellation.' });
+    return results;
+  }
+
+  async cancelAllOrders(productId) {
+    try {
+        const live = await this.getLiveOrders(productId);
+        const ids = live.result?.map(o => o.id) || [];
+        if (!ids.length) {
+          this.#logger.info('[DeltaClient] No live orders found to cancel.');
+          return;
         }
+        this.#logger.info(`[DeltaClient] Found ${ids.length} orders to cancel. Proceeding with batch cancellation.`);
+        return this.batchCancelOrders(productId, ids);
+    } catch (error) {
+        this.#logger.error(`[DeltaClient] Failed to get live orders for cancellation.`, { message: error.message });
+        throw error;
     }
+  }
 }
 
 module.exports = DeltaClient;
