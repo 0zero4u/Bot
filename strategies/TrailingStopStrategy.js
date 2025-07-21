@@ -36,17 +36,4 @@ class TrailingStopStrategy {
             const response = await this.bot.placeOrder(orderData);
             
             if (response.result) {
-                this.logger.info(`[${this.getName()}] Order placement successful.`);
-                this.bot.priceAtLastTrade = currentPrice;
-                this.bot.startCooldown();
-            } else {
-                 throw new Error('API call failed: ' + JSON.stringify(response));
-            }
-        } catch (error) {
-            this.logger.error(`[${this.getName()}] Failed to execute trade:`, { message: error.message });
-        } finally {
-            this.bot.isOrderInProgress = false;
-        }
-    }
-}
-module.exports = TrailingStopStrategy;
+                this.logger.info(`[${this.
