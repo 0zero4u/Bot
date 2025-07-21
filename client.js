@@ -1,5 +1,5 @@
 // client.js
-// Version 1.8.0 - FINAL: Corrected signature generation to match official documentation precisely.
+// Version 1.5.0 - Based on working v1.4.0. Added User-Agent and cancelAllOrders.
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -18,6 +18,7 @@ class DeltaClient {
         this.#apiSecret = apiSecret;
         this.#logger = logger;
         
+        // <<< THE FIX: Added User-Agent to satisfy the API firewall >>>
         this.#axiosInstance = axios.create({
             baseURL: baseURL,
             timeout: 10000,
@@ -30,18 +31,9 @@ class DeltaClient {
 
     #signRequest(method, path, data = null, query = null) {
         const timestamp = Math.floor(Date.now() / 1000).toString();
-
-        // <<< THE DEFINITIVE FIX >>>
-        // The query string must be generated and prefixed with '?' ONLY if params exist.
-        // It is a separate component from the 'path'.
         const queryString = query ? '?' + new URLSearchParams(query).toString() : '';
         const bodyString = data ? JSON.stringify(data) : '';
-
-        // The signature is built from the distinct components, exactly as per the documentation.
         const signatureData = method.toUpperCase() + timestamp + path + queryString + bodyString;
-        
-        this.#logger.debug(`[DeltaClient] Signing string: "${signatureData}"`);
-
         const signature = crypto.createHmac('sha256', this.#apiSecret).update(signatureData).digest('hex');
         return { timestamp, signature };
     }
@@ -66,7 +58,7 @@ class DeltaClient {
                 status: error.response?.status,
                 data: error.response?.data
             });
-            throw error;
+            throw error; // This correctly propagates the error to the strategy.
         }
     }
     
@@ -74,14 +66,9 @@ class DeltaClient {
         return this.#request('POST', '/v2/orders', orderData, null);
     }
 
-    async getLiveOrders(productId) {
-        if (!productId) throw new Error("productId is required for getLiveOrders.");
-        return this.#request('GET', '/v2/orders', null, { product_id: productId });
-    }
-
     async batchCancelOrders(productId, orderIds) {
         if (!orderIds || orderIds.length === 0) {
-            return Promise.resolve({ success: true, result: 'No orders to cancel.' });
+            return Promise.resolve({ success: true, result: 'No orders to cancel.'});
         }
         const payload = {
             product_id: productId,
@@ -90,6 +77,15 @@ class DeltaClient {
         return this.#request('DELETE', '/v2/orders/batch', payload, null);
     }
     
+    // --- ADDED: Method to get all live orders for a product ---
+    async getLiveOrders(productId) {
+        if (!productId) {
+            throw new Error("productId is required for getLiveOrders.");
+        }
+        return this.#request('GET', '/v2/orders', null, { product_id: productId });
+    }
+
+    // --- ADDED: High-level utility to cancel all open orders for a product ---
     async cancelAllOrders(productId) {
         this.#logger.info(`[DeltaClient] Requesting to cancel all orders for product ${productId}...`);
         
@@ -99,14 +95,9 @@ class DeltaClient {
             const orderIdsToCancel = liveOrdersResponse.result.map(o => o.id);
             this.#logger.info(`[DeltaClient] Found open orders to cancel: ${orderIdsToCancel.join(', ')}`);
             return this.batchCancelOrders(productId, orderIdsToCancel);
-        } else if (liveOrdersResponse.result && liveOrdersResponse.result.length === 0) {
-            this.#logger.info(`[DeltaClient] No live orders found for product ${productId}.`);
-            return Promise.resolve({ success: true, result: 'No live orders found.' });
         } else {
-            // This case handles when the API call itself fails.
-            this.#logger.error(`[DeltaClient] Failed to get live orders. Cannot proceed with cancelAllOrders.`);
-            // Create a consistent error object to be returned
-            return Promise.resolve({ success: false, error: 'Failed to retrieve live orders to cancel.' });
+            this.#logger.info(`[DeltaClient] No live orders found for product ${productId} to cancel.`);
+            return Promise.resolve({ success: true, result: 'No live orders found.' });
         }
     }
 }
