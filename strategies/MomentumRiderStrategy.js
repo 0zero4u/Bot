@@ -1,5 +1,6 @@
 // strategies/MomentumRiderStrategy.js
-// Version 1.9.1 - Refined logging for existing positions on restart.
+// Version 2.0.0 - UPGRADED to a Trailing Stop-Loss Mechanism
+// This strategy now truly "rides the momentum" by trailing the stop-loss.
 
 class MomentumRiderStrategy {
     constructor(bot) {
@@ -7,9 +8,8 @@ class MomentumRiderStrategy {
         this.logger = bot.logger;
         this.position = null;
         this.isExitInProgress = false;
+        // This will temporarily hold the signal price that triggered a potential entry.
         this.lastEntrySignalPrice = null;
-        // --- NEW: Flag to prevent log flooding ---
-        this.hasWarnedAboutMissingSignalPrice = false;
     }
 
     getName() { return "MomentumRiderStrategy"; }
@@ -31,120 +31,58 @@ class MomentumRiderStrategy {
                 side: positionSize > 0 ? 'buy' : 'sell',
                 entryPrice: parseFloat(positionUpdate.entry_price),
                 size: Math.abs(positionSize),
-                entrySignalPrice: this.lastEntrySignalPrice
+                // This is the highest price (for a long) or lowest price (for a short) seen so far.
+                // We initialize it with the price that triggered the trade.
+                peakPrice: this.lastEntrySignalPrice 
             };
-            this.logger.info(`[${this.getName()}] STRATEGY POSITION SYNCED: Side=${this.position.side}, Entry Price=${this.position.entryPrice}, Entry Signal Price=${this.position.entrySignalPrice}`);
+            this.logger.info(`[${this.getName()}] STRATEGY POSITION SYNCED: Side=${this.position.side}, Entry Price=${this.position.entryPrice}. Trailing stop initialized at peak price: ${this.position.peakPrice}`);
         
         } else if (!positionIsOpen && this.position) {
             this.logger.info(`[${this.getName()}] STRATEGY POSITION CLEARED.`);
             this.position = null;
             this.isExitInProgress = false;
             this.lastEntrySignalPrice = null;
-            // --- NEW: Reset the warning flag when the position is closed ---
-            this.hasWarnedAboutMissingSignalPrice = false;
         }
     }
 
-    async tryEnterPosition(currentPrice) {
-        try {
-            const side = currentPrice > this.bot.priceAtLastTrade ? 'buy' : 'sell';
-            const book = side === 'buy' ? this.bot.orderBook.asks : this.bot.orderBook.bids;
-            if (!book?.[0]?.[0]) throw new Error(`No L1 data for side '${side}'.`);
-            
-            const bboPrice = parseFloat(book[0][0]);
-            const protectionOffset = side === 'buy' ? this.bot.config.slippageProtectionOffset : -this.bot.config.slippageProtectionOffset;
-            const protectedLimitPrice = bboPrice + protectionOffset;
-
-            const orderData = { 
-                product_id: this.bot.config.productId, 
-                size: this.bot.config.orderSize, 
-                side, 
-                order_type: 'limit_order',
-                limit_price: protectedLimitPrice.toString()
-            };
-
-            this.logger.info(`[${this.getName()}] Placing entry order...`);
-            const response = await this.bot.placeOrder(orderData);
-
-            if (response && response.result) {
-                this.logger.info(`[${this.getName()}] Entry order placed successfully.`);
-                this.bot.priceAtLastTrade = currentPrice;
-                this.lastEntrySignalPrice = currentPrice;
-                this.bot.startCooldown();
-            } else {
-                throw new Error(`Exchange rejected order: ${JSON.stringify(response)}`);
-            }
-        } catch (error) {
-            this.logger.error(`[${this.getName()}] Failed to enter position:`, { message: error.message });
-        } finally {
-            this.bot.isOrderInProgress = false;
-        }
-    }
-
+    /**
+     * CORE LOGIC: This function now implements the trailing stop-loss.
+     */
     manageOpenPosition(currentPrice) {
-        // --- MODIFIED: The guard clause logic is now improved ---
-        if (!this.position || this.isExitInProgress) {
+        // Guard clauses: Do nothing if no position, exit is busy, or we can't manage it.
+        if (!this.position || this.isExitInProgress || !this.position.peakPrice) {
+            // This handles the edge case of a bot restart with an existing position.
             return;
         }
 
-        // Handle the specific case of a missing entry signal price
-        if (!this.position.entrySignalPrice) {
-            // Only log the warning if we haven't already.
-            if (!this.hasWarnedAboutMissingSignalPrice) {
-                this.logger.warn(`[${this.getName()}] Cannot manage position because entrySignalPrice is missing. This can happen on bot restart with an existing position. The stop-loss will not be active for this trade.`);
-                this.hasWarnedAboutMissingSignalPrice = true; // Set the flag to prevent re-logging
-            }
-            return; // Exit the function
-        }
+        let drawdown = 0;
 
-        let adverseMovement = 0;
-
+        // Logic for a LONG ('buy') position
         if (this.position.side === 'buy') {
-            adverseMovement = this.position.entrySignalPrice - currentPrice;
-        } else { // 'sell'
-            adverseMovement = currentPrice - this.position.entrySignalPrice;
+            // If the price hits a new high, we update our peak and trail the stop up.
+            if (currentPrice > this.position.peakPrice) {
+                this.logger.info(`[${this.getName()}] New peak price for LONG: ${currentPrice} (previous: ${this.position.peakPrice})`);
+                this.position.peakPrice = currentPrice;
+            }
+            // Calculate how far the price has dropped from its peak.
+            drawdown = this.position.peakPrice - currentPrice;
+        
+        // Logic for a SHORT ('sell') position
+        } else { 
+            // If the price hits a new low, we update our peak (a new low) and trail the stop down.
+            if (currentPrice < this.position.peakPrice) {
+                this.logger.info(`[${this.getName()}] New peak price for SHORT: ${currentPrice} (previous: ${this.position.peakPrice})`);
+                this.position.peakPrice = currentPrice;
+            }
+            // Calculate how far the price has risen from its lowest point.
+            drawdown = currentPrice - this.position.peakPrice;
         }
 
-        if (adverseMovement >= this.bot.config.adverseMovementThreshold) {
-            this.logger.warn(`[${this.getName()}] ADVERSE MOVEMENT threshold met based on signal price. Current: ${currentPrice}, Entry Signal: ${this.position.entrySignalPrice}. Attempting to exit.`);
+        // Check if the reversal has exceeded our allowed threshold from the config
+        if (drawdown >= this.bot.config.momentumReversalThreshold) {
+            this.logger.warn(`[${this.getName()}] TRAILING STOP TRIGGERED! Peak: ${this.position.peakPrice}, Current: ${currentPrice}. Drawdown (${drawdown.toFixed(2)}) >= Threshold (${this.bot.config.momentumReversalThreshold}). Exiting.`);
             this.exitPosition();
         }
     }
 
-    async exitPosition() {
-        if (!this.position) return;
-        this.isExitInProgress = true;
-        const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
-
-        try {
-            this.logger.info(`[${this.getName()}] Placing exit order...`);
-            const book = exitSide === 'buy' ? this.bot.orderBook.asks : this.bot.orderBook.bids;
-            if (!book?.[0]?.[0]) throw new Error(`No L1 data for exit side '${exitSide}'.`);
-            const bboPrice = parseFloat(book[0][0]);
-            const protectionOffset = exitSide === 'buy' ? this.bot.config.slippageProtectionOffset : -this.bot.config.slippageProtectionOffset;
-            const protectedLimitPrice = bboPrice + protectionOffset;
-
-            const orderData = { 
-                product_id: this.bot.config.productId, 
-                size: this.bot.config.orderSize, 
-                side: exitSide, 
-                order_type: 'limit_order',
-                limit_price: protectedLimitPrice.toString(),
-                reduce_only: true 
-            };
-            
-            const response = await this.bot.placeOrder(orderData);
-
-            if (response && response.result) {
-                this.logger.info(`[${this.getName()}] Exit order placed successfully. Waiting for confirmation.`);
-            } else {
-                throw new Error(`Exchange rejected exit order: ${JSON.stringify(response)}`);
-            }
-        } catch (error) {
-            this.logger.error(`[${this.getName()}] Failed to place exit order:`, { message: error.message });
-            this.isExitInProgress = false; 
-        }
-    }
-}
-
-module.exports = MomentumRiderStrategy;
+    async tryEnterPosition(currentPrice
