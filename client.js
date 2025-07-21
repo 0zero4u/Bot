@@ -1,5 +1,5 @@
 // client.js
-// Version 6.0.0 - FINAL & CORRECTED: Guarantees signature matches the request URI.
+// Version 7.0.0 - FINAL: Correctly implements the exact signature logic from official documentation.
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -23,32 +23,35 @@ class DeltaClient {
             timeout: 15000,
             headers: { 
                 'Content-Type': 'application/json',
-                'User-Agent': 'trading-bot-v10.6' // Required by API firewall
+                'User-Agent': 'trading-bot-v10.7' // Required by API firewall
             }
         });
     }
 
     async #request(method, path, data = null, query = null) {
-        // Create the full path with encoded query params using Axios's own serializer.
-        // This guarantees the path used in the signature is IDENTICAL to the one in the request.
-        const url = this.#axiosInstance.getUri({ url: path, params: query });
-        
         const timestamp = Math.floor(Date.now() / 1000).toString();
+        
+        // <<< THE DEFINITIVE FIX >>>
+        // 1. The query string is generated. It will be an empty string if `query` is null.
+        const queryString = query ? new URLSearchParams(query).toString() : '';
+        
+        // 2. The body string is generated. It will be an empty string if `data` is null.
         const bodyString = data ? JSON.stringify(data) : '';
 
-        // The signature is built from the exact URI that will be requested.
-        const signatureData = method.toUpperCase() + timestamp + url + bodyString;
+        // 3. The query string for the signature MUST be prefixed with '?' if it's not empty.
+        const queryStringForSig = queryString ? '?' + queryString : '';
+
+        // 4. The final signature is built from the distinct components, exactly as per the documentation.
+        const signatureData = method.toUpperCase() + timestamp + path + queryStringForSig + bodyString;
         
         this.#logger.debug(`[DeltaClient] Signing string: "${signatureData}"`);
 
-        const signature = crypto.createHmac('sha256', this.#apiSecret)
-            .update(signatureData)
-            .digest('hex');
-            
+        const signature = crypto.createHmac('sha256', this.#apiSecret).update(signatureData).digest('hex');
+
         try {
             const response = await this.#axiosInstance({
                 method,
-                url: path, // Let axios use the original path and params object
+                url: path,
                 params: query,
                 data: data,
                 headers: {
