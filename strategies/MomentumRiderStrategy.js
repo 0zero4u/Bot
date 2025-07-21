@@ -1,5 +1,5 @@
 // strategies/MomentumRiderStrategy.js
-// Version 2.0.1 - Fixed race condition on position creation.
+// Version 2.0.2 - Cooldown logic centralized in main bot
 
 class MomentumRiderStrategy {
     constructor(bot) {
@@ -79,7 +79,7 @@ class MomentumRiderStrategy {
             if (response.result) {
                 this.logger.info(`[${this.getName()}] Entry order placed successfully.`);
                 this.bot.priceAtLastTrade = currentPrice;
-                this.bot.startCooldown();
+                // this.bot.startCooldown(); // <<< REMOVED
             } else { 
                 this.lastEntrySignalPrice = null; // Clear price on failure
                 throw new Error(`Exchange rejected order: ${JSON.stringify(response)}`); 
