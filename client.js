@@ -1,5 +1,5 @@
 // client.js
-// Version 1.7.0 - FINAL: Added User-Agent to satisfy API firewall (CloudFront).
+// Version 1.8.0 - FINAL: Corrected signature generation to match official documentation precisely.
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -18,22 +18,30 @@ class DeltaClient {
         this.#apiSecret = apiSecret;
         this.#logger = logger;
         
-        // <<< THE DEFINITIVE FIX: Add a User-Agent to all requests >>>
         this.#axiosInstance = axios.create({
             baseURL: baseURL,
             timeout: 10000,
             headers: { 
                 'Content-Type': 'application/json',
-                'User-Agent': 'trading-bot-v10' // This makes our requests look legitimate.
+                'User-Agent': 'trading-bot-v10.3'
             }
         });
     }
 
     #signRequest(method, path, data = null, query = null) {
         const timestamp = Math.floor(Date.now() / 1000).toString();
-        const queryStringForSig = query ? '?' + new URLSearchParams(query).toString() : '';
+
+        // <<< THE DEFINITIVE FIX >>>
+        // The query string must be generated and prefixed with '?' ONLY if params exist.
+        // It is a separate component from the 'path'.
+        const queryString = query ? '?' + new URLSearchParams(query).toString() : '';
         const bodyString = data ? JSON.stringify(data) : '';
-        const signatureData = method.toUpperCase() + timestamp + path + queryStringForSig + bodyString;
+
+        // The signature is built from the distinct components, exactly as per the documentation.
+        const signatureData = method.toUpperCase() + timestamp + path + queryString + bodyString;
+        
+        this.#logger.debug(`[DeltaClient] Signing string: "${signatureData}"`);
+
         const signature = crypto.createHmac('sha256', this.#apiSecret).update(signatureData).digest('hex');
         return { timestamp, signature };
     }
@@ -91,9 +99,14 @@ class DeltaClient {
             const orderIdsToCancel = liveOrdersResponse.result.map(o => o.id);
             this.#logger.info(`[DeltaClient] Found open orders to cancel: ${orderIdsToCancel.join(', ')}`);
             return this.batchCancelOrders(productId, orderIdsToCancel);
-        } else {
+        } else if (liveOrdersResponse.result && liveOrdersResponse.result.length === 0) {
             this.#logger.info(`[DeltaClient] No live orders found for product ${productId}.`);
             return Promise.resolve({ success: true, result: 'No live orders found.' });
+        } else {
+            // This case handles when the API call itself fails.
+            this.#logger.error(`[DeltaClient] Failed to get live orders. Cannot proceed with cancelAllOrders.`);
+            // Create a consistent error object to be returned
+            return Promise.resolve({ success: false, error: 'Failed to retrieve live orders to cancel.' });
         }
     }
 }
