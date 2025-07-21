@@ -1,5 +1,6 @@
 // client.js
-// Version 1.4.0 - FINAL PRODUCTION VERSION
+// Version 1.5.0 - FINAL PRODUCTION VERSION
+// Added getLiveOrders and cancelAllOrders to support advanced strategies.
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -26,9 +27,13 @@ class DeltaClient {
 
     #signRequest(method, path, data = null, query = null) {
         const timestamp = Math.floor(Date.now() / 1000).toString();
-        const queryString = query ? '?' + new URLSearchParams(query).toString() : '';
+        // The query string must be URL-encoded but not have the initial '?'
+        const queryString = query ? new URLSearchParams(query).toString() : '';
         const bodyString = data ? JSON.stringify(data) : '';
-        const signatureData = method.toUpperCase() + timestamp + path + queryString + bodyString;
+        // The query string for signature must NOT have the '?' prefix
+        const signaturePath = path + (queryString ? '?' + queryString : '');
+        const signatureData = method.toUpperCase() + timestamp + signaturePath + bodyString;
+        
         const signature = crypto.createHmac('sha256', this.#apiSecret).update(signatureData).digest('hex');
         return { timestamp, signature };
     }
@@ -53,7 +58,8 @@ class DeltaClient {
                 status: error.response?.status,
                 data: error.response?.data
             });
-            throw error;
+            // Propagate the error payload from Delta for better debugging in the bot.
+            return error.response?.data || { success: false, error: error.message };
         }
     }
     
@@ -61,15 +67,45 @@ class DeltaClient {
         return this.#request('POST', '/v2/orders', orderData);
     }
 
+    // --- ADDED: Method to get all live orders for a product ---
+    async getLiveOrders(productId) {
+        if (!productId) {
+            throw new Error("productId is required for getLiveOrders.");
+        }
+        return this.#request('GET', '/v2/orders', null, { product_id: productId });
+    }
+
     async batchCancelOrders(productId, orderIds) {
         if (!orderIds || orderIds.length === 0) {
-            return Promise.resolve();
+            this.#logger.info('[DeltaClient] batchCancelOrders called with no order IDs.');
+            return Promise.resolve({ success: true, result: 'No orders to cancel.' });
         }
         const payload = {
             product_id: productId,
             orders: orderIds.map(id => ({ id }))
         };
         return this.#request('DELETE', '/v2/orders/batch', payload);
+    }
+    
+    // --- ADDED: High-level utility to cancel all open orders for a product ---
+    async cancelAllOrders(productId) {
+        this.#logger.info(`[DeltaClient] Requesting to cancel all orders for product ${productId}...`);
+        try {
+            const liveOrdersResponse = await this.getLiveOrders(productId);
+            if (liveOrdersResponse && liveOrdersResponse.result && liveOrdersResponse.result.length > 0) {
+                const orderIdsToCancel = liveOrdersResponse.result.map(o => o.id);
+                this.#logger.info(`[DeltaClient] Found open orders to cancel: ${orderIdsToCancel.join(', ')}`);
+                return this.batchCancelOrders(productId, orderIdsToCancel);
+            } else {
+                this.#logger.info(`[DeltaClient] No live orders found for product ${productId}.`);
+                return Promise.resolve({ success: true, result: 'No live orders found.' });
+            }
+        } catch (error) {
+             this.#logger.error(`[DeltaClient] Failed during cancelAllOrders process`, {
+                error: error.message
+            });
+            throw error;
+        }
     }
 }
 
