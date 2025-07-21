@@ -1,5 +1,6 @@
 // strategies/MomentumRiderStrategy.js
-// Version 2.0.2 - Cooldown logic centralized in main bot
+// Version 3.0.0 - Added dual stop-loss mechanism (hard SL + trailing SL)
+const { v4: uuidv4 } = require('uuid'); // <<< ADDED
 
 class MomentumRiderStrategy {
     constructor(bot) {
@@ -29,9 +30,13 @@ class MomentumRiderStrategy {
                 side: positionSize > 0 ? 'buy' : 'sell',
                 entryPrice: parseFloat(positionUpdate.entry_price),
                 size: Math.abs(positionSize),
-                peakPrice: this.lastEntrySignalPrice 
+                peakPrice: this.lastEntrySignalPrice,
+                clientOrderId: positionUpdate.client_order_id, // <<< ADDED: Store the ID
             };
-            this.logger.info(`[${this.getName()}] STRATEGY POSITION SYNCED. Trailing stop initialized at peak price: ${this.position.peakPrice}`);
+            this.logger.info(`[${this.getName()}] STRATEGY POSITION SYNCED. Trailing stop initialized.`, {
+                peakPrice: this.position.peakPrice,
+                clientOrderId: this.position.clientOrderId,
+            });
         
         } else if (!positionIsOpen && this.position) {
             this.logger.info(`[${this.getName()}] STRATEGY POSITION CLEARED.`);
@@ -47,7 +52,7 @@ class MomentumRiderStrategy {
         let drawdown = 0;
         if (this.position.side === 'buy') {
             if (currentPrice > this.position.peakPrice) this.position.peakPrice = currentPrice;
-            drawdown = this.position.peakPrice - currentPrice;
+            drawdown = this.position.peakPric - currentPrice;
         } else { 
             if (currentPrice < this.position.peakPrice) this.position.peakPrice = currentPrice;
             drawdown = currentPrice - this.position.peakPrice;
@@ -61,6 +66,7 @@ class MomentumRiderStrategy {
 
     async tryEnterPosition(currentPrice) {
         this.bot.isOrderInProgress = true;
+        const clientOrderId = uuidv4(); // <<< ADDED
         try {
             const side = currentPrice > this.bot.priceAtLastTrade ? 'buy' : 'sell';
             const orderData = { 
@@ -68,25 +74,31 @@ class MomentumRiderStrategy {
                 size: this.bot.config.orderSize, 
                 side, 
                 order_type: 'market_order',
+                client_order_id: clientOrderId, // <<< ADDED
             };
             
-            // --- THE FIX: Set the price BEFORE the await call ---
             this.lastEntrySignalPrice = currentPrice;
+            
+            // <<< MODIFIED: Register with OrderManager before placing >>>
+            this.bot.registerPendingOrder(clientOrderId);
 
             this.logger.info(`[${this.getName()}] Placing entry order...`);
             const response = await this.bot.placeOrder(orderData);
 
             if (response.result) {
-                this.logger.info(`[${this.getName()}] Entry order placed successfully.`);
+                // <<< MODIFIED: Confirm with OrderManager >>>
+                this.bot.confirmRegisteredOrder(clientOrderId, response.result);
+                this.logger.info(`[${this.getName()}] Entry order placed successfully. Handing off to OrderManager to attach SL.`);
                 this.bot.priceAtLastTrade = currentPrice;
-                // this.bot.startCooldown(); // <<< REMOVED
             } else { 
-                this.lastEntrySignalPrice = null; // Clear price on failure
+                this.bot.cancelPendingOrder(clientOrderId); // <<< ADDED
+                this.lastEntrySignalPrice = null;
                 throw new Error(`Exchange rejected order: ${JSON.stringify(response)}`); 
             }
         } catch (error) {
+            this.bot.cancelPendingOrder(clientOrderId); // <<< ADDED
             this.logger.error(`[${this.getName()}] Failed to enter position:`, { message: error.message });
-            this.lastEntrySignalPrice = null; // Also clear on error
+            this.lastEntrySignalPrice = null;
         } finally {
             this.bot.isOrderInProgress = false;
         }
@@ -95,6 +107,10 @@ class MomentumRiderStrategy {
     async exitPosition() {
         if (!this.position || this.isExitInProgress) return;
         this.isExitInProgress = true;
+        
+        // <<< MODIFIED: Cancel the hard stop-loss before placing our own exit order >>>
+        await this.bot.cancelActiveStopLoss(this.position.clientOrderId);
+        
         const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
         try {
             const orderData = { 
@@ -108,10 +124,11 @@ class MomentumRiderStrategy {
             if (!response.result) {
                 throw new Error(`Exchange rejected exit order: ${JSON.stringify(response)}`);
             }
-            this.logger.info(`[${this.getName()}] Exit order placed successfully.`);
+            this.logger.info(`[${this.getName()}] Trailing exit order placed successfully.`);
         } catch (error) {
-            this.logger.error(`[${this.getName()}] Failed to place exit order:`, { message: error.message });
-            this.isExitInProgress = false; 
+            this.logger.error(`[${this.getName()}] Failed to place trailing exit order:`, { message: error.message });
+            // Even if exit fails, we must keep isExitInProgress true to prevent new attempts.
+            // The position will be cleared by the websocket update eventually.
         }
     }
 }
