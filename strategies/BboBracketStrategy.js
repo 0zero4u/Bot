@@ -1,5 +1,5 @@
 // strategies/BboBracketStrategy.js
-// Version 8.1.0 - Added Price Aggression Offset for Slippage Control
+// This strategy places a main order and relies on the trader to manage the TP/SL bracket.
 const { v4: uuidv4 } = require('uuid');
 
 class BboBracketStrategy {
@@ -11,51 +11,32 @@ class BboBracketStrategy {
     getName() { return "BboBracketStrategy"; }
 
     async onPriceUpdate(currentPrice, priceDifference) {
-        if (priceDifference < this.bot.config.priceThreshold) {
-            return;
-        }
-
         this.bot.isOrderInProgress = true;
         try {
-            this.logger.info(`[${this.getName()}] TRADE TRIGGER: Price diff $${priceDifference.toFixed(2)}`);
             const side = currentPrice > this.bot.priceAtLastTrade ? 'buy' : 'sell';
             const clientOrderId = uuidv4();
             const book = side === 'buy' ? this.bot.orderBook.asks : this.bot.orderBook.bids;
             if (!book?.[0]?.[0]) throw new Error(`No L1 data for side '${side}'.`);
             
             const bboPrice = parseFloat(book[0][0]);
-            
-            // --- SLIPPAGE CONTROL ---
-            // Calculate an aggressive limit price to increase fill probability.
-            const aggressionOffset = side === 'buy' 
-                ? this.bot.config.priceAggressionOffset 
-                : -this.bot.config.priceAggressionOffset;
+            const aggressionOffset = side === 'buy' ? this.bot.config.priceAggressionOffset : -this.bot.config.priceAggressionOffset;
             const aggressiveLimitPrice = bboPrice + aggressionOffset;
             
-            this.logger.info(`[${this.getName()}] Applying aggression offset: BBO price is ${bboPrice}, placing limit at ${aggressiveLimitPrice.toFixed(4)}`);
-
-            // Calculate TP/SL based on the new aggressive price.
-            const takeProfitPrice = side === 'buy' ? aggressiveLimitPrice + this.bot.config.takeProfitOffset : aggressiveLimitPrice - this.bot.config.takeProfitOffset;
-            const stopLossPrice = side === 'buy' ? aggressiveLimitPrice - this.bot.config.stopLossOffset : aggressiveLimitPrice + this.bot.config.stopLossOffset;
-
-            if (takeProfitPrice <= 0 || stopLossPrice <= 0) {
-                this.logger.error(`[${this.getName()}] ABORTING: Invalid bracket price (<= 0).`, { aggressiveLimitPrice, takeProfitPrice, stopLossPrice });
-                return;
-            }
-            
             const orderData = {
-                product_id: this.bot.config.productId, size: this.bot.config.orderSize, side,
+                product_id: this.bot.config.productId, 
+                size: this.bot.config.orderSize, 
+                side,
                 order_type: 'limit_order', 
-                limit_price: aggressiveLimitPrice.toString(), // Use the aggressive price
+                limit_price: aggressiveLimitPrice.toString(),
                 client_order_id: clientOrderId,
-                bracket_take_profit_price: takeProfitPrice.toString(),
-                bracket_stop_loss_price: stopLossPrice.toString(),
             };
             
+            this.logger.info(`[${this.getName()}] Placing main bracket order at ${aggressiveLimitPrice.toFixed(4)}.`);
             const response = await this.bot.placeOrder(orderData);
 
-            if (response.success && response.result) {
-                this.logger.info(`[${this.getName()}] Main order placement successful. Waiting for TP/SL updates.`);
+            if (response.result) {
+                this.logger.info(`[${this.getName()}] Main order placement successful. Handing off to OrderManager.`);
+                // CRITICAL: Register the order with the trader for bracket management.
                 this.bot.registerOrder(response.result, 'main', clientOrderId);
                 this.bot.priceAtLastTrade = currentPrice;
                 this.bot.startCooldown();
@@ -69,5 +50,4 @@ class BboBracketStrategy {
         }
     }
 }
-
 module.exports = BboBracketStrategy;
