@@ -1,5 +1,5 @@
 // client.js
-// Version 5.0.0 - FINAL & CORRECTED: Implements the exact signature logic from official documentation.
+// Version 6.0.0 - FINAL & CORRECTED: Guarantees signature matches the request URI.
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -23,45 +23,40 @@ class DeltaClient {
             timeout: 15000,
             headers: { 
                 'Content-Type': 'application/json',
-                'User-Agent': 'trading-bot-v10.5' // Required by API firewall
+                'User-Agent': 'trading-bot-v10.6' // Required by API firewall
             }
         });
     }
 
-    async #request(method, path, data = null, query = null, auth = true) {
-        const requestConfig = {
-            method,
-            url: path, // Only the path, e.g., /v2/orders
-            params: query,
-            data: data,
-            headers: {}
-        };
+    async #request(method, path, data = null, query = null) {
+        // Create the full path with encoded query params using Axios's own serializer.
+        // This guarantees the path used in the signature is IDENTICAL to the one in the request.
+        const url = this.#axiosInstance.getUri({ url: path, params: query });
+        
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const bodyString = data ? JSON.stringify(data) : '';
 
-        if (auth) {
-            const timestamp = Math.floor(Date.now() / 1000).toString();
+        // The signature is built from the exact URI that will be requested.
+        const signatureData = method.toUpperCase() + timestamp + url + bodyString;
+        
+        this.#logger.debug(`[DeltaClient] Signing string: "${signatureData}"`);
+
+        const signature = crypto.createHmac('sha256', this.#apiSecret)
+            .update(signatureData)
+            .digest('hex');
             
-            // <<< THE DEFINITIVE FIX >>>
-            // Create the query and body strings exactly as per documentation.
-            const queryString = query ? '?' + new URLSearchParams(query).toString() : '';
-            const bodyString = data ? JSON.stringify(data) : '';
-
-            // The signature path is composed of the distinct components.
-            const signatureData = method.toUpperCase() + timestamp + path + queryString + bodyString;
-            
-            this.#logger.debug(`[DeltaClient] Signing string: "${signatureData}"`);
-
-            const signature = crypto.createHmac('sha256', this.#apiSecret).update(signatureData).digest('hex');
-
-            // Add authentication headers to the request config.
-            requestConfig.headers = {
-                'api-key': this.#apiKey,
-                'timestamp': timestamp,
-                'signature': signature,
-            };
-        }
-
         try {
-            const response = await this.#axiosInstance(requestConfig);
+            const response = await this.#axiosInstance({
+                method,
+                url: path, // Let axios use the original path and params object
+                params: query,
+                data: data,
+                headers: {
+                    'api-key': this.#apiKey,
+                    'timestamp': timestamp,
+                    'signature': signature,
+                }
+            });
             return response.data;
         } catch (error) {
             this.#logger.error(`[DeltaClient] API Request Failed: ${method} ${path}`, {
@@ -74,12 +69,12 @@ class DeltaClient {
     
     // --- Authenticated Methods ---
     placeOrder(orderData) {
-        return this.#request('POST', '/v2/orders', orderData, null, true);
+        return this.#request('POST', '/v2/orders', orderData, null);
     }
 
     getLiveOrders(productId) {
         if (!productId) throw new Error("productId is required for getLiveOrders.");
-        return this.#request('GET', '/v2/orders', null, { product_id: productId }, true);
+        return this.#request('GET', '/v2/orders', null, { product_id: productId });
     }
 
     batchCancelOrders(productId, orderIds) {
@@ -90,7 +85,7 @@ class DeltaClient {
             product_id: productId,
             orders: orderIds.map(id => ({ id }))
         };
-        return this.#request('DELETE', '/v2/orders/batch', payload, null, true);
+        return this.#request('DELETE', '/v2/orders/batch', payload, null);
     }
     
     async cancelAllOrders(productId) {
@@ -108,7 +103,6 @@ class DeltaClient {
             }
         } catch (error) {
             this.#logger.error(`[DeltaClient] Failed to execute cancelAllOrders due to an API error.`);
-            // Return a consistent failure object
             return Promise.resolve({ success: false, error: 'API error during getLiveOrders prevented cancellation.' });
         }
     }
