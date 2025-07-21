@@ -153,4 +153,3 @@ class MomentumRiderStrategy {
     }
 }
 module.exports = MomentumRiderStrategy;
-                             
