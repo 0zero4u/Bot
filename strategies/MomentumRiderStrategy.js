@@ -1,5 +1,5 @@
 // strategies/MomentumRiderStrategy.js
-// Version 5.0.0 - FINAL: Implements atomic server-side SL with client-side algorithmic override.
+// Version 5.1.0 - Correctly implements algorithmic exit by fetching and cancelling the hard SL.
 
 const { v4: uuidv4 } = require('uuid');
 
@@ -68,27 +68,18 @@ class MomentumRiderStrategy {
         this.bot.isOrderInProgress = true;
         try {
             const side = currentPrice > this.bot.priceAtLastTrade ? 'buy' : 'sell';
-            
-            // <<< THE DEFINITIVE FIX >>>
-            // We calculate the hard stop-loss price based on the *current market price* and offset.
-            // This ensures maximum protection against a sudden crash right after entry.
-            const stopLossPrice = side === 'buy' 
-                ? currentPrice - this.bot.config.stopLossOffset 
-                : currentPrice + this.bot.config.stopLossOffset;
+            const stopLossPrice = side === 'buy' ? currentPrice - this.bot.config.stopLossOffset : currentPrice + this.bot.config.stopLossOffset;
 
             if (stopLossPrice <= 0) {
                 this.logger.error(`[${this.getName()}] ABORTING: Invalid Stop-Loss Price (<=0) calculated.`, { currentPrice, stopLossPrice });
                 return;
             }
             
-            // Create a single ATOMIC order payload that includes the bracket parameter.
-            // This is sent in ONE API call.
             const orderData = { 
                 product_id: this.bot.config.productId, 
                 size: this.bot.config.orderSize, 
                 side, 
                 order_type: 'market_order',
-                // This special field tells the exchange to create the fail-safe SL for us instantly upon fill.
                 bracket_stop_loss_price: stopLossPrice.toString()
             };
             
@@ -98,7 +89,6 @@ class MomentumRiderStrategy {
             const response = await this.bot.placeOrder(orderData);
 
             if (response.result) {
-                // The process is now simple and robust. The exchange handles the SL placement.
                 this.logger.info(`[${this.getName()}] Atomic entry order placed successfully. Exchange is managing the fail-safe SL.`);
                 this.bot.priceAtLastTrade = currentPrice;
             } else { 
@@ -117,19 +107,29 @@ class MomentumRiderStrategy {
         if (!this.position || this.isExitInProgress) return;
         this.isExitInProgress = true;
         
-        // CRITICAL OVERRIDE STEP:
-        // Before we place our own exit order, we cancel ALL open orders for this symbol.
-        // This removes the hard fail-safe stop-loss from the exchange, preventing conflicts.
-        this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Cancelling all open orders for ${this.bot.config.productSymbol} to remove the hard SL.`);
+        this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Fetching and cancelling hard SL before placing final exit order.`);
+        
         try {
-            await this.bot.client.cancelAllOrders(this.bot.config.productId);
-            this.logger.info(`[${this.getName()}] Hard SL cancelled successfully.`);
+            // <<< THE DEFINITIVE FIX >>>
+            // 1. Get all live orders for the symbol.
+            const liveOrdersResponse = await this.bot.client.getLiveOrders(this.bot.config.productId);
+            if (liveOrdersResponse.result && liveOrdersResponse.result.length > 0) {
+                const orderIdsToCancel = liveOrdersResponse.result.map(o => o.id);
+                this.logger.info(`[${this.getName()}] Found open orders to cancel: ${orderIdsToCancel.join(', ')}`);
+                
+                // 2. Batch cancel all found orders.
+                await this.bot.client.batchCancelOrders(this.bot.config.productId, orderIdsToCancel);
+                this.logger.info(`[${this.getName()}] Hard SL and any other open orders cancelled successfully.`);
+            } else {
+                this.logger.info(`[${this.getName()}] No open orders found to cancel.`);
+            }
         } catch (error) {
             this.logger.error(`[${this.getName()}] Could not cancel hard SL, but proceeding with exit order anyway. Manual check may be required.`, { message: error.message });
         }
         
         const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
         try {
+            // 3. Place the final market order to close the position.
             const orderData = { 
                 product_id: this.bot.config.productId, 
                 size: this.position.size, 
