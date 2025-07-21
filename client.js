@@ -30,18 +30,9 @@ class DeltaClient {
 
     async #request(method, path, data = null, query = null) {
         const timestamp = Math.floor(Date.now() / 1000).toString();
-        
-        // --- THE DEFINITIVE FIX ---
-        // 1. Generate the query string. It's an empty string if `query` is null.
         const queryString = query ? new URLSearchParams(query).toString() : '';
-        
-        // 2. Generate the body string. It's an empty string if `data` is null.
         const bodyString = data ? JSON.stringify(data) : '';
-
-        // 3. For the signature, the query string MUST be prefixed with '?' if it exists.
         const queryStringForSig = queryString ? '?' + queryString : '';
-
-        // 4. Build the final signature string from the distinct components, exactly as per the official examples.
         const signatureData = method.toUpperCase() + timestamp + path + queryStringForSig + bodyString;
         
         this.#logger.debug(`[DeltaClient] Signing string: "${signatureData}"`);
@@ -49,7 +40,6 @@ class DeltaClient {
         const signature = crypto.createHmac('sha256', this.#apiSecret).update(signatureData).digest('hex');
 
         try {
-            // 5. Make the request using the original path and query object. `axios` will handle the final URL construction.
             const response = await this.#axiosInstance({
                 method,
                 url: path,
@@ -71,14 +61,12 @@ class DeltaClient {
         }
     }
     
-    // --- Authenticated Methods ---
     placeOrder(orderData) {
         return this.#request('POST', '/v2/orders', orderData, null);
     }
 
     getLiveOrders(productId) {
         if (!productId) throw new Error("productId is required for getLiveOrders.");
-        // This is a direct implementation of the `get_live_orders` Python function.
         return this.#request('GET', '/v2/orders', null, { product_id: productId });
     }
 
@@ -90,7 +78,6 @@ class DeltaClient {
             product_id: productId,
             orders: orderIds.map(id => ({ id }))
         };
-        // This is a direct implementation of the `batch_cancel` Python function.
         return this.#request('DELETE', '/v2/orders/batch', payload, null);
     }
     
@@ -98,13 +85,10 @@ class DeltaClient {
         this.#logger.info(`[DeltaClient] Requesting to cancel all orders for product ${productId}...`);
         
         try {
-            // This now correctly calls the fixed `getLiveOrders`.
             const liveOrdersResponse = await this.getLiveOrders(productId);
-
             if (liveOrdersResponse && liveOrdersResponse.result && liveOrdersResponse.result.length > 0) {
                 const orderIdsToCancel = liveOrdersResponse.result.map(o => o.id);
                 this.#logger.info(`[DeltaClient] Found open orders to cancel: ${orderIdsToCancel.join(', ')}`);
-                // This now correctly calls the fixed `batchCancelOrders`.
                 return this.batchCancelOrders(productId, orderIdsToCancel);
             } else {
                 this.#logger.info(`[DeltaClient] No live orders found for product ${productId}.`);
