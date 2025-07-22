@@ -1,5 +1,5 @@
 // strategies/MomentumRiderStrategy.js
-// Version 6.0.0 - HYPER-EFFICIENT EXIT: Relies on exchange to auto-cancel bracket SL after position closes.
+// Version 8.0.0 - AGGRESSIVE ENTRY: Uses an IOC Limit Order to cross the spread and ensure immediate fills.
 
 class MomentumRiderStrategy {
     constructor(bot) {
@@ -25,7 +25,6 @@ class MomentumRiderStrategy {
     }
 
     onPositionUpdate(positionUpdate) {
-        // ... (this function remains the same)
         const positionSize = parseFloat(positionUpdate.size);
         const positionIsOpen = positionSize !== 0;
 
@@ -38,6 +37,7 @@ class MomentumRiderStrategy {
             };
             this.logger.info(`[${this.getName()}] POSITION SYNCED. Algorithmic trailing stop is now active.`, {
                 entry: this.position.entryPrice,
+                size: this.position.size,
                 peak: this.position.peakPrice
             });
         
@@ -50,7 +50,6 @@ class MomentumRiderStrategy {
     }
 
     manageOpenPosition(currentPrice) {
-        // ... (this function remains the same)
         if (!this.position || this.isExitInProgress || !this.position.peakPrice) return;
         let drawdown = 0;
         if (this.position.side === 'buy') {
@@ -66,32 +65,55 @@ class MomentumRiderStrategy {
         }
     }
 
+    /**
+     * [MODIFIED] Places an aggressive IOC Limit Order to ensure an immediate, controlled fill.
+     */
     async tryEnterPosition(currentPrice) {
-        // ... (this function remains the same)
         this.bot.isOrderInProgress = true;
         try {
             const side = currentPrice > this.bot.priceAtLastTrade ? 'buy' : 'sell';
-            if (!this.bot.isOrderbookReady || !this.bot.orderBook.bids?.[0]?.[0]) {
-                throw new Error("L1 order book is not ready for SL calculation.");
-            }
-            const deltaReferencePrice = side === 'buy' ? parseFloat(this.bot.orderBook.bids[0][0]) : parseFloat(this.bot.orderBook.asks[0][0]);
-            const stopLossPrice = side === 'buy' ? deltaReferencePrice - this.bot.config.stopLossOffset : deltaReferencePrice + this.bot.config.stopLossOffset;
-            if (stopLossPrice <= 0) throw new Error(`Invalid Stop-Loss Price (<=0) calculated: ${stopLossPrice}`);
             
+            if (!this.bot.isOrderbookReady || !this.bot.orderBook.bids?.[0]?.[0] || !this.bot.orderBook.asks?.[0]?.[0]) {
+                throw new Error("L1 order book is not ready for price calculation.");
+            }
+
+            // --- AGGRESSIVE LIMIT PRICE CALCULATION ---
+            // To buy, we place an order slightly ABOVE the best ask.
+            // To sell, we place an order slightly BELOW the best bid.
+            const referencePrice = side === 'buy' ? parseFloat(this.bot.orderBook.asks[0][0]) : parseFloat(this.bot.orderBook.bids[0][0]);
+            const aggressiveLimitPrice = side === 'buy' 
+                ? referencePrice + this.bot.config.priceAggressionOffset // The user requested 0.5, this offset is configurable.
+                : referencePrice - this.bot.config.priceAggressionOffset;
+
+            // --- FAIL-SAFE SL CALCULATION (based on the opposite side of the book) ---
+            const stopLossReferencePrice = side === 'buy' ? parseFloat(this.bot.orderBook.bids[0][0]) : parseFloat(this.bot.orderBook.asks[0][0]);
+            const stopLossPrice = side === 'buy' 
+                ? stopLossReferencePrice - this.bot.config.stopLossOffset 
+                : stopLossReferencePrice + this.bot.config.stopLossOffset;
+
+            if (stopLossPrice <= 0) {
+                throw new Error(`Invalid Stop-Loss Price (<=0) calculated: ${stopLossPrice}`);
+            }
+            
+            // --- THE NEW, AGGRESSIVE & SAFE ORDER PAYLOAD ---
             const orderData = { 
                 product_id: this.bot.config.productId, 
                 size: this.bot.config.orderSize, 
                 side, 
-                order_type: 'market_order',
+                order_type: 'limit_order',                  // ✅ Use a limit order
+                limit_price: aggressiveLimitPrice.toString(), // ✅ Set our aggressive price to act as a taker
+                time_in_force: 'ioc',                         // ✅ Fill what's available immediately and cancel the rest
                 bracket_stop_loss_price: stopLossPrice.toString(),
                 bracket_stop_trigger_method: 'last_traded_price'
             };
             
-            this.logger.info(`[${this.getName()}] Placing ATOMIC market order with fail-safe SL.`, { payload: orderData });
+            this.logger.info(`[${this.getName()}] Placing Aggressive IOC Limit Order with Fail-Safe SL.`, { payload: orderData });
             this.lastEntrySignalPrice = currentPrice;
+            
             const response = await this.bot.placeOrder(orderData);
+
             if (response.result) {
-                this.logger.info(`[${this.getName()}] Atomic entry order accepted by exchange.`);
+                this.logger.info(`[${this.getName()}] IOC entry order accepted by exchange. Waiting for fill confirmation.`);
                 this.bot.priceAtLastTrade = currentPrice;
             } else { 
                 throw new Error(JSON.stringify(response)); 
@@ -109,17 +131,13 @@ class MomentumRiderStrategy {
     }
 
     /**
-     * [HYPER-EFFICIENT EXIT] This function now only places the closing market order.
-     * It relies on the exchange to automatically cancel the linked bracket stop-loss
-     * after the position is closed, eliminating the need for a separate API call.
+     * [HYPER-EFFICIENT EXIT] This function remains unchanged.
      */
     async exitPosition() {
         if (!this.position || this.isExitInProgress) return;
         this.isExitInProgress = true;
         
         this.logger.warn(`[${this.getName()}] Algorithmic exit. Placing market order to close position.`);
-
-        // NOTE: The `safeCancelAll` call has been REMOVED.
         
         const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
         try {
