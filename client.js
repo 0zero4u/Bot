@@ -1,5 +1,5 @@
 // client.js
-// Version 11.0.0 - FINAL: Implements robust response parsing to permanently fix cancellation TypeErrors.
+// Version 12.0.0 - FINAL: Implements a truly robust and efficient cancellation logic.
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -68,6 +68,14 @@ class DeltaClient {
   placeOrder(payload) {
     return this.#request('POST', '/v2/orders', payload);
   }
+
+  /**
+   * Helper function to cancel a single order by its ID.
+   */
+  cancelSingleOrder(productId, orderId) {
+    const payload = { product_id: productId, id: orderId };
+    return this.#request('DELETE', '/v2/orders', payload);
+  }
   
   getPositions() {
     return this.#request('GET', '/v2/positions/margined');
@@ -80,7 +88,6 @@ class DeltaClient {
 
   async batchCancelOrders(productId, ids) {
     if (!ids?.length) {
-      this.logger.info('[DeltaClient] batchCancelOrders called with no IDs.');
       return { success: true, result: 'nothing-to-do' };
     }
     const payload = { product_id: productId, orders: ids.map((id) => ({ id })) };
@@ -88,46 +95,43 @@ class DeltaClient {
   }
 
   /**
-   * [STABLE & FINAL] Cancels all live orders for a product.
-   * This version correctly parses the API response to prevent crashes.
-   * It uses the reliable batch cancellation method for maximum stability.
-   * @param {number} productId
+   * [FINAL & OPTIMIZED] Safely cancels orders for a product.
    */
   async cancelAllOrders(productId) {
     try {
       const response = await this.getLiveOrders(productId);
 
-      // --- ROBUST PARSING (Inspired by the Python client) ---
-      // 1. Check if the response itself is valid and successful
-      if (!response || !response.success) {
-        this.logger.warn('[DeltaClient] getLiveOrders returned a non-successful response. Assuming no orders to cancel.', { response });
+      // --- Defensive Check 1: Verify the API response structure ---
+      if (!response || !response.success || !Array.isArray(response.result)) {
+        this.logger.warn('[DeltaClient] getLiveOrders returned an invalid response. Assuming no orders to cancel.', { response });
         return;
       }
 
-      // 2. Safely extract the 'result' array
       const liveOrders = response.result;
-
-      // 3. Check if the result is a valid array
-      if (!Array.isArray(liveOrders)) {
-        this.logger.warn('[DeltaClient] getLiveOrders result is not an array. Assuming no orders to cancel.', { result: liveOrders });
-        return;
-      }
-      
       const ids = liveOrders.map((o) => o.id);
 
+      // --- Decision Logic ---
+      if (ids.length === 1) {
+        // HAPPY PATH: Exactly one order found. Use the efficient method.
+        this.logger.info(`[DeltaClient] Found 1 order. Using efficient single cancellation (Weight: 5).`);
+        return await this.cancelSingleOrder(productId, ids[0]);
+      } 
+      
       if (ids.length === 0) {
+        // No orders were found, so our job is done.
         this.logger.info('[DeltaClient] No live orders found to cancel.');
         return;
       }
       
-      this.logger.info(`[DeltaClient] Found ${ids.length} order(s). Using robust batch cancellation.`);
+      // SAFE PATH: More than 1 order found. Use the robust batch method as a safety net.
+      this.logger.warn(`[DeltaClient] Found ${ids.length} orders. Using robust batch cancellation as a safeguard (Weight: 25).`);
       return await this.batchCancelOrders(productId, ids);
 
     } catch (error) {
+        // This is the final safety net that catches any unexpected error from the process.
         const payload = error?.response?.data ?? error.message;
-        this.#logger.error('[DeltaClient] CRITICAL: An exception occurred during the cancelAllOrders process.', { payload });
-        // Re-throw so the robust handler in trader.js can log it without crashing the bot.
-        throw error;
+        this.#logger.error('[DeltaClient] CRITICAL: An exception occurred during cancelAllOrders.', { payload });
+        throw error; // Re-throw so trader.js can log it without crashing.
     }
   }
 }
