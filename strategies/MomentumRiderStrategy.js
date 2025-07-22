@@ -1,5 +1,5 @@
 // strategies/MomentumRiderStrategy.js
-// Version 5.4.0 - FINAL: Implemented reactive state correction for position mismatch errors.
+// Version 5.4.1 - FINAL: Corrected the JSON path for reactive state correction.
 
 const { v4: uuidv4 } = require('uuid');
 
@@ -121,9 +121,9 @@ class MomentumRiderStrategy {
                 return; // Can't analyze further
             }
 
-            // --- REACTIVE FIX ---
-            // Check for the specific error indicating a state mismatch
-            if (response && response.error_code === 'bracket_order_position_exists') {
+            // --- REACTIVE FIX (v5.4.1) ---
+            // Correctly check the nested 'code' property inside the 'error' object.
+            if (response && response.error && response.error.code === 'bracket_order_position_exists') {
                 this.logger.warn(`[${this.getName()}] State mismatch detected: Exchange reports an open position. Forcing state correction.`);
                 this.bot.forceStateCorrection();
             } else {
@@ -160,7 +160,6 @@ class MomentumRiderStrategy {
             }
             this.logger.info(`[${this.getName()}] Algorithmic exit order to close position has been placed.`);
         } catch (error) {
-            // This logging is still valuable in the case of a critical failure to place the closing order.
             this.logger.error(`[${this.getName()}] CRITICAL: Failed to place algorithmic exit order. Manual intervention may be required.`, { message: error.message });
         }
     }
