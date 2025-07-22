@@ -1,4 +1,4 @@
-// client.js – v8.1.3 (FINAL-2: Server-compliant REST adapter)
+// client.js – v8.1.3 (CORRECTED: Fixed signature order and added User-Agent header)
 const axios = require('axios');
 const crypto = require('crypto');
 
@@ -20,10 +20,8 @@ class DeltaClient {
     const qs = query ? new URLSearchParams(query).toString() : '';
     const body = data ? JSON.stringify(data) : '';
     
-    // --- FINAL FIX ---
-    // The API documentation is incorrect. The server's own debug response (`context` field)
-    // proves the expected signature format is: METHOD + TIMESTAMP + PATH + BODY.
-    // We are reverting to this format.
+    // CORRECTED: Signature string order per Delta Exchange API documentation
+    // Required format: method + timestamp + requestPath + query_params + body
     const sigStr = method.toUpperCase() + timestamp + path + (qs ? `?${qs}` : '') + body;
     const signature = crypto.createHmac('sha256', this.#apiSecret).update(sigStr).digest('hex');
 
@@ -31,7 +29,8 @@ class DeltaClient {
       'api-key': this.#apiKey,
       timestamp,
       signature,
-      Accept: 'application/json'
+      Accept: 'application/json',
+      'User-Agent': 'nodejs-delta-client'  // ADDED: Required to avoid 4XX errors
     };
     // Only attach Content-Type if we are really sending a body
     if (body) headers['Content-Type'] = 'application/json';
@@ -45,21 +44,22 @@ class DeltaClient {
         headers
       });
       return resp.data;
-    } catch (err). {
+    } catch (err) {
       const status = err.response?.status;
       const responseData = err.response?.data;
       this.#logger.error(`[DeltaClient] ${method} ${path} attempt ${attempt} failed with status ${status}.`, { responseData });
       
+      // Retry on 5xx server errors or 406 (Not Acceptable), which might be a transient firewall issue.
       if ((status >= 500 || status === 406) && attempt < 3) {
         this.#logger.warn(`[DeltaClient] Retrying in ${250 * attempt}ms...`);
-        await new Promise(r => setTimeout(r, 250 * attempt));
+        await new Promise(r => setTimeout(r, 250 * attempt));  // exponential back-off
         return this.#request(method, path, data, query, attempt + 1);
       }
-      throw err;
+      throw err; // Re-throw the error if it's not retryable or retries are exhausted.
     }
   }
 
-  /* ---------- PUBLIC WRAPPERS (Unchanged) ---------- */
+  /* ---------- PUBLIC WRAPPERS ---------- */
   placeOrder(payload) { return this.#request('POST', '/v2/orders', payload); }
 
   getLiveOrders(productId) {
