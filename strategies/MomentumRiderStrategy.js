@@ -14,7 +14,6 @@ class MomentumRiderStrategy {
 
     getName() { return "MomentumRiderStrategy"; }
 
-    // --- onPriceUpdate and onPositionUpdate are unchanged, omitted for brevity ---
     async onPriceUpdate(currentPrice, priceDifference) {
         if (this.position) {
             this.manageOpenPosition(currentPrice);
