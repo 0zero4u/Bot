@@ -1,6 +1,3 @@
-// strategies/MomentumRiderStrategy.js
-// Version 5.3.0 - FINAL: Refactored to use the bot's centralized safeCancelAll method.
-
 const { v4: uuidv4 } = require('uuid');
 
 class MomentumRiderStrategy {
@@ -31,7 +28,7 @@ class MomentumRiderStrategy {
                 side: positionSize > 0 ? 'buy' : 'sell',
                 entryPrice: parseFloat(positionUpdate.entry_price),
                 size: Math.abs(positionSize),
-                peakPrice: this.lastEntrySignalPrice
+                peakPrice: this.lastEntrySignalPrice || parseFloat(positionUpdate.entry_price)
             };
             this.logger.info(`[${this.getName()}] POSITION SYNCED. Algorithmic trailing stop is now active.`, {
                 entry: this.position.entryPrice,
@@ -108,11 +105,28 @@ class MomentumRiderStrategy {
                 this.bot.priceAtLastTrade = currentPrice;
             } else { 
                 this.lastEntrySignalPrice = null;
-                throw new Error(`Exchange rejected order: ${JSON.stringify(response)}`); 
+                // Throw the raw response to be parsed by the catch block
+                throw new Error(JSON.stringify(response)); 
             }
         } catch (error) {
-            this.logger.error(`[${this.getName()}] Failed to enter position:`, { message: error.message });
-            this.lastEntrySignalPrice = null;
+            this.lastEntrySignalPrice = null; // Reset signal price on any error
+            let response;
+            try {
+                response = JSON.parse(error.message);
+            } catch (e) {
+                this.logger.error(`[${this.getName()}] Unparseable or critical error during position entry:`, { message: error.message });
+                return; // Can't analyze further
+            }
+
+            // --- REACTIVE FIX ---
+            // Check for the specific error indicating a state mismatch
+            if (response && response.error_code === 'bracket_order_position_exists') {
+                this.logger.warn(`[${this.getName()}] State mismatch detected: Exchange reports an open position. Forcing state correction.`);
+                this.bot.forceStateCorrection();
+            } else {
+                // Log any other legitimate rejections from the exchange
+                this.logger.error(`[${this.getName()}] Exchange rejected order to enter position:`, { response });
+            }
         } finally {
             this.bot.isOrderInProgress = false;
         }
@@ -124,9 +138,7 @@ class MomentumRiderStrategy {
         
         this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Cancelling all open orders for ${this.bot.config.productSymbol} to remove any hard SL.`);
         
-        // --- UPDATED ---
         // Use the high-level, safe helper on the bot instance.
-        // This abstracts away the direct client call and adds robust logging.
         await this.bot.safeCancelAll(this.bot.config.productId);
         this.logger.info(`[${this.getName()}] Proceeding with market exit order.`);
 
@@ -145,7 +157,6 @@ class MomentumRiderStrategy {
             }
             this.logger.info(`[${this.getName()}] Algorithmic exit order to close position has been placed.`);
         } catch (error) {
-            // This logging is still valuable in the case of a critical failure to place the closing order.
             this.logger.error(`[${this.getName()}] CRITICAL: Failed to place algorithmic exit order. Manual intervention may be required.`, { message: error.message });
         }
     }
