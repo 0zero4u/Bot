@@ -1,7 +1,8 @@
-// client.js – v8.4.0 (FIXED TypeError on getLiveOrders and robust cancellation)
+// client.js – v10.0.0 (STABLE & OPTIMIZED)
+// Implements a defensive, efficient cancellation logic for single-order scenarios.
 
 const axios = require('axios');
-const crypto =require('crypto');
+const crypto = require('crypto');
 
 class DeltaClient {
   #apiKey;
@@ -28,7 +29,7 @@ class DeltaClient {
   async #request(method, path, data = null, query = null, attempt = 1) {
     const timestamp = Math.floor(Date.now() / 1000).toString();
     const params = new URLSearchParams(query);
-    const qs = params.toString().replace(/%2C/g, ',');
+    const qs = params.toString().replace(/%2C/g, ','); 
     const body = data ? JSON.stringify(data) : '';
     const sigStr = method.toUpperCase() + timestamp + path + (qs ? `?${qs}` : '') + body;
     const signature = crypto.createHmac('sha256', this.#apiSecret).update(sigStr).digest('hex');
@@ -72,8 +73,16 @@ class DeltaClient {
     return this.#request('POST', '/v2/orders', payload);
   }
 
-  cancelOrder(productId, orderId) {
-    const payload = { product_id: productId, id: orderId };
+  /**
+   * Helper function to cancel a single order. (Weight: 5)
+   * @param {number} productId 
+   * @param {number} orderId 
+   */
+  cancelSingleOrder(productId, orderId) {
+    const payload = { 
+        product_id: productId,
+        id: orderId 
+    };
     return this.#request('DELETE', '/v2/orders', payload);
   }
   
@@ -96,46 +105,45 @@ class DeltaClient {
   }
 
   /**
-   * [CORRECTED & OPTIMIZED] Cancels all live orders for a product.
+   * [OPTIMIZED & SAFE] Cancels all live orders for a product.
+   * Uses a lightweight call for the common single-order case, with a robust fallback.
    * @param {number} productId
    */
   async cancelAllOrders(productId) {
     try {
       const live = await this.getLiveOrders(productId, { states: 'open,pending' });
 
-      // --- ROBUSTNESS FIX ---
-      // Add a defensive check to ensure live.result is an array before processing.
+      // --- Defensive Check 1: Ensure the response from the exchange is valid ---
       if (!live || !Array.isArray(live.result)) {
-        this.logger.warn('[DeltaClient] getLiveOrders returned an invalid response or no orders found. Assuming cancellation is not needed.', { response: live });
-        return;
+        this.logger.warn('[DeltaClient] getLiveOrders returned an invalid response. Falling back to robust batch cancel.', { response: live });
+        // As a fallback, try to cancel all, even without knowing the IDs. This endpoint handles it.
+        return await this.#request('DELETE', '/v2/orders/all', { product_id: productId });
       }
+      
       const ids = live.result.map((o) => o.id);
 
-      if (!ids.length) {
+      // --- Defensive Check 2: Handle the order count ---
+      if (ids.length === 1) {
+        // HAPPY PATH: Exactly one order found. Use the efficient method.
+        this.logger.info(`[DeltaClient] Found 1 order. Using efficient single order cancellation (Weight: 5).`);
+        return await this.cancelSingleOrder(productId, ids[0]);
+      }
+      
+      if (ids.length === 0) {
+        // No orders found, nothing to do.
         this.logger.info('[DeltaClient] No live orders found to cancel.');
         return;
       }
       
-      this.logger.info(`[DeltaClient] Found ${ids.length} order(s) to cancel.`);
+      // SAFE PATH: 0 or >1 orders found. Use the robust batch method just in case.
+      this.logger.warn(`[DeltaClient] Found ${ids.length} orders. Using robust batch cancellation as a safeguard (Weight: 25).`);
+      return await this.batchCancelOrders(productId, ids);
 
-      try {
-        if (ids.length === 1) {
-          this.logger.info(`[DeltaClient] Using efficient single order cancellation (Weight: 5).`);
-          return await this.cancelOrder(productId, ids[0]);
-        } else {
-          this.logger.info(`[DeltaClient] Using batch cancellation for multiple orders (Weight: 25).`);
-          return await this.batchCancelOrders(productId, ids);
-        }
-      } catch (err) {
-        if (err.response?.data?.error?.code === 'open_order_not_found') {
-          this.logger.warn('[DeltaClient] An order was not found (likely already closed/cancelled); ignoring.');
-          return;
-        }
-        throw err;
-      }
     } catch (error) {
-      this.logger.error('[DeltaClient] CRITICAL: Failed to get live orders for cancellation.', { message: error.message });
-      throw error;
+        // This catch block handles errors from the API calls themselves (e.g., network issues)
+        this.logger.error('[DeltaClient] CRITICAL: An error occurred during the cancellation process.', { message: error.message });
+        // Re-throw so the robust handler in trader.js can log it without crashing the bot.
+        throw error;
     }
   }
 }
