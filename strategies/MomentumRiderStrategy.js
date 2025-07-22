@@ -1,6 +1,6 @@
 // strategies/MomentumRiderStrategy.js
 
-// Version 5.4.2 - FIX: Entry guard checks both local and exchange state.
+// FINAL PATCHED VERSION: Prevents repeated entry attempts if exchange reports a position
 
 const { v4: uuidv4 } = require('uuid');
 
@@ -17,7 +17,7 @@ class MomentumRiderStrategy {
   getName() { return "MomentumRiderStrategy"; }
 
   async onPriceUpdate(currentPrice, priceDifference) {
-    // FIX: Only allow entry when both local and exchange agree position is flat
+    // PATCH: Only allow entry when BOTH local AND exchange state are flat
     if (this.position || this.bot.hasOpenPosition) {
       this.manageOpenPosition(currentPrice);
     } else {
@@ -116,7 +116,7 @@ class MomentumRiderStrategy {
         this.logger.error(`[${this.getName()}] Unparseable or critical error during position entry:`, { message: error.message });
         return;
       }
-      // --- REACTIVE FIX ---
+      // --- PATCHED: State correction on exchange-side position existence ---
       if (response && response.error && response.error.code === 'bracket_order_position_exists') {
         this.logger.warn(`[${this.getName()}] State mismatch detected: Exchange reports an open position. Forcing state correction.`);
         this.bot.forceStateCorrection();
