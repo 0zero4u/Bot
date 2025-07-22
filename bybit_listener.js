@@ -1,5 +1,5 @@
-// bybit_listener.js
-// v1.4.0 - Correctly implemented LOG throttling, not signal throttling.
+// binance_listener.js
+// v2.0.0 - Migrated from Bybit to Binance Spot stream.
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -7,13 +7,15 @@ require('dotenv').config();
 
 // --- Configuration ---
 const config = {
-  symbol: process.env.BYBIT_SYMBOL || 'BTCUSDT',
-  bybitStreamUrl: process.env.BYBIT_STREAM_URL || 'wss://stream.bybit.com/v5/public/spot',
+  // Binance symbols are typically lowercase, e.g., 'btcusdt'
+  symbol: process.env.BINANCE_SYMBOL || 'btcusdt',
+  // Base URL for Binance WebSocket streams
+  binanceStreamUrl: process.env.BINANCE_STREAM_URL || 'wss://stream.binance.com:9443/ws',
   reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
   internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
   minimumTickSize: parseFloat(process.env.MINIMUM_TICK_SIZE || '0.1'),
   logLevel: process.env.LOG_LEVEL || 'info',
-  logThrottleMs: 45 * 1000 // 45 seconds for throttling logs
+  logThrottleMs: 30 * 1000 // 30 seconds for throttling logs
 };
 
 // --- Logging Setup ---
@@ -30,9 +32,8 @@ const logger = winston.createLogger({
 });
 
 let internalWsClient = null;
-let bybitWsClient = null;
+let binanceWsClient = null;
 let lastSentSpotBidPrice = null;
-let pingInterval = null;
 let canLog = true; // Log throttling flag
 
 function connectToInternalReceiver() {
@@ -66,56 +67,38 @@ function sendToInternalClient(payload) {
   }
 }
 
-function connectToBybit() {
-  bybitWsClient = new WebSocket(config.bybitStreamUrl);
+function connectToBinance() {
+  // For Binance, the stream is specified in the URL. We use the book ticker stream for the top-of-book data.
+  const streamUrl = `${config.binanceStreamUrl}/${config.symbol}@bookTicker`;
+  binanceWsClient = new WebSocket(streamUrl);
 
-  bybitWsClient.on('open', () => {
-    logger.info('Bybit WebSocket connection established');
+  binanceWsClient.on('open', () => {
+    logger.info(`Binance WebSocket connection established. Subscribed to: ${config.symbol}@bookTicker`);
     lastSentSpotBidPrice = null;
-
-    pingInterval = setInterval(() => {
-        if (bybitWsClient.readyState === WebSocket.OPEN) {
-            bybitWsClient.send(JSON.stringify({ op: 'ping' }));
-            logger.debug('Sent ping to Bybit');
-        }
-    }, 20 * 1000);
-
-    const subscriptionMessage = {
-      op: 'subscribe',
-      args: [`orderbook.1.${config.symbol}`]
-    };
-
-    bybitWsClient.send(JSON.stringify(subscriptionMessage));
-    logger.info(`Subscribed to: ${subscriptionMessage.args[0]}`);
+    // Note: The 'ws' library automatically handles pong responses to Binance's pings.
+    // No manual ping sending is required.
   });
 
-  bybitWsClient.on('message', (data) => {
+  binanceWsClient.on('message', (data) => {
     try {
       const message = JSON.parse(data.toString());
-      
-      if (message.op === 'ping') {
-        bybitWsClient.send(JSON.stringify({ op: 'pong', req_id: message.req_id }));
-        return;
-      }
 
-      if (message.topic && message.topic.startsWith('orderbook.1') && message.data) {
-        const topBid = message.data.b && message.data.b[0];
-        if (!topBid) return;
-
-        const currentSpotBidPrice = parseFloat(topBid[0]);
+      // Check if the message contains book ticker data (specifically the best bid price 'b')
+      if (message && message.b) {
+        const currentSpotBidPrice = parseFloat(message.b);
         if (isNaN(currentSpotBidPrice)) return;
 
         if (lastSentSpotBidPrice === null) {
           lastSentSpotBidPrice = currentSpotBidPrice;
-          return;
+          return; // Initialize the price on first message
         }
 
         const priceDifference = currentSpotBidPrice - lastSentSpotBidPrice;
 
         if (Math.abs(priceDifference) >= config.minimumTickSize) {
+          // The format { type: 'S', p: price } is preserved for the internal client
           const payload = { type: 'S', p: currentSpotBidPrice };
           
-          // --- CORRECTED LOGIC ---
           // Always send the signal to the bot.
           sendToInternalClient(payload);
           lastSentSpotBidPrice = currentSpotBidPrice;
@@ -131,22 +114,21 @@ function connectToBybit() {
         }
       }
     } catch (error) {
-      logger.error('Error processing Bybit message:', error.message);
+      logger.error('Error processing Binance message:', error.message);
     }
   });
 
-  bybitWsClient.on('error', (error) => {
-    logger.error('Bybit WebSocket error:', error.message);
+  binanceWsClient.on('error', (error) => {
+    logger.error('Binance WebSocket error:', error.message);
   });
 
-  bybitWsClient.on('close', () => {
-    logger.warn('Bybit WebSocket connection closed. Reconnecting...');
-    clearInterval(pingInterval);
-    setTimeout(connectToBybit, config.reconnectInterval);
+  binanceWsClient.on('close', () => {
+    logger.warn('Binance WebSocket connection closed. Reconnecting...');
+    setTimeout(connectToBinance, config.reconnectInterval);
   });
 }
 
 // --- Start Connections ---
-logger.info('Starting Bybit listener...');
+logger.info('Starting Binance listener...');
 connectToInternalReceiver();
-connectToBybit();
+connectToBinance();
