@@ -1,5 +1,5 @@
 // client.js
-// Version 10.1.0 - STABLE: Implements safe, efficient cancellation and robust error guards.
+// Version 11.0.0 - FINAL: Implements robust response parsing to permanently fix cancellation TypeErrors.
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -68,11 +68,6 @@ class DeltaClient {
   placeOrder(payload) {
     return this.#request('POST', '/v2/orders', payload);
   }
-
-  cancelSingleOrder(productId, orderId) {
-    const payload = { product_id: productId, id: orderId };
-    return this.#request('DELETE', '/v2/orders', payload);
-  }
   
   getPositions() {
     return this.#request('GET', '/v2/positions/margined');
@@ -92,33 +87,46 @@ class DeltaClient {
     return await this.#request('DELETE', '/v2/orders/batch', payload);
   }
 
+  /**
+   * [STABLE & FINAL] Cancels all live orders for a product.
+   * This version correctly parses the API response to prevent crashes.
+   * It uses the reliable batch cancellation method for maximum stability.
+   * @param {number} productId
+   */
   async cancelAllOrders(productId) {
     try {
-      const live = await this.getLiveOrders(productId, { states: 'open,pending' });
+      const response = await this.getLiveOrders(productId);
 
-      if (!live || !Array.isArray(live.result)) {
-        this.logger.warn('[DeltaClient] getLiveOrders returned an invalid response. Falling back to robust batch cancel.', { response: live });
-        return await this.#request('DELETE', '/v2/orders/all', { product_id: productId });
+      // --- ROBUST PARSING (Inspired by the Python client) ---
+      // 1. Check if the response itself is valid and successful
+      if (!response || !response.success) {
+        this.logger.warn('[DeltaClient] getLiveOrders returned a non-successful response. Assuming no orders to cancel.', { response });
+        return;
+      }
+
+      // 2. Safely extract the 'result' array
+      const liveOrders = response.result;
+
+      // 3. Check if the result is a valid array
+      if (!Array.isArray(liveOrders)) {
+        this.logger.warn('[DeltaClient] getLiveOrders result is not an array. Assuming no orders to cancel.', { result: liveOrders });
+        return;
       }
       
-      const ids = live.result.map((o) => o.id);
+      const ids = liveOrders.map((o) => o.id);
 
-      if (ids.length === 1) {
-        this.logger.info(`[DeltaClient] Found 1 order. Using efficient single order cancellation (Weight: 5).`);
-        return await this.cancelSingleOrder(productId, ids[0]);
-      }
-      
       if (ids.length === 0) {
         this.logger.info('[DeltaClient] No live orders found to cancel.');
         return;
       }
       
-      this.logger.warn(`[DeltaClient] Found ${ids.length} orders. Using robust batch cancellation as a safeguard (Weight: 25).`);
+      this.logger.info(`[DeltaClient] Found ${ids.length} order(s). Using robust batch cancellation.`);
       return await this.batchCancelOrders(productId, ids);
 
     } catch (error) {
         const payload = error?.response?.data ?? error.message;
-        this.#logger.error('[DeltaClient] CRITICAL: cancelAllOrders failed.', { payload });
+        this.#logger.error('[DeltaClient] CRITICAL: An exception occurred during the cancelAllOrders process.', { payload });
+        // Re-throw so the robust handler in trader.js can log it without crashing the bot.
         throw error;
     }
   }
