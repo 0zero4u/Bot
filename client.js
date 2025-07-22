@@ -1,4 +1,4 @@
-// client.js – v8.1.0 (406-safe REST adapter)
+// client.js – v8.1.1 (FIXED: 403-safe REST adapter)
 const axios = require('axios');
 const crypto = require('crypto');
 
@@ -19,7 +19,12 @@ class DeltaClient {
     const timestamp = Math.floor(Date.now() / 1000).toString();
     const qs = query ? new URLSearchParams(query).toString() : '';
     const body = data ? JSON.stringify(data) : '';
-    const sigStr = method.toUpperCase() + timestamp + path + (qs ? `?${qs}` : '') + body;
+    
+    // --- FIX ---
+    // The signature string must have the timestamp at the END. The previous order
+    // (timestamp at the beginning) caused a 403 Forbidden error from the CloudFront WAF.
+    // Correct format: METHOD + path + body + timestamp
+    const sigStr = method.toUpperCase() + path + (qs ? `?${qs}` : '') + body + timestamp;
     const signature = crypto.createHmac('sha256', this.#apiSecret).update(sigStr).digest('hex');
 
     const headers = {
