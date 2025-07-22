@@ -1,4 +1,4 @@
-// client.js – v8.1.1 (FIXED: 403-safe REST adapter)
+// client.js – v8.1.2 (FINAL: Documentation-compliant REST adapter)
 const axios = require('axios');
 const crypto = require('crypto');
 
@@ -20,11 +20,10 @@ class DeltaClient {
     const qs = query ? new URLSearchParams(query).toString() : '';
     const body = data ? JSON.stringify(data) : '';
     
-    // --- FIX ---
-    // The signature string must have the timestamp at the END. The previous order
-    // (timestamp at the beginning) caused a 403 Forbidden error from the CloudFront WAF.
-    // Correct format: METHOD + path + body + timestamp
-    const sigStr = method.toUpperCase() + path + (qs ? `?${qs}` : '') + body + timestamp;
+    // --- FINAL FIX ---
+    // The official Delta Exchange documentation specifies the signature string must be in the
+    // exact order: http_method + request_path + timestamp + request_body
+    const sigStr = method.toUpperCase() + path + (qs ? `?${qs}` : '') + timestamp + body;
     const signature = crypto.createHmac('sha256', this.#apiSecret).update(sigStr).digest('hex');
 
     const headers = {
@@ -72,10 +71,8 @@ class DeltaClient {
         this.#logger.info('[DeltaClient] batchCancelOrders called with no IDs.');
         return { success: true, result: 'nothing-to-do' };
     }
-    // Delta API might have a limit on the number of orders in a single batch request.
-    // Chunking the requests is a safe way to handle large numbers of cancellations.
     const chunks = [];
-    for (let i = 0; i < ids.length; i += 20) { // Using a conservative chunk size of 20
+    for (let i = 0; i < ids.length; i += 20) {
         chunks.push(ids.slice(i, i + 20));
     }
 
@@ -86,7 +83,6 @@ class DeltaClient {
             product_id: productId,
             orders: slice.map(id => ({ id }))
       };
-      // The DELETE method for batch cancellation sends the product_id in the body, not query.
       const res = await this.#request('DELETE', '/v2/orders/batch', payload, null);
       results.push(res);
     }
