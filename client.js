@@ -1,4 +1,4 @@
-// client.js – v8.1.2 (FINAL: Documentation-compliant REST adapter)
+// client.js – v8.1.3 (FINAL-2: Server-compliant REST adapter)
 const axios = require('axios');
 const crypto = require('crypto');
 
@@ -21,9 +21,10 @@ class DeltaClient {
     const body = data ? JSON.stringify(data) : '';
     
     // --- FINAL FIX ---
-    // The official Delta Exchange documentation specifies the signature string must be in the
-    // exact order: http_method + request_path + timestamp + request_body
-    const sigStr = method.toUpperCase() + path + (qs ? `?${qs}` : '') + timestamp + body;
+    // The API documentation is incorrect. The server's own debug response (`context` field)
+    // proves the expected signature format is: METHOD + TIMESTAMP + PATH + BODY.
+    // We are reverting to this format.
+    const sigStr = method.toUpperCase() + timestamp + path + (qs ? `?${qs}` : '') + body;
     const signature = crypto.createHmac('sha256', this.#apiSecret).update(sigStr).digest('hex');
 
     const headers = {
@@ -44,22 +45,21 @@ class DeltaClient {
         headers
       });
       return resp.data;
-    } catch (err) {
+    } catch (err). {
       const status = err.response?.status;
       const responseData = err.response?.data;
       this.#logger.error(`[DeltaClient] ${method} ${path} attempt ${attempt} failed with status ${status}.`, { responseData });
       
-      // Retry on 5xx server errors or 406 (Not Acceptable), which might be a transient firewall issue.
       if ((status >= 500 || status === 406) && attempt < 3) {
         this.#logger.warn(`[DeltaClient] Retrying in ${250 * attempt}ms...`);
-        await new Promise(r => setTimeout(r, 250 * attempt));  // exponential back-off
+        await new Promise(r => setTimeout(r, 250 * attempt));
         return this.#request(method, path, data, query, attempt + 1);
       }
-      throw err; // Re-throw the error if it's not retryable or retries are exhausted.
+      throw err;
     }
   }
 
-  /* ---------- PUBLIC WRAPPERS ---------- */
+  /* ---------- PUBLIC WRAPPERS (Unchanged) ---------- */
   placeOrder(payload) { return this.#request('POST', '/v2/orders', payload); }
 
   getLiveOrders(productId) {
