@@ -1,4 +1,5 @@
 // strategies/MomentumRiderStrategy.js
+// Version 11.5.2 - ADDED check to defer position management while order is in progress.
 
 const { v4: uuidv4 } = require('uuid');
 
@@ -10,17 +11,14 @@ class MomentumRiderStrategy {
     this.position = null;
     this.isExitInProgress = false;
     this.lastEntrySignalPrice = null;
-    
-    // NEW: Properties to signal intent to the trader bot
-    this.hasBracketOrders = false; // This strategy does not use a TP bracket
-    this.hasFailSafeStop = true;   // It does require a fail-safe SL
-    this.lastCalculatedStopLoss = null; // Store the calculated SL price
+    this.hasBracketOrders = false;
+    this.hasFailSafeStop = true;
+    this.lastCalculatedStopLoss = null;
   }
 
   getName() { return "MomentumRiderStrategy"; }
 
   async onPriceUpdate(currentPrice, priceDifference) {
-    // FIX: Only allow entry if BOTH local AND exchange state are flat
     if (this.position || this.bot.hasOpenPosition) {
       this.manageOpenPosition(currentPrice);
     } else {
@@ -31,8 +29,6 @@ class MomentumRiderStrategy {
   onPositionUpdate(positionUpdate) {
     const positionSize = parseFloat(positionUpdate.size);
     const positionIsOpen = positionSize !== 0;
-
-    // This can be triggered by REST or WS, find the correct entry price source
     const entryPrice = positionUpdate.entry_price || positionUpdate.avg_entry_price;
 
     if (positionIsOpen && !this.position) {
@@ -51,12 +47,19 @@ class MomentumRiderStrategy {
       this.position = null;
       this.isExitInProgress = false;
       this.lastEntrySignalPrice = null;
-      this.lastCalculatedStopLoss = null; // Clear SL on position close
+      this.lastCalculatedStopLoss = null;
     }
   }
 
+  // MODIFIED: Added check for isOrderInProgress to prevent premature exit.
   manageOpenPosition(currentPrice) {
-    if (!this.position || this.isExitInProgress || !this.position.peakPrice) return;
+    if (!this.position || this.isExitInProgress || !this.position.peakPrice || this.bot.isOrderInProgress) {
+        if (this.bot.isOrderInProgress) {
+            this.logger.info(`[${this.getName()}] Deferring position management: entry order sequence is in progress.`);
+        }
+        return;
+    }
+
     let drawdown = 0;
     if (this.position.side === 'buy') {
       if (currentPrice > this.position.peakPrice) this.position.peakPrice = currentPrice;
@@ -96,10 +99,8 @@ class MomentumRiderStrategy {
         return;
       }
       
-      // Store the SL price so the trader can use it after the main order fills
       this.lastCalculatedStopLoss = stopLossPrice;
 
-      // MODIFIED: Removed deprecated `bracket_stop_loss_price`
       const orderData = {
         product_id: this.bot.config.productId,
         size: this.bot.config.orderSize,
@@ -116,14 +117,14 @@ class MomentumRiderStrategy {
       });
       
       this.lastEntrySignalPrice = currentPrice;
-      this.bot.registerPendingOrder(clientOrderId, 'main'); // Manually register as pending
+      this.bot.registerPendingOrder(clientOrderId, 'main');
       const response = await this.bot.placeOrder(orderData);
 
       if (response.result) {
         this.logger.info(`[${this.getName()}] Entry order placed successfully. Waiting for fill to attach SL.`);
         this.bot.priceAtLastTrade = currentPrice;
       } else {
-        this.bot.cancelPendingOrder(clientOrderId); // Cancel if placement failed
+        this.bot.cancelPendingOrder(clientOrderId);
         this.lastEntrySignalPrice = null;
         this.lastCalculatedStopLoss = null;
         throw new Error(JSON.stringify(response));
@@ -143,15 +144,14 @@ class MomentumRiderStrategy {
         return;
       }
 
-      if (response && response.error && response.error.code === 'bracket_order_position_exists' || response.error.code === 'position_non_zero_size_for_reduce_only' ) {
+      if (response && response.error && (response.error.code === 'bracket_order_position_exists' || response.error.code === 'position_non_zero_size_for_reduce_only')) {
         this.logger.warn(`[${this.getName()}] State mismatch detected: Exchange reports an open position. Forcing state correction.`);
         await this.bot.forceStateCorrection();
       } else {
         this.logger.error(`[${this.getName()}] Exchange rejected order to enter position:`, { response });
       }
       this.bot.isOrderInProgress = false;
-    } 
-    // Do not set isOrderInProgress to false here, let the fill/fail logic handle it
+    }
   }
 
   async exitPosition() {
@@ -176,6 +176,7 @@ class MomentumRiderStrategy {
       this.logger.info(`[${this.getName()}] Algorithmic exit order to close position has been placed.`);
     } catch (error) {
       this.logger.error(`[${this.getName()}] CRITICAL: Failed to place algorithmic exit order. Manual intervention may be required.`, { message: error.message });
+      this.isExitInProgress = false; // Reset on failure
     }
   }
 }
