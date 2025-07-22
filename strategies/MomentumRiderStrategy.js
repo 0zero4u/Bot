@@ -1,3 +1,6 @@
+// strategies/MomentumRiderStrategy.js
+// Version 5.4.0 - FINAL: Implemented reactive state correction for position mismatch errors.
+
 const { v4: uuidv4 } = require('uuid');
 
 class MomentumRiderStrategy {
@@ -157,6 +160,7 @@ class MomentumRiderStrategy {
             }
             this.logger.info(`[${this.getName()}] Algorithmic exit order to close position has been placed.`);
         } catch (error) {
+            // This logging is still valuable in the case of a critical failure to place the closing order.
             this.logger.error(`[${this.getName()}] CRITICAL: Failed to place algorithmic exit order. Manual intervention may be required.`, { message: error.message });
         }
     }
