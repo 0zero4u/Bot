@@ -1,4 +1,3 @@
-
 // client.js – v8.1.4 (with “open,pending” cancellation fix)
 
 const axios = require('axios');
@@ -72,7 +71,9 @@ class DeltaClient {
       );
 
       // Retry on transient errors (5xx / 406) with exponential back-off
-      if ((status >= 500 || status === 406) && attempt  setTimeout(r, delay));
+      if ((status >= 500 || status === 406) && attempt < 3) {
+        const delay = 500 * Math.pow(2, attempt - 1);
+        await new Promise((r) => setTimeout(r, delay));
         return this.#request(method, path, data, query, attempt + 1);
       }
 
@@ -112,9 +113,13 @@ class DeltaClient {
       return { success: true, result: 'nothing-to-do' };
     }
 
-    // Delta limits: 20 orders per batch
-    const chunks = [];
-    for (let i = 0; i  ({ id }))
+    const results = [];
+    const chunkSize = 20;
+    for (let i = 0; i < ids.length; i += chunkSize) {
+      const chunk = ids.slice(i, i + chunkSize);
+      const payload = {
+        product_id: productId,
+        orders: chunk.map((id) => ({ id }))
       };
       const res = await this.#request('DELETE', '/v2/orders/batch', payload);
       results.push(res);
@@ -165,3 +170,4 @@ class DeltaClient {
 }
 
 module.exports = DeltaClient;
+  
