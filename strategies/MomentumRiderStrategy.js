@@ -1,7 +1,5 @@
 // strategies/MomentumRiderStrategy.js
 
-// FINAL PATCHED VERSION: Prevents repeated entry attempts if exchange reports a position
-
 const { v4: uuidv4 } = require('uuid');
 
 class MomentumRiderStrategy {
@@ -17,7 +15,7 @@ class MomentumRiderStrategy {
   getName() { return "MomentumRiderStrategy"; }
 
   async onPriceUpdate(currentPrice, priceDifference) {
-    // PATCH: Only allow entry when BOTH local AND exchange state are flat
+    // FIX: Only allow entry if BOTH local AND exchange state are flat
     if (this.position || this.bot.hasOpenPosition) {
       this.manageOpenPosition(currentPrice);
     } else {
@@ -116,7 +114,6 @@ class MomentumRiderStrategy {
         this.logger.error(`[${this.getName()}] Unparseable or critical error during position entry:`, { message: error.message });
         return;
       }
-      // --- PATCHED: State correction on exchange-side position existence ---
       if (response && response.error && response.error.code === 'bracket_order_position_exists') {
         this.logger.warn(`[${this.getName()}] State mismatch detected: Exchange reports an open position. Forcing state correction.`);
         this.bot.forceStateCorrection();
@@ -132,7 +129,6 @@ class MomentumRiderStrategy {
     if (!this.position || this.isExitInProgress) return;
     this.isExitInProgress = true;
     this.logger.warn(`[${this.getName()}] Algorithmic exit triggered. Cancelling all open orders for ${this.bot.config.productSymbol} to remove any hard SL.`);
-    // Use the high-level, safe helper on the bot instance.
     await this.bot.safeCancelAll(this.bot.config.productId);
     this.logger.info(`[${this.getName()}] Proceeding with market exit order.`);
     const exitSide = this.position.side === 'buy' ? 'sell' : 'buy';
