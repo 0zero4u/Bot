@@ -1,4 +1,4 @@
-// client.js – v8.1.4 (with “open,pending” cancellation fix)
+// client.js – v8.1.5 (FIXED signature mismatch for query strings)
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -28,7 +28,11 @@ class DeltaClient {
 
   async #request(method, path, data = null, query = null, attempt = 1) {
     const timestamp = Math.floor(Date.now() / 1000).toString();
-    const qs = query ? new URLSearchParams(query).toString() : '';
+    
+    // FIX: Generate query string and then replace encoded commas to match server expectation for signature.
+    const params = new URLSearchParams(query);
+    const qs = params.toString().replace(/%2C/g, ','); // De-encode commas for signature
+
     const body = data ? JSON.stringify(data) : '';
 
     // Signature string per Delta docs: METHOD + timestamp + path + query + body
@@ -54,6 +58,7 @@ class DeltaClient {
     if (body) headers['Content-Type'] = 'application/json';
 
     try {
+      // Axios will correctly encode the request, but our signature now matches the server's expectation.
       const resp = await this.#axios({
         method,
         url: path,
@@ -88,7 +93,6 @@ class DeltaClient {
     return this.#request('POST', '/v2/orders', payload);
   }
   
-  // ADDED: Method to get all margined positions
   getPositions() {
     return this.#request('GET', '/v2/positions/margined');
   }
@@ -96,7 +100,7 @@ class DeltaClient {
   /**
    * Fetch live orders for a product.
    * @param {number} productId
-   * @param {{ states?: string }} [opts]  // NEW: allow specifying states
+   * @param {{ states?: string }} [opts]
    */
   getLiveOrders(productId, opts = {}) {
     // By default, fetch both open and pending orders
@@ -148,7 +152,7 @@ class DeltaClient {
         return;
       }
 
-      this.logger.info(
+      this.#logger.info(
         `[DeltaClient] Found ${ids.length} orders to cancel. Proceeding with batch cancellation.`
       );
 
@@ -157,7 +161,7 @@ class DeltaClient {
       } catch (err) {
         // Ignore "open_order_not_found" race errors
         if (err.response?.data?.error?.code === 'open_order_not_found') {
-          this.logger.warn(
+          this.#logger.warn(
             '[DeltaClient] Some orders not found (likely already filled/closed); ignoring.'
           );
           return;
@@ -165,7 +169,7 @@ class DeltaClient {
         throw err;
       }
     } catch (error) {
-      this.logger.error(
+      this.#logger.error(
         '[DeltaClient] Failed to get live orders for cancellation.',
         { message: error.message }
       );
