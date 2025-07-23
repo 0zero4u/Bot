@@ -1,5 +1,5 @@
 // binance_listener.js
-// v2.0.0 - Migrated from Bybit to Binance Spot stream.
+// v2.1.0 - Migrated from Binance Spot to Binance Futures trade stream.
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -10,7 +10,7 @@ const config = {
   // Binance symbols are typically lowercase, e.g., 'btcusdt'
   symbol: process.env.BINANCE_SYMBOL || 'btcusdt',
   // Base URL for Binance WebSocket streams
-  binanceStreamUrl: process.env.BINANCE_STREAM_URL || 'wss://stream.binance.com:9443/ws',
+  binanceStreamUrl: process.env.BINANCE_FUTURES_STREAM_URL || 'wss://fstream.binance.com/ws',
   reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
   internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
   minimumTickSize: parseFloat(process.env.MINIMUM_TICK_SIZE || '0.1'),
@@ -68,12 +68,12 @@ function sendToInternalClient(payload) {
 }
 
 function connectToBinance() {
-  // For Binance, the stream is specified in the URL. We use the book ticker stream for the top-of-book data.
-  const streamUrl = `${config.binanceStreamUrl}/${config.symbol}@bookTicker`;
+  // For Binance Futures, the stream is specified in the URL. We use the trade stream.
+  const streamUrl = `${config.binanceStreamUrl}/${config.symbol}@trade`;
   binanceWsClient = new WebSocket(streamUrl);
 
   binanceWsClient.on('open', () => {
-    logger.info(`Binance WebSocket connection established. Subscribed to: ${config.symbol}@bookTicker`);
+    logger.info(`Binance Futures WebSocket connection established. Subscribed to: ${config.symbol}@trade`);
     lastSentSpotBidPrice = null;
     // Note: The 'ws' library automatically handles pong responses to Binance's pings.
     // No manual ping sending is required.
@@ -83,29 +83,29 @@ function connectToBinance() {
     try {
       const message = JSON.parse(data.toString());
 
-      // Check if the message contains book ticker data (specifically the best bid price 'b')
-      if (message && message.b) {
-        const currentSpotBidPrice = parseFloat(message.b);
-        if (isNaN(currentSpotBidPrice)) return;
+      // Check if the message contains trade data (specifically the trade price 'p')
+      if (message && message.e === 'trade' && message.p) {
+        const currentTradePrice = parseFloat(message.p);
+        if (isNaN(currentTradePrice)) return;
 
         if (lastSentSpotBidPrice === null) {
-          lastSentSpotBidPrice = currentSpotBidPrice;
+          lastSentSpotBidPrice = currentTradePrice;
           return; // Initialize the price on first message
         }
 
-        const priceDifference = currentSpotBidPrice - lastSentSpotBidPrice;
+        const priceDifference = currentTradePrice - lastSentSpotBidPrice;
 
         if (Math.abs(priceDifference) >= config.minimumTickSize) {
           // The format { type: 'S', p: price } is preserved for the internal client
-          const payload = { type: 'S', p: currentSpotBidPrice };
+          const payload = { type: 'S', p: currentTradePrice };
           
           // Always send the signal to the bot.
           sendToInternalClient(payload);
-          lastSentSpotBidPrice = currentSpotBidPrice;
+          lastSentSpotBidPrice = currentTradePrice;
 
           // Only log the message if the throttle period has passed.
           if (canLog) {
-            logger.info(`Significant price move detected. Sending price ${currentSpotBidPrice} to trader. (Logs will be throttled for ${config.logThrottleMs / 1000}s)`);
+            logger.info(`Significant price move detected. Sending price ${currentTradePrice} to trader. (Logs will be throttled for ${config.logThrottleMs / 1000}s)`);
             canLog = false;
             setTimeout(() => {
                 canLog = true;
