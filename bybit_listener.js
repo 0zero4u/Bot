@@ -1,134 +1,92 @@
-// binance_listener.js
-// v2.1.0 - Migrated from Binance Spot to Binance Futures trade stream.
 
 const WebSocket = require('ws');
 const winston = require('winston');
 require('dotenv').config();
 
-// --- Configuration ---
 const config = {
-  // Binance symbols are typically lowercase, e.g., 'btcusdt'
-  symbol: process.env.BINANCE_SYMBOL || 'btcusdt',
-  // Base URL for Binance WebSocket streams
+  // We stream all 3 assets. 
+  // NOTE: Using Binance Futures streams. Symbols are lowercase.
+  symbols: ['btcusdt', 'ethusdt', 'solusdt'], 
   binanceStreamUrl: process.env.BINANCE_FUTURES_STREAM_URL || 'wss://fstream.binance.com/ws',
-  reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
+  reconnectInterval: 5000,
   internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
-  minimumTickSize: parseFloat(process.env.MINIMUM_TICK_SIZE || '0.1'),
-  logLevel: process.env.LOG_LEVEL || 'info',
-  logThrottleMs: 30 * 1000 // 30 seconds for throttling logs
 };
 
-// --- Logging Setup ---
 const logger = winston.createLogger({
-  level: config.logLevel,
+  level: 'info',
   format: winston.format.combine(
     winston.format.timestamp(),
-    winston.format.colorize(),
-    winston.format.printf(({ timestamp, level, message }) => `${timestamp} [${level}]: ${message}`)
+    winston.format.simple()
   ),
-  transports: [
-    new winston.transports.Console()
-  ]
+  transports: [new winston.transports.Console()]
 });
 
-let internalWsClient = null;
-let binanceWsClient = null;
-let lastSentSpotBidPrice = null;
-let canLog = true; // Log throttling flag
+let internalWs = null;
+let binanceWs = null;
 
-function connectToInternalReceiver() {
-  if (internalWsClient && (internalWsClient.readyState === WebSocket.OPEN || internalWsClient.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
-
-  internalWsClient = new WebSocket(config.internalReceiverUrl);
-
-  internalWsClient.on('open', () => {
-    logger.info('Connected to internal trader WebSocket');
+function connectToInternal() {
+  internalWs = new WebSocket(config.internalReceiverUrl);
+  
+  internalWs.on('open', () => {
+    logger.info('Connected to internal Bot Receiver.');
   });
-
-  internalWsClient.on('close', () => {
-    logger.warn('Internal trader WebSocket closed. Reconnecting...');
-    setTimeout(connectToInternalReceiver, config.reconnectInterval);
+  
+  internalWs.on('close', () => {
+    logger.warn('Internal Bot WebSocket closed. Reconnecting...');
+    setTimeout(connectToInternal, config.reconnectInterval);
   });
-
-  internalWsClient.on('error', (error) => {
-    logger.error('Internal trader WebSocket error:', error.message);
-  });
-}
-
-function sendToInternalClient(payload) {
-  if (internalWsClient && internalWsClient.readyState === WebSocket.OPEN) {
-    try {
-      internalWsClient.send(JSON.stringify(payload));
-    } catch (error) {
-      logger.error('Failed to send message to trader:', error.message);
-    }
-  }
+  
+  internalWs.on('error', (e) => logger.error(`Internal WS Error: ${e.message}`));
 }
 
 function connectToBinance() {
-  // For Binance Futures, the stream is specified in the URL. We use the trade stream.
-  const streamUrl = `${config.binanceStreamUrl}/${config.symbol}@trade`;
-  binanceWsClient = new WebSocket(streamUrl);
+  // Construct Multi-stream URL: /stream?streams=<symbol>@trade/<symbol>@trade...
+  const streams = config.symbols.map(s => `${s}@trade`).join('/');
+  const url = `${config.binanceStreamUrl}/stream?streams=${streams}`;
+  
+  logger.info(`Connecting to Binance Multi-Stream: ${url}`);
+  binanceWs = new WebSocket(url);
 
-  binanceWsClient.on('open', () => {
-    logger.info(`Binance Futures WebSocket connection established. Subscribed to: ${config.symbol}@trade`);
-    lastSentSpotBidPrice = null;
-    // Note: The 'ws' library automatically handles pong responses to Binance's pings.
-    // No manual ping sending is required.
+  binanceWs.on('open', () => {
+    logger.info(`Connected to Multi-Stream: ${config.symbols.join(', ')}`);
   });
-
-  binanceWsClient.on('message', (data) => {
+  
+  binanceWs.on('message', (data) => {
     try {
-      const message = JSON.parse(data.toString());
+      const msg = JSON.parse(data.toString());
+      // Binance Payload: { stream: 'btcusdt@trade', data: { s: 'BTCUSDT', p: '123.45', ... } }
+      if (!msg.data || msg.data.e !== 'trade') return;
 
-      // Check if the message contains trade data (specifically the trade price 'p')
-      if (message && message.e === 'trade' && message.p) {
-        const currentTradePrice = parseFloat(message.p);
-        if (isNaN(currentTradePrice)) return;
-
-        if (lastSentSpotBidPrice === null) {
-          lastSentSpotBidPrice = currentTradePrice;
-          return; // Initialize the price on first message
-        }
-
-        const priceDifference = currentTradePrice - lastSentSpotBidPrice;
-
-        if (Math.abs(priceDifference) >= config.minimumTickSize) {
-          // The format { type: 'S', p: price } is preserved for the internal client
-          const payload = { type: 'S', p: currentTradePrice };
-          
-          // Always send the signal to the bot.
-          sendToInternalClient(payload);
-          lastSentSpotBidPrice = currentTradePrice;
-
-          // Only log the message if the throttle period has passed.
-          if (canLog) {
-            logger.info(`Significant price move detected. Sending price ${currentTradePrice} to trader. (Logs will be throttled for ${config.logThrottleMs / 1000}s)`);
-            canLog = false;
-            setTimeout(() => {
-                canLog = true;
-            }, config.logThrottleMs);
-          }
-        }
+      const rawSymbol = msg.data.s; // e.g., 'BTCUSDT'
+      const price = parseFloat(msg.data.p);
+      
+      // Normalize Symbol to our internal format: 'BTC', 'ETH', 'SOL'
+      let asset = null;
+      if (rawSymbol.startsWith('BTC')) asset = 'BTC';
+      else if (rawSymbol.startsWith('ETH')) asset = 'ETH';
+      else if (rawSymbol.startsWith('SOL')) asset = 'SOL';
+      
+      if (asset && internalWs && internalWs.readyState === WebSocket.OPEN) {
+          // SEND TAGGED PAYLOAD: { type: 'S', s: 'BTC', p: 50000 }
+          internalWs.send(JSON.stringify({ type: 'S', s: asset, p: price }));
       }
-    } catch (error) {
-      logger.error('Error processing Binance message:', error.message);
+
+    } catch (e) {
+      logger.error(`Parse Error: ${e.message}`);
     }
   });
 
-  binanceWsClient.on('error', (error) => {
-    logger.error('Binance WebSocket error:', error.message);
+  binanceWs.on('close', () => {
+    logger.warn('Binance Stream closed. Reconnecting...');
+    setTimeout(connectToBinance, config.reconnectInterval);
   });
 
-  binanceWsClient.on('close', () => {
-    logger.warn('Binance WebSocket connection closed. Reconnecting...');
-    setTimeout(connectToBinance, config.reconnectInterval);
+  binanceWs.on('error', (e) => {
+    logger.error(`Binance WS Error: ${e.message}`);
   });
 }
 
-// --- Start Connections ---
-logger.info('Starting Binance listener...');
-connectToInternalReceiver();
+// Start Listeners
+connectToInternal();
 connectToBinance();
+  
