@@ -1,6 +1,4 @@
-// trader.js
-// Version 14.0.0 - Multi-Asset, Multi-Source Enabled
-// Handles Delta Exchange connection and routes "Source-Tagged" signals to Strategy.
+
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -11,13 +9,14 @@ const DeltaClient = require('./client.js');
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Advance', 
+    strategy: process.env.STRATEGY || 'Advance', // Default to new strategy
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
     apiSecret: process.env.DELTA_API_SECRET,
-    // Note: productId in .env is overridden by Strategy for execution
+    // Note: productId in .env is overridden by Strategy for execution, 
+    // but kept here for fallback or single-asset modes.
     productId: parseInt(process.env.DELTA_PRODUCT_ID),
     productSymbol: process.env.DELTA_PRODUCT_SYMBOL, 
     orderSize: parseInt(process.env.ORDER_SIZE || '1'),
@@ -59,7 +58,7 @@ class TradingBot {
         this.ws = null; this.authenticated = false;
         this.isOrderInProgress = false; 
         
-        // Multi-Asset Orderbooks for BTC, ETH, SOL
+        // NEW: Multi-Asset Orderbooks
         this.orderBooks = {
             'BTC': { bids: [], asks: [] },
             'ETH': { bids: [], asks: [] },
@@ -131,7 +130,7 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        // Subscribe to L1 books for ALL tracked assets
+        // UPDATED: Subscribe to L1 books for ALL tracked assets
         const symbols = ['BTCUSD', 'ETHUSD', 'SOLUSD'];
         
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
@@ -169,14 +168,14 @@ class TradingBot {
                 break;
             
             case 'l1_orderbook':
-                // Route L1 updates to specific assets
+                // UPDATED: Identify the asset and route to Strategy for Delta Deviation checks
                 let asset = null;
                 if (message.symbol.includes('BTC')) asset = 'BTC';
                 else if (message.symbol.includes('ETH')) asset = 'ETH';
                 else if (message.symbol.includes('SOL')) asset = 'SOL';
 
                 if (asset) {
-                    // Update internal book 
+                    // Update internal book (optional, if strategy needs raw access)
                     this.orderBooks[asset] = {
                         bids: [[message.best_bid, message.bid_qty]],
                         asks: [[message.best_ask, message.ask_qty]]
@@ -197,15 +196,14 @@ class TradingBot {
         try {
             const data = JSON.parse(message.toString());
             
-            // Handle Multi-Asset Signal { type: 'S', s: 'BTC', p: 123, x: 'OKX' }
+            // UPDATED: Handle Multi-Asset Signal { type: 'S', s: 'BTC', p: 123 }
             if (data.type === 'S' && data.p) {
-                const asset = data.s || 'BTC';
+                const asset = data.s || 'BTC'; // Default to BTC if 's' missing
                 const price = parseFloat(data.p);
-                const source = data.x || 'UNKNOWN'; // Extract the Source Tag
                 
-                // Route to Strategy with Source info for Volatility Buckets
+                // Route directly to Strategy
                 if (this.strategy.onPriceUpdate) {
-                    await this.strategy.onPriceUpdate(asset, price, source);
+                    await this.strategy.onPriceUpdate(asset, price);
                 }
             }
         } catch (error) {
@@ -224,7 +222,7 @@ class TradingBot {
         this.logger.info(`Signal server started on port ${this.config.port}`);
     }
     
-    // --- Order Execution & Management ---
+    // --- Order Execution & Management (Preserved) ---
     async placeOrder(orderData) {
         return this.client.placeOrder(orderData);
     }
@@ -236,13 +234,15 @@ class TradingBot {
             // Just check if ANY position is open for the bot generally
             const hasActive = positions.some(p => parseFloat(p.size) !== 0);
             this.hasOpenPosition = hasActive;
+            
+            // If strategy wants specific updates, it will get them via WS or can query
             this.isStateSynced = true;
         } catch (error) {
             this.logger.error('Failed to sync position state:', error.message);
         }
     }
     
-    // Legacy Helpers (OrderManager logic stub)
+    // Helpers required by OrderManager logic (if used by other strategies)
     registerPendingOrder(clientOrderId) { /* ... */ }
     confirmRegisteredOrder(clientOrderId, orderResult) { /* ... */ }
     cancelPendingOrder(clientOrderId) { /* ... */ }
@@ -250,7 +250,7 @@ class TradingBot {
     handleOrderUpdate(orderUpdate) {
         // Basic logging of fills
         if (orderUpdate.state === 'filled') {
-            this.logger.info(`[Trader] Order ${orderUpdate.id} FILLED.`);
+            this.logger.info(`[OrderManager] Order ${orderUpdate.id} FILLED.`);
         }
     }
 
@@ -283,3 +283,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
+        
