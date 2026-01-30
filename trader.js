@@ -1,5 +1,3 @@
-
-
 const WebSocket = require('ws');
 const winston = require('winston');
 const { v4: uuidv4 } = require('uuid');
@@ -9,14 +7,14 @@ const DeltaClient = require('./client.js');
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Advance', // Default to new strategy
+    strategy: process.env.STRATEGY || 'Advance', 
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
     apiSecret: process.env.DELTA_API_SECRET,
-    // Note: productId in .env is overridden by Strategy for execution, 
-    // but kept here for fallback or single-asset modes.
+    // Note: productId in .env is overridden by Strategy logic usually, 
+    // but kept here for fallback.
     productId: parseInt(process.env.DELTA_PRODUCT_ID),
     productSymbol: process.env.DELTA_PRODUCT_SYMBOL, 
     orderSize: parseInt(process.env.ORDER_SIZE || '1'),
@@ -31,11 +29,20 @@ const config = {
 // --- Logging Setup ---
 const logger = winston.createLogger({
     level: config.logLevel,
-    format: winston.format.combine(winston.format.timestamp(), winston.format.errors({ stack: true }), winston.format.json()),
+    format: winston.format.combine(
+        winston.format.timestamp(), 
+        winston.format.errors({ stack: true }), 
+        winston.format.json()
+    ),
     transports: [
         new winston.transports.File({ filename: 'error.log', level: 'error' }),
         new winston.transports.File({ filename: 'combined.log' }),
-        new winston.transports.Console({ format: winston.format.combine(winston.format.colorize(), winston.format.simple()) })
+        new winston.transports.Console({ 
+            format: winston.format.combine(
+                winston.format.colorize(), 
+                winston.format.simple()
+            ) 
+        })
     ]
 });
 
@@ -58,7 +65,8 @@ class TradingBot {
         this.ws = null; this.authenticated = false;
         this.isOrderInProgress = false; 
         
-        // NEW: Multi-Asset Orderbooks
+        // NEW: Multi-Asset Orderbooks storage
+        // This ensures when we get a signal for ETH, we have ETH's orderbook ready.
         this.orderBooks = {
             'BTC': { bids: [], asks: [] },
             'ETH': { bids: [], asks: [] },
@@ -70,6 +78,7 @@ class TradingBot {
         this.pingInterval = null; this.heartbeatTimeout = null;
         this.managedOrders = new Map(); this.pendingOrders = new Map();
 
+        // Load Strategy dynamically
         try {
             const StrategyClass = require(`./strategies/${this.config.strategy}Strategy.js`);
             this.strategy = new StrategyClass(this);
@@ -81,13 +90,20 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v14.0.0) ---`);
+        this.logger.info(`--- Bot Initializing (v14.1.0) ---`);
         this.logger.info(`Strategy: ${this.strategy.getName()}`);
+        
+        // 1. Check current positions on Delta
         await this.syncPositionState();
+        
+        // 2. Connect to Delta WebSocket for Prices & Order Updates
         await this.initWebSocket();
+        
+        // 3. Start Local WebSocket Server to listen for signals (market_listener.js)
         this.setupHttpServer();
     }
     
+    // --- WebSocket Heartbeat (Keep-Alive) ---
     startHeartbeat() {
         this.resetHeartbeatTimeout();
         this.pingInterval = setInterval(() => {
@@ -110,8 +126,10 @@ class TradingBot {
         clearInterval(this.pingInterval);
     }
 
+    // --- WebSocket Connection ---
     async initWebSocket() { 
         this.ws = new WebSocket(this.config.wsURL);
+        
         this.ws.on('open', () => this.authenticateWebSocket());
         this.ws.on('message', (data) => this.handleWebSocketMessage(JSON.parse(data.toString())));
         this.ws.on('error', (error) => this.logger.error('WebSocket error:', error.message));
@@ -130,7 +148,10 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        // UPDATED: Subscribe to L1 books for ALL tracked assets
+        // UPDATED: Subscribe to L1 books for ALL tracked assets.
+        // Adjust these symbols if you are trading Linear (USDT) vs Inverse. 
+        // Usually BTCUSD = Inverse, BTC-PERP = Linear. Check Delta docs if unsure.
+        // Assuming standard Inverse/Perp symbols here:
         const symbols = ['BTCUSD', 'ETHUSD', 'SOLUSD'];
         
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
@@ -168,20 +189,20 @@ class TradingBot {
                 break;
             
             case 'l1_orderbook':
-                // UPDATED: Identify the asset and route to Strategy for Delta Deviation checks
+                // UPDATED: Route L1 updates to the correct internal storage
                 let asset = null;
                 if (message.symbol.includes('BTC')) asset = 'BTC';
                 else if (message.symbol.includes('ETH')) asset = 'ETH';
                 else if (message.symbol.includes('SOL')) asset = 'SOL';
 
                 if (asset) {
-                    // Update internal book (optional, if strategy needs raw access)
+                    // Update internal book for Strategy usage
                     this.orderBooks[asset] = {
                         bids: [[message.best_bid, message.bid_qty]],
                         asks: [[message.best_ask, message.ask_qty]]
                     };
                     
-                    // Pass specific asset price to strategy history
+                    // Notify Strategy (Crucial for Delta Deviation calculations)
                     if (this.strategy.onOrderBookUpdate) {
                         this.strategy.onOrderBookUpdate(message.symbol, parseFloat(message.best_bid));
                     }
@@ -190,20 +211,24 @@ class TradingBot {
         }
     }
 
+    // --- Signal Handling from market_listener.js ---
     async handleSignalMessage(message) {
         if (!this.authenticated) return;
 
         try {
             const data = JSON.parse(message.toString());
             
-            // UPDATED: Handle Multi-Asset Signal { type: 'S', s: 'BTC', p: 123 }
+            // UPDATED: Handle Multi-Asset Signal with Source Tag
+            // Format: { type: 'S', s: 'BTC', p: 90000.5, x: 'OKX' }
             if (data.type === 'S' && data.p) {
-                const asset = data.s || 'BTC'; // Default to BTC if 's' missing
+                const asset = data.s || 'BTC'; 
                 const price = parseFloat(data.p);
+                const source = data.x || 'UNKNOWN'; // Extract the Exchange Source
                 
-                // Route directly to Strategy
+                // Route to Strategy with Source info
+                // This allows the strategy to put this price in the correct "Bucket"
                 if (this.strategy.onPriceUpdate) {
-                    await this.strategy.onPriceUpdate(asset, price);
+                    await this.strategy.onPriceUpdate(asset, price, source);
                 }
             }
         } catch (error) {
@@ -222,7 +247,10 @@ class TradingBot {
         this.logger.info(`Signal server started on port ${this.config.port}`);
     }
     
-    // --- Order Execution & Management (Preserved) ---
+    // --- Order Execution & Management ---
+    
+    // Places order on Delta Exchange
+    // Delegates to client.js which handles the API Key & HMAC Signing
     async placeOrder(orderData) {
         return this.client.placeOrder(orderData);
     }
@@ -231,26 +259,26 @@ class TradingBot {
         try {
             const response = await this.client.getPositions();
             const positions = response.result || [];
-            // Just check if ANY position is open for the bot generally
+            // Check if we have ANY active position
             const hasActive = positions.some(p => parseFloat(p.size) !== 0);
             this.hasOpenPosition = hasActive;
             
-            // If strategy wants specific updates, it will get them via WS or can query
             this.isStateSynced = true;
+            this.logger.info(`Position State Synced. Open Position: ${this.hasOpenPosition}`);
         } catch (error) {
             this.logger.error('Failed to sync position state:', error.message);
         }
     }
     
-    // Helpers required by OrderManager logic (if used by other strategies)
-    registerPendingOrder(clientOrderId) { /* ... */ }
+    // Legacy Helpers (Kept for compatibility if Strategy uses OrderManager logic)
+    registerPendingOrder(clientOrderId) { /* Managed by Strategy internal state now */ }
     confirmRegisteredOrder(clientOrderId, orderResult) { /* ... */ }
     cancelPendingOrder(clientOrderId) { /* ... */ }
 
     handleOrderUpdate(orderUpdate) {
-        // Basic logging of fills
+        // Log fills for debugging
         if (orderUpdate.state === 'filled') {
-            this.logger.info(`[OrderManager] Order ${orderUpdate.id} FILLED.`);
+            this.logger.info(`[Trader] Order ${orderUpdate.id} FILLED on Delta.`);
         }
     }
 
@@ -259,6 +287,7 @@ class TradingBot {
         return this.orderBooks[asset];
     }
     
+    // Safety Fallback
     async safeCancelAll(productId) {
         try {
             await this.client.cancelAllOrders(productId);
@@ -283,4 +312,3 @@ class TradingBot {
         process.exit(1);
     }
 })();
-        
