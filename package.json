@@ -1,17 +1,16 @@
 {
-  "name": "bybit-delta-trading-bot",
-  "version": "5.0.0",
-  "description": "A state-aware trading bot that uses Bybit signals to execute single, controlled trades on Delta Exchange with a cooldown period.",
+  "name": "multi-exchange-delta-bot",
+  "version": "14.1.0",
+  "description": "High-Frequency Arbitrage Bot. Listens to Binance, OKX, Gate, and Bitget to trade on Delta Exchange.",
   "main": "trader.js",
   "scripts": {
     "start": "pm2 start ecosystem.config.js",
     "stop": "pm2 stop ecosystem.config.js",
     "delete": "pm2 delete ecosystem.config.js",
-    "restart": "pm2 restart ecosystem.config.js",
+    "restart": "pm2 reload ecosystem.config.js",
     "logs": "pm2 logs",
     "monitor": "pm2 monit",
-    "test": "node --test",
-    "dev": "nodemon trader.js"
+    "test": "node --test"
   },
   "author": "",
   "license": "ISC",
@@ -27,6 +26,6 @@
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=20.0.0"
   }
 }
