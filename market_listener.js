@@ -1,6 +1,4 @@
-// market_listener.js
-// Version 11.2.0 - Ultra-Low Latency (Deduplication + Coalescing Buffer)
-// Optimized for 2000+ msg/s without CPU overheating.
+
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -364,4 +362,3 @@ connectOKX();
 connectGate();
 connectBitget();
 setTimeout(monitorConnections, 10000);
-                               
