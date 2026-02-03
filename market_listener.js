@@ -1,9 +1,3 @@
-
-// market_listener.js
-// Version 11.1.0 - USDT Linear Aggregator (FIXED)
-// Listens to external markets (Binance, OKX, Gate.io, Bitget) for USDT pairs.
-// All protocol issues resolved - February 2026
-
 const WebSocket = require('ws');
 const winston = require('winston');
 require('dotenv').config();
@@ -70,7 +64,7 @@ function sendPrice(asset, price, source) {
         const payload = JSON.stringify({ type: 'S', s: asset, p: price, x: source });
         internalWs.send(payload);
     } else {
-        logger.warn(`⚠ Cannot send ${asset} price from ${source} - Internal WS not connected`);
+        // Suppress repetitive log warnings if disconnected to avoid spam
     }
 }
 
@@ -142,7 +136,7 @@ function connectBinance() {
 }
 
 // ==========================================
-// 2. OKX (SWAP) LISTENER (USDT) - FIXED
+// 2. OKX (SWAP) LISTENER (USDT)
 // ==========================================
 function connectOKX() {
     const url = 'wss://ws.okx.com:8443/ws/v5/public';
@@ -155,12 +149,11 @@ function connectOKX() {
         logger.info('[OKX] ✓ Connected.');
         resetReconnectCounter('OKX');
         
-        // FIXED: Heartbeat interval set to 30 seconds
         pingInterval = setInterval(() => {
             if(okxWs && okxWs.readyState === WebSocket.OPEN) {
                 okxWs.send('ping');
             }
-        }, 30000); // Changed from 20000 to 30000
+        }, 30000); 
 
         // Subscribe to Tickers: XRP-USDT-SWAP
         const args = config.assets.map(a => ({ 
@@ -177,20 +170,16 @@ function connectOKX() {
             
             const msg = JSON.parse(strData);
             
-            // Handle subscription confirmation
             if (msg.event === 'subscribe') {
                 logger.info(`[OKX] Subscribed to ${msg.arg?.instId || 'channels'}`);
                 return;
             }
             
-            // Handle error responses
             if (msg.event === 'error') {
                 logger.error(`[OKX] Subscription error: ${msg.msg}`);
                 return;
             }
             
-            // Handle data updates
-            // msg: { arg: { channel: 'tickers', instId: 'XRP-USDT-SWAP' }, data: [{ last: '...' }] }
             if (msg.data && msg.data[0] && msg.data[0].last) {
                 const instId = msg.arg.instId; 
                 const asset = instId.split('-')[0]; // Extract 'XRP'
@@ -230,18 +219,16 @@ function connectGate() {
         logger.info('[Gate.io] ✓ Connected.');
         resetReconnectCounter('GATE');
         
-        // FIXED: Ping interval adjusted to 15 seconds, using futures.ping
+        // Ping every 15 seconds
         pingInterval = setInterval(() => {
             if(gateWs && gateWs.readyState === WebSocket.OPEN) {
                 gateWs.send(JSON.stringify({ 
-                    time: Math.floor(Date.now() / 1000), // Unix timestamp in seconds
-                    channel: 'futures.ping' // FIXED: Changed from spot.ping
+                    time: Math.floor(Date.now() / 1000), 
+                    channel: 'futures.ping' 
                 }));
             }
-        }, 15000); // Changed from 10000 to 15000
+        }, 15000); 
 
-        // Subscribe to futures tickers
-        // Symbols format: XRP_USDT
         const symbols = config.assets.map(a => `${a}_USDT`);
         gateWs.send(JSON.stringify({
             time: Math.floor(Date.now() / 1000),
@@ -255,12 +242,8 @@ function connectGate() {
         try {
             const msg = JSON.parse(data.toString());
             
-            // Handle pong response
-            if (msg.channel === 'futures.pong') {
-                return;
-            }
+            if (msg.channel === 'futures.pong') return;
             
-            // Handle subscription confirmation
             if (msg.event === 'subscribe') {
                 if (msg.error === null) {
                     logger.info(`[Gate.io] Subscribed to ${msg.channel}`);
@@ -270,17 +253,25 @@ function connectGate() {
                 return;
             }
             
-            // Handle ticker updates
-            // msg: { event: 'update', channel: 'futures.tickers', result: { contract: 'XRP_USDT', last: '...' } }
+            // --- FIX START: Handle Array Response ---
+            // msg: { event: 'update', result: [ { contract: 'BTC_USDT', last: '...' } ] }
             if (msg.event === 'update' && msg.channel === 'futures.tickers' && msg.result) {
-                const rawSymbol = msg.result.contract; 
-                const asset = rawSymbol.split('_')[0]; // Extract 'XRP'
-                const price = parseFloat(msg.result.last);
-                
-                if (!isNaN(price) && price > 0) {
-                    sendPrice(asset, price, 'GATE');
-                }
+                // Ensure we handle it as a list, even if API sends single object
+                const tickers = Array.isArray(msg.result) ? msg.result : [msg.result];
+
+                tickers.forEach(t => {
+                    if (t && t.contract && t.last) {
+                        const rawSymbol = t.contract; 
+                        const asset = rawSymbol.split('_')[0]; // Extract 'XRP' from 'XRP_USDT'
+                        const price = parseFloat(t.last);
+                        
+                        if (!isNaN(price) && price > 0) {
+                            sendPrice(asset, price, 'GATE');
+                        }
+                    }
+                });
             }
+            // --- FIX END ---
         } catch (e) {
             logger.error(`[Gate.io] Parse error: ${e.message}`);
         }
@@ -298,10 +289,9 @@ function connectGate() {
 }
 
 // ==========================================
-// 4. BITGET (FUTURES) LISTENER (USDT) - FIXED
+// 4. BITGET (FUTURES) LISTENER (USDT)
 // ==========================================
 function connectBitget() {
-    // FIXED: Using V2 WebSocket endpoint
     const url = 'wss://ws.bitget.com/v2/ws/public';
     logger.info(`[Bitget] Connecting to ${url}`);
     bitgetWs = new WebSocket(url);
@@ -318,9 +308,8 @@ function connectBitget() {
             }
         }, 30000);
 
-        // FIXED: V2 API subscription format with correct instType
         const args = config.assets.map(a => ({
-            instType: 'USDT-FUTURES', // FIXED: Changed from 'mc' to 'USDT-FUTURES'
+            instType: 'USDT-FUTURES',
             channel: 'ticker',
             instId: `${a}USDT`
         }));
@@ -334,20 +323,16 @@ function connectBitget() {
             
             const msg = JSON.parse(strData);
             
-            // Handle subscription confirmation
             if (msg.event === 'subscribe') {
                 logger.info(`[Bitget] Subscribed: ${msg.arg?.instId || 'channels'}`);
                 return;
             }
             
-            // Handle error responses
             if (msg.event === 'error') {
                 logger.error(`[Bitget] Error: ${msg.msg}`);
                 return;
             }
             
-            // Handle ticker data
-            // msg: { action: 'snapshot', arg: { instType: 'USDT-FUTURES', instId: 'XRPUSDT' }, data: [{ last: '...' }] }
             if ((msg.action === 'snapshot' || msg.action === 'update') && msg.data && msg.data[0]) {
                 if (msg.data[0].last) {
                     const instId = msg.arg.instId; // XRPUSDT
@@ -442,7 +427,7 @@ process.on('unhandledRejection', (reason, promise) => {
 // ==========================================
 // INITIALIZATION
 // ==========================================
-logger.info('🚀 Starting Market Listener v11.1.0 (FIXED)');
+logger.info('🚀 Starting Market Listener v11.2.0 (FIXED)');
 logger.info(`📡 Assets: ${config.assets.join(', ')}`);
 logger.info(`🔌 Internal Receiver: ${config.internalReceiverUrl}`);
 
