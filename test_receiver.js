@@ -1,20 +1,4 @@
 
-### The Best Approach: "Throttled Logging"
-
-**Do not slow down the data.** Your trading bot needs those milliseconds to make decisions. Instead, we should **update the receiver** to collect the data silently and only print a **summary report every 3 seconds**.
-
-Here is the updated `test_receiver.js`. It calculates how many messages per second (MPS) you are getting and shows the latest prices snapshot.
-
-### Step 1: Update the Receiver Script
-Run this command to overwrite your existing test file with the new "Smart" version:
-
-```bash
-nano test_receiver.js
-```
-
-**Delete the old code and paste this instead:**
-
-```javascript
 const WebSocket = require('ws');
 require('dotenv').config();
 
