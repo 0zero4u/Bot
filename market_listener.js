@@ -1,6 +1,6 @@
 // market_listener.js
-// Version 10.0.0 - Multi-Exchange Aggregator (Binance, OKX, Gate, Bitget)
-// Sends source-tagged prices to the main Trader bot to prevent cross-exchange noise.
+// Version 11.0.0 - USDT Linear Aggregator
+// Listens to external markets (Binance, OKX, etc) for USDT pairs.
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -10,8 +10,8 @@ const config = {
     // Port must match the one in trader.js
     internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
     reconnectInterval: 5000,
-    // The assets we want to track across all exchanges
-    assets: ['BTC', 'ETH', 'SOL'] 
+    // DYNAMIC: Load assets from .env (e.g., "XRP,BTC,ETH")
+    assets: (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',')
 };
 
 // --- LOGGING ---
@@ -31,7 +31,7 @@ function connectToInternal() {
     internalWs = new WebSocket(config.internalReceiverUrl);
     
     internalWs.on('open', () => {
-        logger.info('Connected to Internal Bot Receiver.');
+        logger.info(`Connected to Internal Bot Receiver. Tracking: ${config.assets.join(', ')}`);
     });
     
     internalWs.on('close', () => {
@@ -44,23 +44,23 @@ function connectToInternal() {
 
 /**
  * Sends a normalized price update to the main bot.
- * @param {string} asset - e.g., 'BTC'
- * @param {number} price - e.g., 50000.50
- * @param {string} source - e.g., 'BINANCE', 'OKX', 'GATE', 'BITGET'
+ * @param {string} asset - e.g., 'XRP'
+ * @param {number} price - e.g., 0.55
+ * @param {string} source - e.g., 'BINANCE'
  */
 function sendPrice(asset, price, source) {
     if (internalWs && internalWs.readyState === WebSocket.OPEN) {
-        // Payload: { type: 'S', s: 'BTC', p: 89000, x: 'BINANCE' }
+        // Payload: { type: 'S', s: 'XRP', p: 0.55, x: 'BINANCE' }
         const payload = JSON.stringify({ type: 'S', s: asset, p: price, x: source });
         internalWs.send(payload);
     }
 }
 
 // ==========================================
-// 1. BINANCE FUTURES LISTENER
+// 1. BINANCE FUTURES LISTENER (USDT)
 // ==========================================
 function connectBinance() {
-    // Stream format: btcusdt@trade / ethusdt@trade
+    // Stream format: xrpusdt@trade / btcusdt@trade
     const streams = config.assets.map(a => `${a.toLowerCase()}usdt@trade`).join('/');
     const url = `wss://fstream.binance.com/stream?streams=${streams}`;
     
@@ -72,11 +72,11 @@ function connectBinance() {
     ws.on('message', (data) => {
         try {
             const msg = JSON.parse(data.toString());
-            // Format: { stream: 'btcusdt@trade', data: { s: 'BTCUSDT', p: '...' } }
+            // Format: { stream: 'xrpusdt@trade', data: { s: 'XRPUSDT', p: '...' } }
             if (!msg.data || msg.data.e !== 'trade') return;
 
-            const rawSymbol = msg.data.s; // 'BTCUSDT'
-            const asset = rawSymbol.replace('USDT', ''); 
+            const rawSymbol = msg.data.s; // 'XRPUSDT'
+            const asset = rawSymbol.replace('USDT', ''); // 'XRP'
             const price = parseFloat(msg.data.p);
             
             sendPrice(asset, price, 'BINANCE');
@@ -92,7 +92,7 @@ function connectBinance() {
 }
 
 // ==========================================
-// 2. OKX (SWAP) LISTENER
+// 2. OKX (SWAP) LISTENER (USDT)
 // ==========================================
 function connectOKX() {
     const url = 'wss://ws.okx.com:8443/ws/v5/public';
@@ -106,7 +106,7 @@ function connectOKX() {
 
     ws.on('open', () => {
         logger.info('[OKX] Connected.');
-        // Subscribe to Tickers: BTC-USDT-SWAP
+        // Subscribe to Tickers: XRP-USDT-SWAP
         const args = config.assets.map(a => ({ channel: 'tickers', instId: `${a}-USDT-SWAP` }));
         ws.send(JSON.stringify({ op: 'subscribe', args: args }));
     });
@@ -117,10 +117,10 @@ function connectOKX() {
             if (strData === 'pong') return;
             
             const msg = JSON.parse(strData);
-            // msg: { arg: { instId: 'BTC-USDT-SWAP' }, data: [{ last: '...' }] }
+            // msg: { arg: { instId: 'XRP-USDT-SWAP' }, data: [{ last: '...' }] }
             if (msg.data && msg.data[0]) {
                 const instId = msg.arg.instId; 
-                const asset = instId.split('-')[0]; // Extract 'BTC'
+                const asset = instId.split('-')[0]; // Extract 'XRP'
                 const price = parseFloat(msg.data[0].last);
                 
                 sendPrice(asset, price, 'OKX');
@@ -137,14 +137,13 @@ function connectOKX() {
 }
 
 // ==========================================
-// 3. GATE.IO (FUTURES) LISTENER
+// 3. GATE.IO (FUTURES) LISTENER (USDT)
 // ==========================================
 function connectGate() {
     const url = 'wss://fx-ws.gateio.ws/v4/ws/usdt';
     logger.info(`[Gate.io] Connecting to ${url}`);
     const ws = new WebSocket(url);
     
-    // Heartbeat for Gate
     const pingInterval = setInterval(() => {
         if(ws.readyState === WebSocket.OPEN) {
              ws.send(JSON.stringify({ time: Date.now(), channel: 'spot.ping', event: 'ping' }));
@@ -153,8 +152,8 @@ function connectGate() {
 
     ws.on('open', () => {
         logger.info('[Gate.io] Connected.');
+        // Symbols: XRP_USDT
         const symbols = config.assets.map(a => `${a}_USDT`);
-        // Subscribe
         ws.send(JSON.stringify({
             time: Date.now(),
             channel: 'futures.tickers',
@@ -166,10 +165,10 @@ function connectGate() {
     ws.on('message', (data) => {
         try {
             const msg = JSON.parse(data.toString());
-            // msg: { event: 'update', result: { contract: 'BTC_USDT', last: '...' } }
+            // msg: { event: 'update', result: { contract: 'XRP_USDT', last: '...' } }
             if (msg.event === 'update' && msg.result) {
                 const rawSymbol = msg.result.contract; 
-                const asset = rawSymbol.split('_')[0]; // Extract 'BTC'
+                const asset = rawSymbol.split('_')[0]; // Extract 'XRP'
                 const price = parseFloat(msg.result.last);
                 
                 sendPrice(asset, price, 'GATE');
@@ -186,7 +185,7 @@ function connectGate() {
 }
 
 // ==========================================
-// 4. BITGET (MIX/FUTURES) LISTENER
+// 4. BITGET (MIX/FUTURES) LISTENER (USDT)
 // ==========================================
 function connectBitget() {
     const url = 'wss://ws-api.bitget.com/mix/v1/stream';
@@ -200,7 +199,7 @@ function connectBitget() {
     ws.on('open', () => {
         logger.info('[Bitget] Connected.');
         const args = config.assets.map(a => ({
-            instType: 'mc', // mc = mix contract (futures)
+            instType: 'mc', 
             channel: 'ticker',
             instId: `${a}USDT`
         }));
@@ -213,9 +212,9 @@ function connectBitget() {
             if (strData === 'pong') return;
             
             const msg = JSON.parse(strData);
-            // msg: { action: 'snapshot', arg: { instId: 'BTCUSDT' }, data: [{ last: '...' }] }
+            // msg: { action: 'snapshot', arg: { instId: 'XRPUSDT' }, data: [{ last: '...' }] }
             if ((msg.action === 'snapshot' || msg.action === 'update') && msg.data && msg.data[0]) {
-                const instId = msg.arg.instId; // BTCUSDT
+                const instId = msg.arg.instId; // XRPUSDT
                 const asset = instId.replace('USDT', '');
                 const price = parseFloat(msg.data[0].last);
                 
