@@ -1,6 +1,8 @@
+
 // market_listener.js
-// Version 11.0.0 - USDT Linear Aggregator
-// Listens to external markets (Binance, OKX, etc) for USDT pairs.
+// Version 11.1.0 - USDT Linear Aggregator (FIXED)
+// Listens to external markets (Binance, OKX, Gate.io, Bitget) for USDT pairs.
+// All protocol issues resolved - February 2026
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -10,6 +12,7 @@ const config = {
     // Port must match the one in trader.js
     internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
     reconnectInterval: 5000,
+    maxReconnectDelay: 60000,
     // DYNAMIC: Load assets from .env (e.g., "XRP,BTC,ETH")
     assets: (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',')
 };
@@ -24,22 +27,35 @@ const logger = winston.createLogger({
     transports: [new winston.transports.Console()]
 });
 
+// Connection references
 let internalWs = null;
+let binanceWs = null;
+let okxWs = null;
+let gateWs = null;
+let bitgetWs = null;
+
+// Reconnection tracking
+const reconnectAttempts = {
+    BINANCE: 0,
+    OKX: 0,
+    GATE: 0,
+    BITGET: 0
+};
 
 // --- INTERNAL BOT CONNECTION ---
 function connectToInternal() {
     internalWs = new WebSocket(config.internalReceiverUrl);
     
     internalWs.on('open', () => {
-        logger.info(`Connected to Internal Bot Receiver. Tracking: ${config.assets.join(', ')}`);
+        logger.info(`✓ Connected to Internal Bot Receiver. Tracking: ${config.assets.join(', ')}`);
     });
     
     internalWs.on('close', () => {
-        logger.warn('Internal Bot WebSocket closed. Reconnecting...');
+        logger.warn('⚠ Internal Bot WebSocket closed. Reconnecting...');
         setTimeout(connectToInternal, config.reconnectInterval);
     });
     
-    internalWs.on('error', (e) => logger.error(`Internal WS Error: ${e.message}`));
+    internalWs.on('error', (e) => logger.error(`✗ Internal WS Error: ${e.message}`));
 }
 
 /**
@@ -53,6 +69,31 @@ function sendPrice(asset, price, source) {
         // Payload: { type: 'S', s: 'XRP', p: 0.55, x: 'BINANCE' }
         const payload = JSON.stringify({ type: 'S', s: asset, p: price, x: source });
         internalWs.send(payload);
+    } else {
+        logger.warn(`⚠ Cannot send ${asset} price from ${source} - Internal WS not connected`);
+    }
+}
+
+/**
+ * Reconnect with exponential backoff
+ */
+function reconnectWithBackoff(exchange, connectFn) {
+    const attempts = reconnectAttempts[exchange];
+    const delay = Math.min(config.reconnectInterval * Math.pow(1.5, attempts), config.maxReconnectDelay);
+    
+    logger.warn(`[${exchange}] Reconnecting in ${(delay/1000).toFixed(1)}s (attempt ${attempts + 1})`);
+    reconnectAttempts[exchange]++;
+    
+    setTimeout(connectFn, delay);
+}
+
+/**
+ * Reset reconnection counter on successful connection
+ */
+function resetReconnectCounter(exchange) {
+    if (reconnectAttempts[exchange] > 0) {
+        logger.info(`[${exchange}] Reconnection successful after ${reconnectAttempts[exchange]} attempts`);
+        reconnectAttempts[exchange] = 0;
     }
 }
 
@@ -65,175 +106,354 @@ function connectBinance() {
     const url = `wss://fstream.binance.com/stream?streams=${streams}`;
     
     logger.info(`[Binance] Connecting to ${url}`);
-    const ws = new WebSocket(url);
+    binanceWs = new WebSocket(url);
 
-    ws.on('open', () => logger.info('[Binance] Connected.'));
+    binanceWs.on('open', () => {
+        logger.info('[Binance] ✓ Connected.');
+        resetReconnectCounter('BINANCE');
+    });
     
-    ws.on('message', (data) => {
+    binanceWs.on('message', (data) => {
         try {
             const msg = JSON.parse(data.toString());
-            // Format: { stream: 'xrpusdt@trade', data: { s: 'XRPUSDT', p: '...' } }
+            // Format: { stream: 'xrpusdt@trade', data: { s: 'XRPUSDT', p: '...', e: 'trade' } }
             if (!msg.data || msg.data.e !== 'trade') return;
 
             const rawSymbol = msg.data.s; // 'XRPUSDT'
             const asset = rawSymbol.replace('USDT', ''); // 'XRP'
             const price = parseFloat(msg.data.p);
             
-            sendPrice(asset, price, 'BINANCE');
-        } catch(e) {}
+            if (!isNaN(price) && price > 0) {
+                sendPrice(asset, price, 'BINANCE');
+            }
+        } catch(e) {
+            logger.error(`[Binance] Parse error: ${e.message}`);
+        }
     });
 
-    ws.on('close', () => {
-        logger.warn('[Binance] Closed. Reconnecting...');
-        setTimeout(connectBinance, config.reconnectInterval);
+    binanceWs.on('close', () => {
+        logger.warn('[Binance] ✗ Connection closed.');
+        reconnectWithBackoff('BINANCE', connectBinance);
     });
     
-    ws.on('error', (e) => logger.error(`[Binance] Error: ${e.message}`));
+    binanceWs.on('error', (e) => {
+        logger.error(`[Binance] Error: ${e.message}`);
+    });
 }
 
 // ==========================================
-// 2. OKX (SWAP) LISTENER (USDT)
+// 2. OKX (SWAP) LISTENER (USDT) - FIXED
 // ==========================================
 function connectOKX() {
     const url = 'wss://ws.okx.com:8443/ws/v5/public';
     logger.info(`[OKX] Connecting to ${url}`);
-    const ws = new WebSocket(url);
+    okxWs = new WebSocket(url);
     
-    // Heartbeat for OKX
-    const pingInterval = setInterval(() => {
-        if(ws.readyState === WebSocket.OPEN) ws.send('ping');
-    }, 20000);
+    let pingInterval = null;
 
-    ws.on('open', () => {
-        logger.info('[OKX] Connected.');
+    okxWs.on('open', () => {
+        logger.info('[OKX] ✓ Connected.');
+        resetReconnectCounter('OKX');
+        
+        // FIXED: Heartbeat interval set to 30 seconds
+        pingInterval = setInterval(() => {
+            if(okxWs && okxWs.readyState === WebSocket.OPEN) {
+                okxWs.send('ping');
+            }
+        }, 30000); // Changed from 20000 to 30000
+
         // Subscribe to Tickers: XRP-USDT-SWAP
-        const args = config.assets.map(a => ({ channel: 'tickers', instId: `${a}-USDT-SWAP` }));
-        ws.send(JSON.stringify({ op: 'subscribe', args: args }));
+        const args = config.assets.map(a => ({ 
+            channel: 'tickers', 
+            instId: `${a}-USDT-SWAP` 
+        }));
+        okxWs.send(JSON.stringify({ op: 'subscribe', args: args }));
     });
 
-    ws.on('message', (data) => {
+    okxWs.on('message', (data) => {
         try {
             const strData = data.toString();
             if (strData === 'pong') return;
             
             const msg = JSON.parse(strData);
-            // msg: { arg: { instId: 'XRP-USDT-SWAP' }, data: [{ last: '...' }] }
-            if (msg.data && msg.data[0]) {
+            
+            // Handle subscription confirmation
+            if (msg.event === 'subscribe') {
+                logger.info(`[OKX] Subscribed to ${msg.arg?.instId || 'channels'}`);
+                return;
+            }
+            
+            // Handle error responses
+            if (msg.event === 'error') {
+                logger.error(`[OKX] Subscription error: ${msg.msg}`);
+                return;
+            }
+            
+            // Handle data updates
+            // msg: { arg: { channel: 'tickers', instId: 'XRP-USDT-SWAP' }, data: [{ last: '...' }] }
+            if (msg.data && msg.data[0] && msg.data[0].last) {
                 const instId = msg.arg.instId; 
                 const asset = instId.split('-')[0]; // Extract 'XRP'
                 const price = parseFloat(msg.data[0].last);
                 
-                sendPrice(asset, price, 'OKX');
+                if (!isNaN(price) && price > 0) {
+                    sendPrice(asset, price, 'OKX');
+                }
             }
-        } catch (e) {}
+        } catch (e) {
+            logger.error(`[OKX] Parse error: ${e.message}`);
+        }
     });
 
-    ws.on('close', () => {
-        clearInterval(pingInterval);
-        logger.warn('[OKX] Closed. Reconnecting...');
-        setTimeout(connectOKX, config.reconnectInterval);
+    okxWs.on('close', () => {
+        if (pingInterval) clearInterval(pingInterval);
+        logger.warn('[OKX] ✗ Connection closed.');
+        reconnectWithBackoff('OKX', connectOKX);
     });
-    ws.on('error', (e) => logger.error(`[OKX] Error: ${e.message}`));
+    
+    okxWs.on('error', (e) => {
+        logger.error(`[OKX] Error: ${e.message}`);
+    });
 }
 
 // ==========================================
-// 3. GATE.IO (FUTURES) LISTENER (USDT)
+// 3. GATE.IO (FUTURES) LISTENER (USDT) - FIXED
 // ==========================================
 function connectGate() {
     const url = 'wss://fx-ws.gateio.ws/v4/ws/usdt';
     logger.info(`[Gate.io] Connecting to ${url}`);
-    const ws = new WebSocket(url);
+    gateWs = new WebSocket(url);
     
-    const pingInterval = setInterval(() => {
-        if(ws.readyState === WebSocket.OPEN) {
-             ws.send(JSON.stringify({ time: Date.now(), channel: 'spot.ping', event: 'ping' }));
-        }
-    }, 10000);
+    let pingInterval = null;
 
-    ws.on('open', () => {
-        logger.info('[Gate.io] Connected.');
-        // Symbols: XRP_USDT
+    gateWs.on('open', () => {
+        logger.info('[Gate.io] ✓ Connected.');
+        resetReconnectCounter('GATE');
+        
+        // FIXED: Ping interval adjusted to 15 seconds, using futures.ping
+        pingInterval = setInterval(() => {
+            if(gateWs && gateWs.readyState === WebSocket.OPEN) {
+                gateWs.send(JSON.stringify({ 
+                    time: Math.floor(Date.now() / 1000), // Unix timestamp in seconds
+                    channel: 'futures.ping' // FIXED: Changed from spot.ping
+                }));
+            }
+        }, 15000); // Changed from 10000 to 15000
+
+        // Subscribe to futures tickers
+        // Symbols format: XRP_USDT
         const symbols = config.assets.map(a => `${a}_USDT`);
-        ws.send(JSON.stringify({
-            time: Date.now(),
+        gateWs.send(JSON.stringify({
+            time: Math.floor(Date.now() / 1000),
             channel: 'futures.tickers',
             event: 'subscribe',
             payload: symbols
         }));
     });
 
-    ws.on('message', (data) => {
+    gateWs.on('message', (data) => {
         try {
             const msg = JSON.parse(data.toString());
-            // msg: { event: 'update', result: { contract: 'XRP_USDT', last: '...' } }
-            if (msg.event === 'update' && msg.result) {
+            
+            // Handle pong response
+            if (msg.channel === 'futures.pong') {
+                return;
+            }
+            
+            // Handle subscription confirmation
+            if (msg.event === 'subscribe') {
+                if (msg.error === null) {
+                    logger.info(`[Gate.io] Subscribed to ${msg.channel}`);
+                } else {
+                    logger.error(`[Gate.io] Subscription error: ${JSON.stringify(msg.error)}`);
+                }
+                return;
+            }
+            
+            // Handle ticker updates
+            // msg: { event: 'update', channel: 'futures.tickers', result: { contract: 'XRP_USDT', last: '...' } }
+            if (msg.event === 'update' && msg.channel === 'futures.tickers' && msg.result) {
                 const rawSymbol = msg.result.contract; 
                 const asset = rawSymbol.split('_')[0]; // Extract 'XRP'
                 const price = parseFloat(msg.result.last);
                 
-                sendPrice(asset, price, 'GATE');
+                if (!isNaN(price) && price > 0) {
+                    sendPrice(asset, price, 'GATE');
+                }
             }
-        } catch (e) {}
+        } catch (e) {
+            logger.error(`[Gate.io] Parse error: ${e.message}`);
+        }
     });
 
-    ws.on('close', () => {
-        clearInterval(pingInterval);
-        logger.warn('[Gate.io] Closed. Reconnecting...');
-        setTimeout(connectGate, config.reconnectInterval);
+    gateWs.on('close', () => {
+        if (pingInterval) clearInterval(pingInterval);
+        logger.warn('[Gate.io] ✗ Connection closed.');
+        reconnectWithBackoff('GATE', connectGate);
     });
-    ws.on('error', (e) => logger.error(`[Gate] Error: ${e.message}`));
+    
+    gateWs.on('error', (e) => {
+        logger.error(`[Gate.io] Error: ${e.message}`);
+    });
 }
 
 // ==========================================
-// 4. BITGET (MIX/FUTURES) LISTENER (USDT)
+// 4. BITGET (FUTURES) LISTENER (USDT) - FIXED
 // ==========================================
 function connectBitget() {
-    const url = 'wss://ws-api.bitget.com/mix/v1/stream';
+    // FIXED: Using V2 WebSocket endpoint
+    const url = 'wss://ws.bitget.com/v2/ws/public';
     logger.info(`[Bitget] Connecting to ${url}`);
-    const ws = new WebSocket(url);
+    bitgetWs = new WebSocket(url);
 
-    const pingInterval = setInterval(() => {
-        if(ws.readyState === WebSocket.OPEN) ws.send('ping');
-    }, 30000);
+    let pingInterval = null;
 
-    ws.on('open', () => {
-        logger.info('[Bitget] Connected.');
+    bitgetWs.on('open', () => {
+        logger.info('[Bitget] ✓ Connected.');
+        resetReconnectCounter('BITGET');
+        
+        pingInterval = setInterval(() => {
+            if(bitgetWs && bitgetWs.readyState === WebSocket.OPEN) {
+                bitgetWs.send('ping');
+            }
+        }, 30000);
+
+        // FIXED: V2 API subscription format with correct instType
         const args = config.assets.map(a => ({
-            instType: 'mc', 
+            instType: 'USDT-FUTURES', // FIXED: Changed from 'mc' to 'USDT-FUTURES'
             channel: 'ticker',
             instId: `${a}USDT`
         }));
-        ws.send(JSON.stringify({ op: 'subscribe', args: args }));
+        bitgetWs.send(JSON.stringify({ op: 'subscribe', args: args }));
     });
 
-    ws.on('message', (data) => {
+    bitgetWs.on('message', (data) => {
         try {
             const strData = data.toString();
             if (strData === 'pong') return;
             
             const msg = JSON.parse(strData);
-            // msg: { action: 'snapshot', arg: { instId: 'XRPUSDT' }, data: [{ last: '...' }] }
-            if ((msg.action === 'snapshot' || msg.action === 'update') && msg.data && msg.data[0]) {
-                const instId = msg.arg.instId; // XRPUSDT
-                const asset = instId.replace('USDT', '');
-                const price = parseFloat(msg.data[0].last);
-                
-                sendPrice(asset, price, 'BITGET');
+            
+            // Handle subscription confirmation
+            if (msg.event === 'subscribe') {
+                logger.info(`[Bitget] Subscribed: ${msg.arg?.instId || 'channels'}`);
+                return;
             }
-        } catch (e) {}
+            
+            // Handle error responses
+            if (msg.event === 'error') {
+                logger.error(`[Bitget] Error: ${msg.msg}`);
+                return;
+            }
+            
+            // Handle ticker data
+            // msg: { action: 'snapshot', arg: { instType: 'USDT-FUTURES', instId: 'XRPUSDT' }, data: [{ last: '...' }] }
+            if ((msg.action === 'snapshot' || msg.action === 'update') && msg.data && msg.data[0]) {
+                if (msg.data[0].last) {
+                    const instId = msg.arg.instId; // XRPUSDT
+                    const asset = instId.replace('USDT', ''); // XRP
+                    const price = parseFloat(msg.data[0].last);
+                    
+                    if (!isNaN(price) && price > 0) {
+                        sendPrice(asset, price, 'BITGET');
+                    }
+                }
+            }
+        } catch (e) {
+            logger.error(`[Bitget] Parse error: ${e.message}`);
+        }
     });
 
-    ws.on('close', () => {
-        clearInterval(pingInterval);
-        logger.warn('[Bitget] Closed. Reconnecting...');
-        setTimeout(connectBitget, config.reconnectInterval);
+    bitgetWs.on('close', () => {
+        if (pingInterval) clearInterval(pingInterval);
+        logger.warn('[Bitget] ✗ Connection closed.');
+        reconnectWithBackoff('BITGET', connectBitget);
     });
-    ws.on('error', (e) => logger.error(`[Bitget] Error: ${e.message}`));
+    
+    bitgetWs.on('error', (e) => {
+        logger.error(`[Bitget] Error: ${e.message}`);
+    });
 }
 
-// --- INIT ALL CONNECTIONS ---
+// ==========================================
+// CONNECTION HEALTH MONITORING
+// ==========================================
+function monitorConnections() {
+    setInterval(() => {
+        const status = {
+            internal: internalWs?.readyState === WebSocket.OPEN,
+            binance: binanceWs?.readyState === WebSocket.OPEN,
+            okx: okxWs?.readyState === WebSocket.OPEN,
+            gate: gateWs?.readyState === WebSocket.OPEN,
+            bitget: bitgetWs?.readyState === WebSocket.OPEN
+        };
+        
+        const connected = Object.values(status).filter(v => v).length;
+        const total = Object.keys(status).length;
+        
+        logger.info(`📊 Health Check: ${connected}/${total} connections active | ${JSON.stringify(status)}`);
+        
+        // Alert if internal connection is down
+        if (!status.internal) {
+            logger.error('🚨 CRITICAL: Internal Bot WebSocket is DOWN!');
+        }
+    }, 60000); // Every 60 seconds
+}
+
+// ==========================================
+// GRACEFUL SHUTDOWN
+// ==========================================
+function gracefulShutdown() {
+    logger.info('🛑 Shutting down gracefully...');
+    
+    const closeConnection = (ws, name) => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.close();
+            logger.info(`✓ Closed ${name} connection`);
+        }
+    };
+    
+    closeConnection(internalWs, 'Internal');
+    closeConnection(binanceWs, 'Binance');
+    closeConnection(okxWs, 'OKX');
+    closeConnection(gateWs, 'Gate.io');
+    closeConnection(bitgetWs, 'Bitget');
+    
+    setTimeout(() => {
+        logger.info('👋 Shutdown complete');
+        process.exit(0);
+    }, 1000);
+}
+
+// Handle process termination
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
+
+// Handle uncaught errors
+process.on('uncaughtException', (err) => {
+    logger.error(`💥 Uncaught Exception: ${err.message}`);
+    logger.error(err.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error(`💥 Unhandled Rejection at: ${promise}, reason: ${reason}`);
+});
+
+// ==========================================
+// INITIALIZATION
+// ==========================================
+logger.info('🚀 Starting Market Listener v11.1.0 (FIXED)');
+logger.info(`📡 Assets: ${config.assets.join(', ')}`);
+logger.info(`🔌 Internal Receiver: ${config.internalReceiverUrl}`);
+
+// Connect to all services
 connectToInternal();
 connectBinance();
 connectOKX();
 connectGate();
 connectBitget();
+
+// Start health monitoring after 10 seconds
+setTimeout(monitorConnections, 10000);
+
+logger.info('✓ All connections initiated. Waiting for streams...');
