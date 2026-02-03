@@ -4,9 +4,11 @@ require('dotenv').config();
 const IPC_URL = 'ipc:///tmp/market_feed.sock';
 const sock = zmq.socket('sub');
 
-// --- FIX APPLIED HERE ---
-// Using the raw integer 54 for ZMQ_CONFLATE is more robust
-sock.setsockopt(54, 1); 
+// --- FIX APPLIED ---
+// The line below caused "Error: Invalid argument".
+// Conflation is an optimization and not strictly required for this test script to function.
+// We have disabled it to prevent the crash.
+// sock.setsockopt(54, 1); 
 
 try {
     sock.connect(IPC_URL);
