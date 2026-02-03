@@ -10,8 +10,8 @@ class AdvanceStrategy {
         // CRITICAL: Ensure these IDs match the LINEAR (USDT) contracts on Delta.
         // Inverse IDs (USD) are different.
         const MASTER_CONFIG = {
-            'XRP': { deltaId: 15261 }, // User Provided ID for XRPUSDT
-            'BTC': { deltaId: 298 },   // Common BTC-PERP (Linear) ID - Verify!
+            'XRP': { deltaId: 14969 }, // User Provided ID for XRPUSDT
+            'BTC': { deltaId: 27 },   // Common BTC-PERP (Linear) ID - Verify!
             'ETH': { deltaId: 299 },   // Common ETH-PERP (Linear) ID - Verify!
             'SOL': { deltaId: 300 }    // Common SOL-PERP (Linear) ID - Verify!
         };
