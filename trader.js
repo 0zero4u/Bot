@@ -13,8 +13,7 @@ const config = {
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
     apiSecret: process.env.DELTA_API_SECRET,
-    // Note: productId in .env is overridden by Strategy logic usually, 
-    // but kept here for fallback.
+    // Note: productId in .env is overridden by Strategy logic, but kept here for fallback.
     productId: parseInt(process.env.DELTA_PRODUCT_ID),
     productSymbol: process.env.DELTA_PRODUCT_SYMBOL, 
     orderSize: parseInt(process.env.ORDER_SIZE || '1'),
@@ -65,13 +64,15 @@ class TradingBot {
         this.ws = null; this.authenticated = false;
         this.isOrderInProgress = false; 
         
-        // NEW: Multi-Asset Orderbooks storage
-        // This ensures when we get a signal for ETH, we have ETH's orderbook ready.
-        this.orderBooks = {
-            'BTC': { bids: [], asks: [] },
-            'ETH': { bids: [], asks: [] },
-            'SOL': { bids: [], asks: [] }
-        };
+        // DYNAMIC: Parse Target Assets from .env (e.g., XRP, BTC, ETH)
+        this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
+        this.logger.info(`Trading Targets (USDT): ${this.targetAssets.join(', ')}`);
+
+        // DYNAMIC: Multi-Asset Orderbooks storage
+        this.orderBooks = {};
+        this.targetAssets.forEach(asset => {
+            this.orderBooks[asset] = { bids: [], asks: [] };
+        });
 
         this.hasOpenPosition = false;
         this.isStateSynced = false;
@@ -90,7 +91,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v14.1.0) ---`);
+        this.logger.info(`--- Bot Initializing (v11.0.0 - USDT Linear) ---`);
         this.logger.info(`Strategy: ${this.strategy.getName()}`);
         
         // 1. Check current positions on Delta
@@ -148,12 +149,12 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        // UPDATED: Subscribe to L1 books for ALL tracked assets.
-        // Adjust these symbols if you are trading Linear (USDT) vs Inverse. 
-        // Usually BTCUSD = Inverse, BTC-PERP = Linear. Check Delta docs if unsure.
-        // Assuming standard Inverse/Perp symbols here:
-        const symbols = ['BTCUSD', 'ETHUSD', 'SOLUSD'];
+        // UPDATED: Generate USDT symbols for Delta
+        // Delta Linear Perps are usually "BTCUSDT", "XRPUSDT", etc.
+        const symbols = this.targetAssets.map(asset => `${asset}USDT`);
         
+        this.logger.info(`Subscribing to L1 Books: ${symbols.join(', ')}`);
+
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
@@ -189,11 +190,9 @@ class TradingBot {
                 break;
             
             case 'l1_orderbook':
-                // UPDATED: Route L1 updates to the correct internal storage
-                let asset = null;
-                if (message.symbol.includes('BTC')) asset = 'BTC';
-                else if (message.symbol.includes('ETH')) asset = 'ETH';
-                else if (message.symbol.includes('SOL')) asset = 'SOL';
+                // DYNAMIC: Route L1 updates (e.g., XRPUSDT) to correct internal storage (XRP)
+                // We check which of our target assets matches the start of the symbol
+                const asset = this.targetAssets.find(a => message.symbol.startsWith(a));
 
                 if (asset) {
                     // Update internal book for Strategy usage
@@ -202,7 +201,7 @@ class TradingBot {
                         asks: [[message.best_ask, message.ask_qty]]
                     };
                     
-                    // Notify Strategy (Crucial for Delta Deviation calculations)
+                    // Notify Strategy 
                     if (this.strategy.onOrderBookUpdate) {
                         this.strategy.onOrderBookUpdate(message.symbol, parseFloat(message.best_bid));
                     }
@@ -218,17 +217,17 @@ class TradingBot {
         try {
             const data = JSON.parse(message.toString());
             
-            // UPDATED: Handle Multi-Asset Signal with Source Tag
-            // Format: { type: 'S', s: 'BTC', p: 90000.5, x: 'OKX' }
+            // Format: { type: 'S', s: 'XRP', p: 0.55, x: 'BINANCE' }
             if (data.type === 'S' && data.p) {
                 const asset = data.s || 'BTC'; 
                 const price = parseFloat(data.p);
-                const source = data.x || 'UNKNOWN'; // Extract the Exchange Source
+                const source = data.x || 'UNKNOWN';
                 
-                // Route to Strategy with Source info
-                // This allows the strategy to put this price in the correct "Bucket"
-                if (this.strategy.onPriceUpdate) {
-                    await this.strategy.onPriceUpdate(asset, price, source);
+                // Only process if this asset is in our target list (e.g. XRP)
+                if (this.targetAssets.includes(asset)) {
+                    if (this.strategy.onPriceUpdate) {
+                        await this.strategy.onPriceUpdate(asset, price, source);
+                    }
                 }
             }
         } catch (error) {
@@ -249,8 +248,6 @@ class TradingBot {
     
     // --- Order Execution & Management ---
     
-    // Places order on Delta Exchange
-    // Delegates to client.js which handles the API Key & HMAC Signing
     async placeOrder(orderData) {
         return this.client.placeOrder(orderData);
     }
@@ -259,7 +256,6 @@ class TradingBot {
         try {
             const response = await this.client.getPositions();
             const positions = response.result || [];
-            // Check if we have ANY active position
             const hasActive = positions.some(p => parseFloat(p.size) !== 0);
             this.hasOpenPosition = hasActive;
             
@@ -270,24 +266,20 @@ class TradingBot {
         }
     }
     
-    // Legacy Helpers (Kept for compatibility if Strategy uses OrderManager logic)
-    registerPendingOrder(clientOrderId) { /* Managed by Strategy internal state now */ }
-    confirmRegisteredOrder(clientOrderId, orderResult) { /* ... */ }
-    cancelPendingOrder(clientOrderId) { /* ... */ }
+    registerPendingOrder(clientOrderId) { }
+    confirmRegisteredOrder(clientOrderId, orderResult) { }
+    cancelPendingOrder(clientOrderId) { }
 
     handleOrderUpdate(orderUpdate) {
-        // Log fills for debugging
         if (orderUpdate.state === 'filled') {
             this.logger.info(`[Trader] Order ${orderUpdate.id} FILLED on Delta.`);
         }
     }
 
-    // Helper for Strategy to access latest book
     getOrderBook(asset) {
         return this.orderBooks[asset];
     }
     
-    // Safety Fallback
     async safeCancelAll(productId) {
         try {
             await this.client.cancelAllOrders(productId);
@@ -297,7 +289,6 @@ class TradingBot {
     }
 }
 
-// --- Startup ---
 (async () => {
     try {
         const bot = new TradingBot(config);
