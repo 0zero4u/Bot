@@ -171,7 +171,7 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        const symbols = this.targetAssets.map(asset => `${asset}USDT`);
+        const symbols = this.targetAssets.map(asset => `${asset}USD`);
         this.logger.info(`Subscribing to L1 Books: ${symbols.join(', ')}`);
 
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
