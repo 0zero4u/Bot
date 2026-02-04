@@ -22,8 +22,8 @@ const config = {
     reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
     pingIntervalMs: parseInt(process.env.PING_INTERVAL_MS || '30000'),
     heartbeatTimeoutMs: parseInt(process.env.HEARTBEAT_TIMEOUT_MS || '40000'),
-    // Defaulting to 0.05% (Calculated as: Price * 0.05 / 100)
-    priceAggressionOffset: parseFloat(process.env.PRICE_AGGRESSION_OFFSET || '0.05'),
+    // Defaulting to 0.01% (Calculated as: Price * 0.01 / 100)
+    priceAggressionOffset: parseFloat(process.env.PRICE_AGGRESSION_OFFSET || '0.01'),
 };
 
 // --- Logging Setup ---
