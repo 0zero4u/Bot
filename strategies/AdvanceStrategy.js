@@ -36,7 +36,7 @@ class AdvanceStrategy {
         });
 
         // --- LEARNING PHASE STATE ---
-        this.windowSizeMs = 5 * 60 * 1000; // 5 Minute Sliding Window
+        this.windowSizeMs = 2 * 60 * 1000; // 2 Minute Sliding Window
         this.startTime = Date.now();
         this.isWarmup = true;
         
@@ -47,7 +47,7 @@ class AdvanceStrategy {
         this.lockedAsset = null;
         this.position = null;
         
-        this.minHistoryPoints = 5; 
+        this.minHistoryPoints = 2; 
     }
 
     getName() { return "AdvanceStrategy (USDT Linear)"; }
