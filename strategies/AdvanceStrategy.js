@@ -1,5 +1,5 @@
 // strategies/AdvanceStrategy.js
-// Version 11.0.3 - UPDATE: Percentage-based Price Aggression
+// Version 12.0.0 - UPDATE: Sliding Window Dynamic Threshold
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -24,7 +24,8 @@ class AdvanceStrategy {
             if (MASTER_CONFIG[asset]) {
                 this.assets[asset] = {
                     deltaId: MASTER_CONFIG[asset].deltaId,
-                    deltaHistory: [],
+                    deltaHistory: [], // Stores Price History
+                    gapHistory: [],   // [NEW] Stores Gap History for Sliding Window
                     sources: {} 
                 };
                 this.logger.info(`[AdvanceStrategy] Enabled Asset: ${asset}USDT (ID: ${this.assets[asset].deltaId})`);
@@ -38,7 +39,8 @@ class AdvanceStrategy {
         this.startTime = Date.now();
         this.isWarmup = true;
         
-        this.baselineGap = 0; 
+        // This is now used primarily for logging, as threshold is calculated per-asset dynamically
+        this.currentThresholdDisplay = 0; 
 
         // --- TRADING STATE ---
         this.lastOrderTime = 0;
@@ -48,7 +50,7 @@ class AdvanceStrategy {
         this.minHistoryPoints = 2; 
     }
 
-    getName() { return "AdvanceStrategy (USDT Linear)"; }
+    getName() { return "AdvanceStrategy (Dynamic Sliding Window)"; }
 
     /**
      * 1. INGEST MARKET PRICE (The "Leader" Signal)
@@ -72,8 +74,7 @@ class AdvanceStrategy {
         if (this.isWarmup && (now - this.startTime > this.windowSizeMs)) {
             this.isWarmup = false;
             this.logger.info(`[AdvanceStrategy] *** WARMUP COMPLETE ***`);
-            this.logger.info(`[AdvanceStrategy] System is now ACTIVE.`);
-            this.logger.info(`[AdvanceStrategy] Learned Volatility Threshold: ${this.baselineGap.toFixed(4)}%`);
+            this.logger.info(`[AdvanceStrategy] System is now ACTIVE with Dynamic Sliding Window.`);
         }
 
         // --- 4. DATA INGESTION ---
@@ -91,7 +92,7 @@ class AdvanceStrategy {
         const currentDeltaPrice = assetData.deltaHistory[assetData.deltaHistory.length - 1].p;
         const deltaStats = this.calculateSpikeStats(assetData.deltaHistory, currentDeltaPrice);
 
-        // --- 6. CALCULATE THE "GAP" ---
+        // --- 6. CALCULATE THE CURRENT "GAP" ---
         let gap = 0;
         let direction = null;
 
@@ -105,28 +106,65 @@ class AdvanceStrategy {
 
         if (gap < 0) gap = 0;
 
-        // --- 7. DECISION LOGIC ---
-        if (this.isWarmup) {
-            // LEARNING PHASE
-            if (gap > this.baselineGap) {
-                this.baselineGap = gap;
+        // ==================================================================
+        // --- 7. SLIDING WINDOW THRESHOLD LOGIC ---
+        // ==================================================================
+
+        // A. Clean up old Gap History (Keep only last 2 minutes)
+        const cutoff = now - this.windowSizeMs;
+        // Efficient array shifting to remove old data
+        while (assetData.gapHistory.length > 0 && assetData.gapHistory[0].t < cutoff) {
+            assetData.gapHistory.shift();
+        }
+
+        // B. Calculate Dynamic Threshold
+        // Find the MAXIMUM gap that occurred in the last 2 minutes.
+        // We set a minimum floor (e.g., 0.05%) to prevent trading on tiny noise.
+        let rollingMax = 0.05; 
+        
+        for (const item of assetData.gapHistory) {
+            if (item.v > rollingMax) {
+                rollingMax = item.v;
             }
+        }
+        
+        // Update display variable for logging
+        this.currentThresholdDisplay = rollingMax;
+
+        // ==================================================================
+        // --- 8. DECISION LOGIC ---
+        // ==================================================================
+
+        if (this.isWarmup) {
+            // Just recording history during warmup
+            // No action needed, pushing to history happens at end of function
         } else {
-            // [NEW] DEBUG PULSE: Log heartbeat to confirm math is running
-            // Logs if gap is > 50% of threshold OR 5% random chance
-            if (gap > (this.baselineGap * 0.5) || Math.random() < 0.05) {
-                this.logger.info(`[Strategy Pulse] ${asset} | Gap: ${gap.toFixed(4)}% | Threshold: ${this.baselineGap.toFixed(4)}% | Dir: ${direction}`);
+            // ACTIVE PHASE
+            
+            // To trigger, the current Gap must be HIGHER than the Rolling Max
+            // This means it is a "Breakout" from the recent volatility range.
+            // We use a tiny buffer (1.01x) to ensure it's strictly greater.
+            const triggerThreshold = rollingMax * 1.01;
+
+            // DEBUG PULSE (Log occasionally or if close to threshold)
+            if (gap > (triggerThreshold * 0.5) || Math.random() < 0.05) {
+                this.logger.info(`[Pulse] ${asset} | Gap: ${gap.toFixed(4)}% | Rolling Max (2m): ${rollingMax.toFixed(4)}% | Dir: ${direction}`);
             }
 
-            // ACTIVE PHASE
-            if (gap > this.baselineGap) {
+            if (gap > triggerThreshold) {
                 this.logger.info(`[AdvanceStrategy] *** ANOMALY DETECTED on ${asset} via ${source} ***`);
-                this.logger.info(`Gap (${gap.toFixed(4)}%) > Baseline (${this.baselineGap.toFixed(4)}%)`);
+                this.logger.info(`Gap (${gap.toFixed(4)}%) > Rolling Max (${rollingMax.toFixed(4)}%)`);
                 this.logger.info(`Market Move: ${marketStats.changePct.toFixed(4)}% | Delta Move: ${deltaStats.changePct.toFixed(4)}%`);
                 
                 await this.executeTrade(asset, direction, assetData.deltaId);
             }
         }
+
+        // C. UPDATE HISTORY (Last Step)
+        // We push the current gap *after* the check. 
+        // This ensures the current spike becomes the new "Normal" for the next tick,
+        // preventing the bot from buying the same spike twice.
+        assetData.gapHistory.push({ t: now, v: gap });
     }
 
     /**
