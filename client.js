@@ -127,6 +127,13 @@ class DeltaClient {
         return this.#request('GET', '/v2/positions/margined');
     }
 
+    /**
+     * [NEW] Used for Keep-Alive Loop
+     */
+    getWalletBalance() {
+        return this.#request('GET', '/v2/wallet/balances');
+    }
+
     getLiveOrders(productId, opts = {}) {
         const query = { product_id: productId, states: opts.states || 'open,pending' };
         return this.#request('GET', '/v2/orders', null, query);
@@ -173,4 +180,3 @@ class DeltaClient {
 }
 
 module.exports = DeltaClient;
-              
