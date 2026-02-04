@@ -79,6 +79,9 @@ class TradingBot {
         this.pingInterval = null; this.heartbeatTimeout = null;
         this.managedOrders = new Map(); this.pendingOrders = new Map();
 
+        // [NEW] REST Keep-Alive Interval Tracker
+        this.restKeepAliveInterval = null;
+
         // Load Strategy dynamically
         try {
             const StrategyClass = require(`./strategies/${this.config.strategy}Strategy.js`);
@@ -102,6 +105,29 @@ class TradingBot {
         
         // 3. Start Local WebSocket Server to listen for signals (market_listener.js)
         this.setupHttpServer();
+
+        // 4. [NEW] Start REST Keep-Alive (25s Loop)
+        this.startRestKeepAlive();
+    }
+
+    /**
+     * [NEW] Keeps the HTTP/2 connection warm by sending a lightweight request every 25s.
+     * This prevents Load Balancer idle timeouts (usually 60s).
+     */
+    startRestKeepAlive() {
+        this.logger.info('Starting REST Keep-Alive Loop (25s interval)...');
+        
+        if (this.restKeepAliveInterval) clearInterval(this.restKeepAliveInterval);
+
+        this.restKeepAliveInterval = setInterval(async () => {
+            try {
+                // Using getWalletBalance as the "ping"
+                await this.client.getWalletBalance();
+            } catch (error) {
+                // Log warning but don't crash; the client will auto-reconnect on next attempt
+                this.logger.warn(`[Keep-Alive] Check Failed: ${error.message}`);
+            }
+        }, 25000); // 25 seconds
     }
     
     // --- WebSocket Heartbeat (Keep-Alive) ---
@@ -303,3 +329,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
+                                      
