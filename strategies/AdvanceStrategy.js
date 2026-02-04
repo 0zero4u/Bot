@@ -1,5 +1,5 @@
 // strategies/AdvanceStrategy.js
-// Version 11.0.1 - FIX APPLIED: Product ID String & Race Condition
+// Version 11.0.2 - ADDED: Heartbeat Logging for visibility
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -8,16 +8,14 @@ class AdvanceStrategy {
 
         // --- 1. MASTER ASSET METADATA (USDT / LINEAR IDS) ---
         // CRITICAL: Ensure these IDs match the LINEAR (USDT) contracts on Delta.
-        // Inverse IDs (USD) are different.
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969 }, // User Provided ID for XRPUSDT
-            'BTC': { deltaId: 27 },    // Common BTC-PERP (Linear) ID - Verify!
-            'ETH': { deltaId: 299 },   // Common ETH-PERP (Linear) ID - Verify!
-            'SOL': { deltaId: 300 }    // Common SOL-PERP (Linear) ID - Verify!
+            'BTC': { deltaId: 27 },    // Common BTC-PERP (Linear) ID
+            'ETH': { deltaId: 299 },   // Common ETH-PERP (Linear) ID
+            'SOL': { deltaId: 300 }    // Common SOL-PERP (Linear) ID
         };
 
         // --- 2. INITIALIZE TARGETS ---
-        // Load assets from .env (e.g. TARGET_ASSETS=XRP,BTC)
         const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
         
         this.assets = {};
@@ -114,6 +112,12 @@ class AdvanceStrategy {
                 this.baselineGap = gap;
             }
         } else {
+            // [NEW] DEBUG PULSE: Log heartbeat to confirm math is running
+            // Logs if gap is > 50% of threshold OR 5% random chance
+            if (gap > (this.baselineGap * 0.5) || Math.random() < 0.05) {
+                this.logger.info(`[Strategy Pulse] ${asset} | Gap: ${gap.toFixed(4)}% | Threshold: ${this.baselineGap.toFixed(4)}% | Dir: ${direction}`);
+            }
+
             // ACTIVE PHASE
             if (gap > this.baselineGap) {
                 this.logger.info(`[AdvanceStrategy] *** ANOMALY DETECTED on ${asset} via ${source} ***`);
@@ -130,7 +134,6 @@ class AdvanceStrategy {
      */
     onOrderBookUpdate(symbol, price) {
         // DYNAMIC LOOKUP: Check which of our active assets matches this symbol
-        // e.g. symbol "XRPUSDT" starts with asset "XRP"
         const asset = Object.keys(this.assets).find(a => symbol.startsWith(a));
 
         if (asset && this.assets[asset]) {
@@ -188,7 +191,7 @@ class AdvanceStrategy {
             const limitPrice = side === 'buy' ? bestPrice + offset : bestPrice - offset;
 
             const orderData = {
-                product_id: productId.toString(), // <--- FIX 1: Converted to String
+                product_id: productId.toString(), 
                 size: this.bot.config.orderSize, 
                 side: side,
                 order_type: 'limit_order',
@@ -198,14 +201,12 @@ class AdvanceStrategy {
 
             this.logger.info(`[AdvanceStrategy] FLEETING ${side.toUpperCase()} on ${asset}`, orderData);
             
-            // <--- FIX 2: Set cooldown BEFORE requesting to prevent 429 race conditions
             this.lastOrderTime = Date.now(); 
 
             const response = await this.bot.placeOrder(orderData);
             
             if (response.result) {
                 this.logger.info(`[AdvanceStrategy] Order Placed Successfully. Entering Cooldown.`);
-                // Timestamp already updated above
             } else {
                 this.logger.error(`[AdvanceStrategy] Order rejected/failed: ${JSON.stringify(response)}`);
             }
@@ -228,4 +229,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-                
+                                                                                       
