@@ -52,7 +52,7 @@ class DeltaClient {
                 limit: 0 // FAIL-FAST: No retries. If it fails, we move on.
             },
             headers: {
-                'User-Agent': 'nodejs-delta-sniper',
+                'User-Agent': 'nodejs-delta',
                 'Accept': 'application/json'
             }
         });
