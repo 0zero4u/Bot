@@ -1,5 +1,5 @@
 // strategies/AdvanceStrategy.js
-// Version 11.0.0 - USDT Linear Strategy (XRP, BTC, ETH)
+// Version 11.0.1 - FIX APPLIED: Product ID String & Race Condition
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -11,7 +11,7 @@ class AdvanceStrategy {
         // Inverse IDs (USD) are different.
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969 }, // User Provided ID for XRPUSDT
-            'BTC': { deltaId: 27 },   // Common BTC-PERP (Linear) ID - Verify!
+            'BTC': { deltaId: 27 },    // Common BTC-PERP (Linear) ID - Verify!
             'ETH': { deltaId: 299 },   // Common ETH-PERP (Linear) ID - Verify!
             'SOL': { deltaId: 300 }    // Common SOL-PERP (Linear) ID - Verify!
         };
@@ -188,7 +188,7 @@ class AdvanceStrategy {
             const limitPrice = side === 'buy' ? bestPrice + offset : bestPrice - offset;
 
             const orderData = {
-                product_id: productId,
+                product_id: productId.toString(), // <--- FIX 1: Converted to String
                 size: this.bot.config.orderSize, 
                 side: side,
                 order_type: 'limit_order',
@@ -198,11 +198,14 @@ class AdvanceStrategy {
 
             this.logger.info(`[AdvanceStrategy] FLEETING ${side.toUpperCase()} on ${asset}`, orderData);
             
+            // <--- FIX 2: Set cooldown BEFORE requesting to prevent 429 race conditions
+            this.lastOrderTime = Date.now(); 
+
             const response = await this.bot.placeOrder(orderData);
             
             if (response.result) {
                 this.logger.info(`[AdvanceStrategy] Order Placed Successfully. Entering Cooldown.`);
-                this.lastOrderTime = Date.now();
+                // Timestamp already updated above
             } else {
                 this.logger.error(`[AdvanceStrategy] Order rejected/failed: ${JSON.stringify(response)}`);
             }
@@ -225,3 +228,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
+                
