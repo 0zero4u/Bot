@@ -1,3 +1,4 @@
+// trader.js
 const WebSocket = require('ws');
 const winston = require('winston');
 const { v4: uuidv4 } = require('uuid');
@@ -13,7 +14,6 @@ const config = {
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
     apiSecret: process.env.DELTA_API_SECRET,
-    // Note: productId in .env is overridden by Strategy logic, but kept here for fallback.
     productId: parseInt(process.env.DELTA_PRODUCT_ID),
     productSymbol: process.env.DELTA_PRODUCT_SYMBOL, 
     orderSize: parseInt(process.env.ORDER_SIZE || '1'),
@@ -45,7 +45,6 @@ const logger = winston.createLogger({
     ]
 });
 
-// --- Input Validation ---
 function validateConfig() {
     const required = ['apiKey', 'apiSecret', 'leverage'];
     if (required.some(key => !config[key])) {
@@ -64,11 +63,9 @@ class TradingBot {
         this.ws = null; this.authenticated = false;
         this.isOrderInProgress = false; 
         
-        // DYNAMIC: Parse Target Assets from .env (e.g., XRP, BTC, ETH)
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
         this.logger.info(`Trading Targets (USDT): ${this.targetAssets.join(', ')}`);
 
-        // DYNAMIC: Multi-Asset Orderbooks storage
         this.orderBooks = {};
         this.targetAssets.forEach(asset => {
             this.orderBooks[asset] = { bids: [], asks: [] };
@@ -77,12 +74,10 @@ class TradingBot {
         this.hasOpenPosition = false;
         this.isStateSynced = false;
         this.pingInterval = null; this.heartbeatTimeout = null;
-        this.managedOrders = new Map(); this.pendingOrders = new Map();
-
+        
         // [NEW] REST Keep-Alive Interval Tracker
         this.restKeepAliveInterval = null;
 
-        // Load Strategy dynamically
         try {
             const StrategyClass = require(`./strategies/${this.config.strategy}Strategy.js`);
             this.strategy = new StrategyClass(this);
@@ -94,16 +89,16 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v11.0.0 - USDT Linear) ---`);
+        this.logger.info(`--- Bot Initializing (v12.0.0 - No Cancel / Keep-Alive) ---`);
         this.logger.info(`Strategy: ${this.strategy.getName()}`);
         
         // 1. Check current positions on Delta
         await this.syncPositionState();
         
-        // 2. Connect to Delta WebSocket for Prices & Order Updates
+        // 2. Connect to Delta WebSocket
         await this.initWebSocket();
         
-        // 3. Start Local WebSocket Server to listen for signals (market_listener.js)
+        // 3. Start Local WebSocket Server
         this.setupHttpServer();
 
         // 4. [NEW] Start REST Keep-Alive (25s Loop)
@@ -112,7 +107,7 @@ class TradingBot {
 
     /**
      * [NEW] Keeps the HTTP/2 connection warm by sending a lightweight request every 25s.
-     * This prevents Load Balancer idle timeouts (usually 60s).
+     * This prevents Load Balancer idle timeouts.
      */
     startRestKeepAlive() {
         this.logger.info('Starting REST Keep-Alive Loop (25s interval)...');
@@ -123,14 +118,15 @@ class TradingBot {
             try {
                 // Using getWalletBalance as the "ping"
                 await this.client.getWalletBalance();
+                // Optional debug log:
+                // this.logger.debug('[Keep-Alive] Balance ping sent.');
             } catch (error) {
-                // Log warning but don't crash; the client will auto-reconnect on next attempt
                 this.logger.warn(`[Keep-Alive] Check Failed: ${error.message}`);
             }
         }, 25000); // 25 seconds
     }
     
-    // --- WebSocket Heartbeat (Keep-Alive) ---
+    // --- WebSocket Heartbeat ---
     startHeartbeat() {
         this.resetHeartbeatTimeout();
         this.pingInterval = setInterval(() => {
@@ -175,10 +171,7 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        // UPDATED: Generate USDT symbols for Delta
-        // Delta Linear Perps are usually "BTCUSDT", "XRPUSDT", etc.
         const symbols = this.targetAssets.map(asset => `${asset}USDT`);
-        
         this.logger.info(`Subscribing to L1 Books: ${symbols.join(', ')}`);
 
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
@@ -207,27 +200,19 @@ class TradingBot {
             case 'orders':
                 if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
                 break;
-            
             case 'positions':
                 if (message.size) {
                     this.hasOpenPosition = parseFloat(message.size) !== 0;
                     if (this.strategy.onPositionUpdate) this.strategy.onPositionUpdate(message);
                 }
                 break;
-            
             case 'l1_orderbook':
-                // DYNAMIC: Route L1 updates (e.g., XRPUSDT) to correct internal storage (XRP)
-                // We check which of our target assets matches the start of the symbol
                 const asset = this.targetAssets.find(a => message.symbol.startsWith(a));
-
                 if (asset) {
-                    // Update internal book for Strategy usage
                     this.orderBooks[asset] = {
                         bids: [[message.best_bid, message.bid_qty]],
                         asks: [[message.best_ask, message.ask_qty]]
                     };
-                    
-                    // Notify Strategy 
                     if (this.strategy.onOrderBookUpdate) {
                         this.strategy.onOrderBookUpdate(message.symbol, parseFloat(message.best_bid));
                     }
@@ -236,20 +221,14 @@ class TradingBot {
         }
     }
 
-    // --- Signal Handling from market_listener.js ---
     async handleSignalMessage(message) {
         if (!this.authenticated) return;
-
         try {
             const data = JSON.parse(message.toString());
-            
-            // Format: { type: 'S', s: 'XRP', p: 0.55, x: 'BINANCE' }
             if (data.type === 'S' && data.p) {
                 const asset = data.s || 'BTC'; 
                 const price = parseFloat(data.p);
                 const source = data.x || 'UNKNOWN';
-                
-                // Only process if this asset is in our target list (e.g. XRP)
                 if (this.targetAssets.includes(asset)) {
                     if (this.strategy.onPriceUpdate) {
                         await this.strategy.onPriceUpdate(asset, price, source);
@@ -272,8 +251,6 @@ class TradingBot {
         this.logger.info(`Signal server started on port ${this.config.port}`);
     }
     
-    // --- Order Execution & Management ---
-    
     async placeOrder(orderData) {
         return this.client.placeOrder(orderData);
     }
@@ -284,7 +261,6 @@ class TradingBot {
             const positions = response.result || [];
             const hasActive = positions.some(p => parseFloat(p.size) !== 0);
             this.hasOpenPosition = hasActive;
-            
             this.isStateSynced = true;
             this.logger.info(`Position State Synced. Open Position: ${this.hasOpenPosition}`);
         } catch (error) {
@@ -305,21 +281,12 @@ class TradingBot {
     getOrderBook(asset) {
         return this.orderBooks[asset];
     }
-    
-    async safeCancelAll(productId) {
-        try {
-            await this.client.cancelAllOrders(productId);
-        } catch (e) {
-            this.logger.error(`CancelAll failed: ${e.message}`);
-        }
-    }
 }
 
 (async () => {
     try {
         const bot = new TradingBot(config);
         await bot.start();
-        
         process.on('uncaughtException', async (err) => {
             logger.error('Uncaught Exception:', err);
             process.exit(1);
@@ -329,4 +296,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                                      
+            
