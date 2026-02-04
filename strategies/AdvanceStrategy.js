@@ -1,5 +1,5 @@
 // strategies/AdvanceStrategy.js
-// Version 11.0.2 - ADDED: Heartbeat Logging for visibility
+// Version 11.0.3 - UPDATE: Percentage-based Price Aggression
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -187,8 +187,16 @@ class AdvanceStrategy {
             if (!book) throw new Error('Orderbook not ready');
 
             const bestPrice = side === 'buy' ? parseFloat(book.asks[0][0]) : parseFloat(book.bids[0][0]);
-            const offset = this.bot.config.priceAggressionOffset;
-            const limitPrice = side === 'buy' ? bestPrice + offset : bestPrice - offset;
+            
+            // --- UPDATED: PERCENTAGE BASED AGGRESSION ---
+            const aggressionPercent = this.bot.config.priceAggressionOffset; // e.g. 0.05
+            const offsetAmount = bestPrice * (aggressionPercent / 100);
+            
+            // Calculate Limit Price
+            let limitPrice = side === 'buy' ? bestPrice + offsetAmount : bestPrice - offsetAmount;
+            
+            // Round to 6 decimals to be safe for API (prevents 100.123456789123)
+            limitPrice = parseFloat(limitPrice.toFixed(6));
 
             const orderData = {
                 product_id: productId.toString(), 
@@ -199,7 +207,7 @@ class AdvanceStrategy {
                 time_in_force: 'ioc' 
             };
 
-            this.logger.info(`[AdvanceStrategy] FLEETING ${side.toUpperCase()} on ${asset}`, orderData);
+            this.logger.info(`[AdvanceStrategy] FLEETING ${side.toUpperCase()} on ${asset} @ ${limitPrice} (Offset: ${aggressionPercent}%)`, orderData);
             
             this.lastOrderTime = Date.now(); 
 
@@ -229,4 +237,3 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-                                                                                       
