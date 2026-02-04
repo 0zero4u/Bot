@@ -25,7 +25,7 @@ class DeltaClient {
             http2: new http2.Agent({
                 keepAlive: true,
                 keepAliveMsecs: 1000,
-                maxSockets: 256, // High concurrency
+                maxSockets: 32, // High concurrency
                 timeout: 5000,
                 // Hook into the session creation to enforce socket options
                 createConnection: (authority, options) => {
