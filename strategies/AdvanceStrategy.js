@@ -1,5 +1,4 @@
-// strategies/AdvanceStrategy.js
-// Version 17.0.0 - Duplicate Order Prevention (Local Locking)
+
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -35,7 +34,7 @@ class AdvanceStrategy {
         this.lastOrderTime = 0;
         this.slPercent = 0.1;
         
-        // [NEW] Local lock to prevent duplicate orders before WebSocket syncs
+        // [LOCK] Local lock to prevent duplicate orders before WebSocket syncs
         this.localInPosition = false; 
     }
 
@@ -78,7 +77,7 @@ class AdvanceStrategy {
 
         // TRIGGER
         if (gap > (rollingMax * 1.01)) {
-            // [NEW] DOUBLE CHECK: Check again right before punching
+            // [DOUBLE CHECK] Check again right before punching
             if (this.localInPosition) return; 
 
             this.logger.info(`[AdvanceStrategy] ⚡ Trigger: Gap ${gap.toFixed(4)}% > Max ${rollingMax.toFixed(4)}%`);
@@ -89,7 +88,7 @@ class AdvanceStrategy {
     }
 
     async executeTrade(asset, side, productId, currentPrice) {
-        // [NEW] Instant lock
+        // [LOCK] Instant lock
         this.localInPosition = true;
         this.bot.isOrderInProgress = true;
         
@@ -121,7 +120,7 @@ class AdvanceStrategy {
         }
     }
 
-    // [MODIFIED] Centralized lock management
+    // Centralized lock management
     isLockedOut() {
         // 1. Prevent trade if we locally think we are in a position
         if (this.localInPosition) return true;
@@ -134,17 +133,24 @@ class AdvanceStrategy {
         return (Date.now() - this.lastOrderTime) < this.lockDurationMs;
     }
 
-    // [NEW] Use Position Sync to manage the lock
+    // [UPDATED] Robust Position Sync to manage the lock
     onPositionUpdate(pos) {
-        const size = Math.abs(parseFloat(pos.size || 0));
+        // Handle cases where size might be a string "0" or number 0
+        const rawSize = (pos && pos.size !== undefined) ? pos.size : 0;
+        const size = Math.abs(parseFloat(rawSize));
         
         if (size > 0) {
             // We are officially in a trade
+            if (!this.localInPosition) {
+                this.logger.info(`[AdvanceStrategy] Exchange reports position ACTIVE. Strategy Locked.`);
+            }
             this.localInPosition = true;
         } else {
             // Position is closed, we can unlock for the next trade
+            if (this.localInPosition) {
+                this.logger.info(`[AdvanceStrategy] Exchange reports position CLOSED. Strategy Unlocked.`);
+            }
             this.localInPosition = false;
-            this.logger.info(`[AdvanceStrategy] Position closed on exchange. Local lock released.`);
         }
     }
 
@@ -171,4 +177,3 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-            
