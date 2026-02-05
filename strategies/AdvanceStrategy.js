@@ -1,5 +1,5 @@
 // strategies/AdvanceStrategy.js
-// Version 14.0.0 - Atomic Bracket Orders (No Response Dependency)
+// Version 16.0.0 - Atomic Bracket SL (Using MomentumRider Logic)
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -33,10 +33,10 @@ class AdvanceStrategy {
 
         // --- TRADING STATE ---
         this.lastOrderTime = 0;
-        this.slPercent = 0.3; // 0.3% is the "Sweet Spot" (Tight but safe from spread)
+        this.slPercent = 0.3; // Recommended "Sweet Spot" for 50x leverage
     }
 
-    getName() { return "AdvanceStrategy (Atomic Bracket)"; }
+    getName() { return "AdvanceStrategy (Atomic Bracket Fix)"; }
 
     async onPriceUpdate(asset, price, source = 'UNKNOWN') {
         const now = Date.now();
@@ -73,47 +73,46 @@ class AdvanceStrategy {
 
         if (gap > (rollingMax * 1.01)) {
             this.logger.info(`[AdvanceStrategy] ⚡ Trigger: Gap ${gap.toFixed(4)}% > Max ${rollingMax.toFixed(4)}%`);
-            // Pass the CURRENT price to calculate SL immediately
+            // We pass the current signal price to the executor
             await this.executeTrade(asset, marketStats.direction === 'up' ? 'buy' : 'sell', assetData.deltaId, price);
         }
 
         assetData.gapHistory.push({ t: now, v: gap });
     }
 
-    // --- ATOMIC EXECUTION ---
+    // --- ATOMIC EXECUTION (MOMENTUM RIDER STYLE) ---
     async executeTrade(asset, side, productId, currentPrice) {
         this.bot.isOrderInProgress = true;
         try {
-            // 1. Calculate SL Price BEFORE sending order
-            // We use 'currentPrice' (from signal) as the anchor.
+            // 1. Calculate SL Price using the proven offset logic
             const slOffset = currentPrice * (this.slPercent / 100);
-            const stopPrice = side === 'buy' 
+            const stopLossPrice = side === 'buy' 
                 ? (currentPrice - slOffset) 
                 : (currentPrice + slOffset);
 
-            // 2. Construct Order WITH Bracket
-            const orderData = {
-                product_id: productId.toString(),
-                size: this.bot.config.orderSize.toString(),
-                side: side,
+            // 2. Prepare Order with ATOMIC Bracket fields
+            // Using the same field names from MomentumRiderStrategy.js
+            const orderData = { 
+                product_id: productId.toString(), 
+                size: this.bot.config.orderSize.toString(), 
+                side: side, 
                 order_type: 'market_order',
-                // This ensures SL is set INSTANTLY by the exchange engine
-                bracket_order: {
-                    stop_loss_price: stopPrice.toFixed(4),
-                    stop_loss_type: 'mark_price' // Safer than 'last_price' for wicks
-                }
+                bracket_stop_loss_price: stopLossPrice.toFixed(4),
+                bracket_stop_trigger_method: 'mark_price' // 'mark_price' is usually safer for 50x leverage
             };
-
-            this.logger.info(`[EXECUTION] Placing Order with ATOMIC SL at ${stopPrice.toFixed(4)}`);
+            
+            this.logger.info(`[AdvanceStrategy] 🚀 Punching Order with Atomic SL at ${stopLossPrice.toFixed(4)}`);
             this.lastOrderTime = Date.now();
             
-            // 3. Send One Request
-            await this.bot.placeOrder(orderData);
-            
-            this.logger.info(`[SUCCESS] Bracket Order Placed.`);
+            const response = await this.bot.placeOrder(orderData);
 
-        } catch (e) {
-            this.logger.error(`Entry Failed: ${e.message}`);
+            if (response.result || (response.status && response.status === 'success')) {
+                this.logger.info(`[AdvanceStrategy] ✅ Atomic entry order accepted by Delta.`);
+            } else { 
+                throw new Error("Order rejected or unexpected response: " + JSON.stringify(response)); 
+            }
+        } catch (error) {
+            this.logger.error(`[AdvanceStrategy] ❌ Execution Failed:`, { message: error.message });
         } finally {
             this.bot.isOrderInProgress = false;
         }
@@ -124,8 +123,9 @@ class AdvanceStrategy {
         return (Date.now() - this.lastOrderTime) < this.lockDurationMs;
     }
 
-    // Removed onPositionUpdate/entryPrice logic as we no longer need it for SL
-    onPositionUpdate(pos) {} 
+    onPositionUpdate(pos) {
+        // Strategy no longer needs to track this for SL as it's exchange-side now
+    }
 
     onOrderBookUpdate(symbol, price) {
         const asset = Object.keys(this.assets).find(a => symbol.startsWith(a));
@@ -150,4 +150,3 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-            
