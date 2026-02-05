@@ -1,9 +1,9 @@
 // client.js
-// Version 13.1.0 - Cleaned (No Cancel), Keep-Alive Ready
+// Version: 14.0.0 (Switched to Standard HTTPS Keep-Alive)
 
 const got = require('got');
 const crypto = require('crypto');
-const http2 = require('http2-wrapper');
+const https = require('https'); // Use standard HTTPS
 
 class DeltaClient {
     #apiKey;
@@ -19,34 +19,26 @@ class DeltaClient {
         this.#apiSecret = apiSecret;
         this.#logger = logger;
 
-        // --- HTTP/2 & TCP OPTIMIZATION ---
-        const agent = {
-            http2: new http2.Agent({
-                keepAlive: true,
-                keepAliveMsecs: 1000,
-                maxSockets: 32,
-                timeout: 5000,
-                createConnection: (authority, options) => {
-                    const socket = http2.auto.createConnection(authority, options);
-                    socket.on('connect', () => {
-                        if (socket.setNoDelay) {
-                            socket.setNoDelay(true);
-                        }
-                    });
-                    return socket;
-                }
-            })
-        };
+        // --- STANDARD HTTPS AGENT (Proven Low Latency) ---
+        const agent = new https.Agent({
+            keepAlive: true,
+            keepAliveMsecs: 1000,
+            maxSockets: 256, // Allow more parallel connections
+            maxFreeSockets: 256,
+            scheduling: 'lifo',
+            timeout: 15000 
+        });
 
         this.#client = got.extend({
             prefixUrl: baseURL,
-            http2: true,
-            agent: agent,
+            http2: false, // <--- DISABLED HTTP/2
+            agent: { https: agent },
             timeout: { request: 5000 },
             retry: { limit: 0 },
             headers: {
-                'User-Agent': 'nodejs-delta',
-                'Accept': 'application/json'
+                'User-Agent': 'nodejs-delta-v1',
+                'Accept': 'application/json',
+                'Connection': 'keep-alive' // Explicitly request persistence
             }
         });
     }
@@ -78,40 +70,23 @@ class DeltaClient {
             return response.body;
         } catch (err) {
             const status = err.response?.statusCode;
-            const responseData = err.response?.body;
+            // Only log actual errors, not "Cancelled" orders which are normal for IOC
             if (status !== 400 && status !== 404) {
-                this.#logger.error(
-                    `[DeltaClient] ${method} ${path} FAILED (Status: ${status}).`, 
-                    { error: responseData || err.message }
-                );
+                 this.#logger.error(`[DeltaClient] Request Failed: ${err.message}`);
             }
             throw err; 
         }
     }
 
-    // --- ORDER MANAGEMENT ---
-
-    placeOrder(payload) {
-        return this.#request('POST', '/v2/orders', payload);
-    }
-    
-    getPositions() {
-        return this.#request('GET', '/v2/positions/margined');
-    }
-
+    // ... (Keep existing methods: placeOrder, getPositions, etc.) ...
+    placeOrder(payload) { return this.#request('POST', '/v2/orders', payload); }
+    getPositions() { return this.#request('GET', '/v2/positions/margined'); }
     getLiveOrders(productId, opts = {}) {
         const query = { product_id: productId, states: opts.states || 'open,pending' };
         return this.#request('GET', '/v2/orders', null, query);
     }
-
-    /**
-     * [NEW] Used for Keep-Alive Loop (25s Interval)
-     * Hits /v2/wallet/balances to keep the Load Balancer connection active.
-     */
-    getWalletBalance() {
-        return this.#request('GET', '/v2/wallet/balances');
-    }
+    getWalletBalance() { return this.#request('GET', '/v2/wallet/balances'); }
 }
 
 module.exports = DeltaClient;
-                                   
+            
