@@ -1,4 +1,5 @@
-//v55.0
+// trader.js
+// v58.0 - [CLEAN] All_Trades Only (No L1)
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -67,10 +68,7 @@ class TradingBot {
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
         this.logger.info(`Trading Targets (USDT): ${this.targetAssets.join(', ')}`);
 
-        this.orderBooks = {};
-        this.targetAssets.forEach(asset => {
-            this.orderBooks[asset] = { bids: [], asks: [] };
-        });
+        // [REMOVED] L1 Orderbook storage
 
         this.hasOpenPosition = false;
         this.isStateSynced = false;
@@ -89,30 +87,17 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v12.1.0 - Position Fix) ---`);
+        this.logger.info(`--- Bot Initializing (v58.0 - All Trades Only) ---`);
         this.logger.info(`Strategy: ${this.strategy.getName()}`);
         
-        // 1. Check current positions on Delta
         await this.syncPositionState();
-        
-        // 2. Connect to Delta WebSocket
         await this.initWebSocket();
-        
-        // 3. Start Local WebSocket Server
         this.setupHttpServer();
-
-        // 4. Start REST Keep-Alive (25s Loop)
         this.startRestKeepAlive();
     }
 
-    /**
-     * Keeps the HTTP/2 connection warm by sending a lightweight request every 25s.
-     */
     startRestKeepAlive() {
-        this.logger.info('Starting REST Keep-Alive Loop (25s interval)...');
-        
         if (this.restKeepAliveInterval) clearInterval(this.restKeepAliveInterval);
-
         this.restKeepAliveInterval = setInterval(async () => {
             try {
                 await this.client.getWalletBalance();
@@ -161,20 +146,33 @@ class TradingBot {
     }
 
     authenticateWebSocket() {
-        const timestamp = Math.floor(Date.now() / 1000).toString();
-        const signature = require('crypto').createHmac('sha256', this.config.apiSecret).update('GET' + timestamp + '/live').digest('hex');
-        this.ws.send(JSON.stringify({ type: 'auth', payload: { 'api-key': this.config.apiKey, timestamp, signature }}));
+        const timestampNum = Math.floor(Date.now() / 1000); 
+        const timestampStr = timestampNum.toString();       
+        
+        const signature = require('crypto')
+            .createHmac('sha256', this.config.apiSecret)
+            .update('GET' + timestampStr + '/live')
+            .digest('hex');
+
+        this.ws.send(JSON.stringify({ 
+            type: 'key-auth', 
+            payload: { 
+                'api-key': this.config.apiKey, 
+                timestamp: timestampNum, 
+                signature 
+            }
+        }));
     }
 
     subscribeToChannels() {
         const symbols = this.targetAssets.map(asset => `${asset}USD`);
-        this.logger.info(`Subscribing to L1 Books: ${symbols.join(', ')}`);
-        this.logger.info(`Subscribing to Orders/Positions: ALL (Full Sync)`);
-
+        this.logger.info(`Subscribing to All Trades: ${symbols.join(', ')}`);
+        
+        // [REMOVED] l1_orderbook from channels list
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
-            { name: 'l1_orderbook', symbols: symbols }
+            { name: 'all_trades', symbols: symbols }
         ]}}));
     }
 
@@ -198,35 +196,40 @@ class TradingBot {
                 if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
                 break;
             case 'positions':
-                // Handle both single object updates and array snapshots
                 if (Array.isArray(message.data)) {
                     message.data.forEach(pos => this.handlePositionUpdate(pos));
                 } else if (message.size !== undefined) {
                     this.handlePositionUpdate(message);
                 }
                 break;
-            case 'l1_orderbook':
+            
+            case 'all_trades':
                 const asset = this.targetAssets.find(a => message.symbol.startsWith(a));
                 if (asset) {
-                    this.orderBooks[asset] = {
-                        bids: [[message.best_bid, message.bid_qty]],
-                        asks: [[message.best_ask, message.ask_qty]]
-                    };
-                    if (this.strategy.onOrderBookUpdate) {
-                        this.strategy.onOrderBookUpdate(message.symbol, parseFloat(message.best_bid));
+                    // Handle single object or array snapshot
+                    const dataPoints = message.data || (Array.isArray(message) ? message : [message]);
+
+                    if (Array.isArray(dataPoints)) {
+                        // Use the last trade for the most recent price
+                        const lastTrade = dataPoints[dataPoints.length - 1];
+                        if (lastTrade && lastTrade.price) {
+                             if (this.strategy.onTradeUpdate) {
+                                this.strategy.onTradeUpdate(message.symbol, parseFloat(lastTrade.price));
+                            }
+                        }
+                    } else if (message.price) {
+                        if (this.strategy.onTradeUpdate) {
+                            this.strategy.onTradeUpdate(message.symbol, parseFloat(message.price));
+                        }
                     }
                 }
                 break;
         }
     }
 
-    // [FIXED] Properly handle 0 size updates
     handlePositionUpdate(pos) {
-        // Check for undefined/null. "if (pos.size)" fails when size is 0
         if (pos.size !== undefined && pos.size !== null) {
             this.hasOpenPosition = parseFloat(pos.size) !== 0;
-            
-            // Pass the update to the strategy so it can unlock 'localInPosition'
             if (this.strategy.onPositionUpdate) {
                 this.strategy.onPositionUpdate(pos);
             }
@@ -267,22 +270,17 @@ class TradingBot {
         return this.client.placeOrder(orderData);
     }
 
-    // [FIXED] Force strategy sync on startup
     async syncPositionState() {
         try {
             const response = await this.client.getPositions();
             const positions = response.result || [];
             
-            // Find specific position for this product
             const myPosition = positions.find(p => p.product_id == this.config.productId);
-            
-            // Determine size (default to 0)
             const currentSize = myPosition ? parseFloat(myPosition.size) : 0;
             
             this.hasOpenPosition = currentSize !== 0;
             this.isStateSynced = true;
 
-            // FORCE update strategy so it knows the lock status immediately
             if (this.strategy.onPositionUpdate) {
                 this.strategy.onPositionUpdate(myPosition || { size: 0 });
             }
@@ -303,9 +301,7 @@ class TradingBot {
         }
     }
 
-    getOrderBook(asset) {
-        return this.orderBooks[asset];
-    }
+    // [REMOVED] getOrderBook() method
 }
 
 (async () => {
@@ -321,3 +317,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
+            
