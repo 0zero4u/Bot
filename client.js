@@ -1,14 +1,14 @@
 // client.js
-// Version: 14.0.0 (Switched to Standard HTTPS Keep-Alive)
+// Version: 15.0.0 (Final Production - HFT Keep-Alive LIFO)
 
 const got = require('got');
 const crypto = require('crypto');
-const https = require('https'); // Use standard HTTPS
+const https = require('https'); 
 
 class DeltaClient {
-    #apiKey;
-    #apiSecret;
-    #client;
+    #apiKey; 
+    #apiSecret; 
+    #client; 
     #logger;
 
     constructor(apiKey, apiSecret, baseURL, logger) {
@@ -19,74 +19,108 @@ class DeltaClient {
         this.#apiSecret = apiSecret;
         this.#logger = logger;
 
-        // --- STANDARD HTTPS AGENT (Proven Low Latency) ---
+        // --- HFT INFRASTRUCTURE: DEDICATED KEEP-ALIVE AGENT ---
+        // This agent manages the TCP connection pool to the exchange.
         const agent = new https.Agent({
-            keepAlive: true,
-            keepAliveMsecs: 1000,
-            maxSockets: 256, // Allow more parallel connections
-            maxFreeSockets: 256,
-            scheduling: 'lifo',
-            timeout: 15000 
+            keepAlive: true,        // CRITICAL: Keeps the TCP connection open between trades
+            keepAliveMsecs: 1000,   // Send TCP Keep-Alive packets every 1s to prevent timeouts
+            maxSockets: 32,        // Allow up to 100 parallel requests (prevents blocking)
+            maxFreeSockets: 50,     // Keep 50 "hot" connections ready in the pool
+            scheduling: 'lifo',     // CRITICAL: Reuse the most recently used (fastest) socket first
+            timeout: 60000          // Close sockets that have been dead for 60s
         });
 
+        // Initialize 'got' HTTP client with the optimized agent
         this.#client = got.extend({
             prefixUrl: baseURL,
-            http2: false, // <--- DISABLED HTTP/2
+            http2: false,           // DISABLE HTTP/2 to avoid handshake overhead on AWS CloudFront
             agent: { https: agent },
-            timeout: { request: 5000 },
-            retry: { limit: 0 },
+            timeout: { request: 5000 }, // Fail fast if network hangs (5s)
+            retry: { limit: 0 },    // HFT Rule: Never retry old orders. Fail and move on.
             headers: {
-                'User-Agent': 'nodejs-delta-v1',
+                'User-Agent': 'nodejs-delta-hft-v15',
                 'Accept': 'application/json',
-                'Connection': 'keep-alive' // Explicitly request persistence
+                'Connection': 'keep-alive' // Explicitly tell the server to hold the line
             }
         });
     }
 
+    // --- PRIVATE REQUEST HANDLER ---
     async #request(method, path, data = null, query = null) {
         const timestamp = Math.floor(Date.now() / 1000).toString();
         const params = new URLSearchParams(query);
         const qs = params.toString().replace(/%2C/g, ','); 
         const body = data ? JSON.stringify(data) : '';
         
+        // Generate Signature
         const sigStr = method.toUpperCase() + timestamp + path + (qs ? `?${qs}` : '') + body;
         const signature = crypto.createHmac('sha256', this.#apiSecret).update(sigStr).digest('hex');
-
-        const headers = {
-            'api-key': this.#apiKey,
-            'timestamp': timestamp,
-            'signature': signature,
-            'Content-Type': body ? 'application/json' : undefined
-        };
 
         try {
             const response = await this.#client(path.startsWith('/') ? path.substring(1) : path, {
                 method: method,
                 searchParams: qs || undefined,
                 body: body || undefined,
-                headers: headers,
+                headers: { 
+                    'api-key': this.#apiKey, 
+                    'timestamp': timestamp, 
+                    'signature': signature,
+                    'Content-Type': body ? 'application/json' : undefined
+                },
                 responseType: 'json'
             });
             return response.body;
         } catch (err) {
             const status = err.response?.statusCode;
-            // Only log actual errors, not "Cancelled" orders which are normal for IOC
+            const responseData = err.response?.body;
+            
+            // Ignore "Cancelled" errors for IOC orders (Standard HFT behavior)
+            // But log critical errors (Auth failures, Rate limits)
             if (status !== 400 && status !== 404) {
-                 this.#logger.error(`[DeltaClient] Request Failed: ${err.message}`);
+                this.#logger.error(
+                    `[DeltaClient] ${method} ${path} FAILED (Status: ${status}).`, 
+                    { error: responseData || err.message }
+                );
             }
             throw err; 
         }
     }
 
-    // ... (Keep existing methods: placeOrder, getPositions, etc.) ...
-    placeOrder(payload) { return this.#request('POST', '/v2/orders', payload); }
-    getPositions() { return this.#request('GET', '/v2/positions/margined'); }
+    // --- PUBLIC API METHODS ---
+
+    /**
+     * Places a Limit or Market order.
+     * HFT Note: For IOC orders, this returns immediately after the exchange accepts/rejects.
+     */
+    placeOrder(payload) {
+        return this.#request('POST', '/v2/orders', payload);
+    }
+    
+    /**
+     * Fetches current margined positions.
+     * Used for initial sync and position checks.
+     */
+    getPositions() {
+        return this.#request('GET', '/v2/positions/margined');
+    }
+
+    /**
+     * Gets live orders.
+     * Useful for tracking open limit orders (non-IOC).
+     */
     getLiveOrders(productId, opts = {}) {
         const query = { product_id: productId, states: opts.states || 'open,pending' };
         return this.#request('GET', '/v2/orders', null, query);
     }
-    getWalletBalance() { return this.#request('GET', '/v2/wallet/balances'); }
+
+    /**
+     * Fetches Wallet Balances.
+     * Also used as the "Keep-Alive Heartbeat" every 25s.
+     */
+    getWalletBalance() {
+        return this.#request('GET', '/v2/wallet/balances');
+    }
 }
 
 module.exports = DeltaClient;
-            
+    
