@@ -1,5 +1,4 @@
 
-
 class AdvanceStrategy {
     constructor(bot) {
         this.bot = bot;
@@ -32,13 +31,13 @@ class AdvanceStrategy {
 
         // --- TRADING STATE ---
         this.lastOrderTime = 0;
-        this.slPercent = 0.15;
+        this.slPercent = 0.15; // Tight Stop Loss
         
         // [LOCK] Local lock to prevent duplicate orders before WebSocket syncs
         this.localInPosition = false; 
     }
 
-    getName() { return "AdvanceStrategy (Anti-Duplicate Fix)"; }
+    getName() { return "AdvanceStrategy (Limit IOC + Aggression)"; }
 
     async onPriceUpdate(asset, price, source = 'UNKNOWN') {
         const now = Date.now();
@@ -93,23 +92,51 @@ class AdvanceStrategy {
         this.bot.isOrderInProgress = true;
         
         try {
-            const slOffset = currentPrice * (this.slPercent / 100);
-            const stopLossPrice = side === 'buy' ? (currentPrice - slOffset) : (currentPrice + slOffset);
+            // --- PRICE CALCULATION (Limit IOC + Aggression) ---
+            
+            // 1. Get Aggression % from config (default 0.05% if not set)
+            // This ensures we cross the spread to get filled immediately
+            const aggressionPercent = this.bot.config.priceAggressionOffset || 0.05;
+            
+            // 2. Fetch Real-Time OrderBook from Bot for precision
+            const ob = this.bot.getOrderBook(asset);
+            let executionPrice = currentPrice;
+
+            // Determine base price from Order Book (Best Ask for Buy, Best Bid for Sell)
+            if (side === 'buy') {
+                if (ob && ob.asks && ob.asks.length > 0) {
+                    executionPrice = parseFloat(ob.asks[0][0]);
+                }
+                // Add aggression to buy slightly higher than ask (guarantee fill)
+                executionPrice = executionPrice * (1 + (aggressionPercent / 100));
+            } else {
+                if (ob && ob.bids && ob.bids.length > 0) {
+                    executionPrice = parseFloat(ob.bids[0][0]);
+                }
+                // Subtract aggression to sell slightly lower than bid (guarantee fill)
+                executionPrice = executionPrice * (1 - (aggressionPercent / 100));
+            }
+
+            // 3. Calculate Stop Loss based on the Execution Price
+            const slOffset = executionPrice * (this.slPercent / 100);
+            const stopLossPrice = side === 'buy' ? (executionPrice - slOffset) : (executionPrice + slOffset);
 
             const orderData = { 
                 product_id: productId.toString(), 
                 size: this.bot.config.orderSize.toString(), 
                 side: side, 
-                order_type: 'market_order',
+                order_type: 'limit_order',              // <--- CHANGED to Limit
+                limit_price: executionPrice.toFixed(4), // <--- Calculated Aggressive Price
+                time_in_force: 'ioc',                   // <--- Immediate Or Cancel
                 bracket_stop_loss_price: stopLossPrice.toFixed(4),
-                bracket_stop_trigger_method: 'mark_price'
+                bracket_stop_trigger_method: 'mark_price' // <--- Safer than last_traded_price
             };
             
-            this.logger.info(`[AdvanceStrategy] 🚀 Punching Order with Atomic SL at ${stopLossPrice.toFixed(4)}`);
+            this.logger.info(`[AdvanceStrategy] 🚀 Punching IOC Order: ${side.toUpperCase()} @ ${executionPrice.toFixed(4)} (SL: ${stopLossPrice.toFixed(4)})`);
             this.lastOrderTime = Date.now();
             
             await this.bot.placeOrder(orderData);
-            this.logger.info(`[AdvanceStrategy] ✅ Atomic entry order accepted.`);
+            this.logger.info(`[AdvanceStrategy] ✅ IOC Order sent.`);
 
         } catch (error) {
             this.logger.error(`[AdvanceStrategy] ❌ Execution Failed:`, { message: error.message });
