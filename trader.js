@@ -1,10 +1,10 @@
 
 // trader.js
-// v60.0 - [FIXED] Timestamp as String for V2 Auth
+// v60.1 - [FIXED] V2 Auth: Timestamp as String
 
 const WebSocket = require('ws');
 const winston = require('winston');
-const crypto = require('crypto'); // Import crypto at top level
+const crypto = require('crypto'); 
 require('dotenv').config();
 
 const DeltaClient = require('./client.js');
@@ -85,7 +85,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v60.0 - String Timestamp) ---`);
+        this.logger.info(`--- Bot Initializing (v60.1 - String Timestamp Fix) ---`);
         await this.syncPositionState();
         await this.initWebSocket();
         this.setupHttpServer();
@@ -142,11 +142,12 @@ class TradingBot {
     }
 
     authenticateWebSocket() {
-        // [FIXED] Timestamp Handling
+        // [FIXED] Force Timestamp to String for both Sig and Payload
         const timestampNum = Math.floor(Date.now() / 1000); 
         const timestampStr = timestampNum.toString(); 
         
         // 1. Generate Signature
+        // Format: 'GET' + timestampStr + '/live'
         const signature = crypto
             .createHmac('sha256', this.config.apiSecret)
             .update('GET' + timestampStr + '/live')
@@ -155,7 +156,7 @@ class TradingBot {
         this.logger.info(`[Auth] Attempting key-auth with timestamp: ${timestampStr}`);
 
         // 2. Send Auth Payload
-        // IMPORTANT: Sending timestamp as STRING to match Python snippet
+        // IMPORTANT: Sending timestamp as STRING to match V2 spec & Python example
         this.ws.send(JSON.stringify({ 
             type: 'key-auth', 
             payload: { 
@@ -178,8 +179,8 @@ class TradingBot {
     }
 
     handleWebSocketMessage(message) {
-        // [DEBUG] Log all non-trade messages to see Auth response
-        if (message.type !== 'all_trades' && message.type !== 'l1_orderbook' && message.type !== 'pong') {
+        // [DEBUG] Log auth-related messages
+        if (message.type === 'error' || message.type === 'success') {
             this.logger.info(`[WS Message]: ${JSON.stringify(message)}`);
         }
 
@@ -244,7 +245,6 @@ class TradingBot {
 
     async handleSignalMessage(message) {
         if (!this.authenticated) {
-             // [DEBUG] Warn only once every 10s to avoid spam
              const now = Date.now();
              if (!this._lastAuthWarn || now - this._lastAuthWarn > 10000) {
                  this.logger.warn('⚠️ Signal received but Bot is NOT Authenticated yet.');
@@ -330,4 +330,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-        
+            
