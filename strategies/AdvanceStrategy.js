@@ -274,4 +274,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-            
+                                                                     
