@@ -1,5 +1,5 @@
 // AdvanceStrategy.js
-// v14.3 - [CLEAN] All Trades Logic
+// v14.4 - [FIXED] Warmup Check on All Updates
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -26,7 +26,7 @@ class AdvanceStrategy {
             }
         });
 
-        this.windowSizeMs = 2 * 60 * 1000;
+        this.windowSizeMs = 2 * 60 * 1000; // 2 Minutes
         this.lockDurationMs = 10000;
         this.isWarmup = true;
         this.startTime = Date.now();
@@ -39,20 +39,30 @@ class AdvanceStrategy {
 
     getName() { return "AdvanceStrategy (All Trades IOC)"; }
 
+    // [NEW] Helper to check warmup status from ANY source
+    checkWarmup() {
+        if (this.isWarmup) {
+            const now = Date.now();
+            if (now - this.startTime > this.windowSizeMs) {
+                this.isWarmup = false;
+                this.logger.info(`[AdvanceStrategy] *** ACTIVE *** (Warmup Complete)`);
+            }
+        }
+    }
+
     async onPriceUpdate(asset, price, source = 'UNKNOWN') {
         const now = Date.now();
         const assetData = this.assets[asset];
         
+        // 1. Always check warmup timer first
+        this.checkWarmup();
+
         if (!assetData || this.isLockedOut()) return;
 
         if (!assetData.sources[source]) assetData.sources[source] = [];
         this.updateHistory(assetData.sources[source], price, now);
 
-        if (this.isWarmup && (now - this.startTime > this.windowSizeMs)) {
-            this.isWarmup = false;
-            this.logger.info(`[AdvanceStrategy] *** ACTIVE ***`);
-        }
-
+        // 2. Return if still warming up OR not enough data
         if (this.isWarmup || assetData.sources[source].length < 2 || assetData.deltaHistory.length < 2) return;
 
         const marketStats = this.calculateSpikeStats(assetData.sources[source], price);
@@ -74,7 +84,6 @@ class AdvanceStrategy {
         if (gap > (rollingMax * 1.11)) {
             if (this.localInPosition) return; 
 
-            // 1. CAPTURE CONTEXT
             const triggerContext = {
                 externalSource: source,
                 externalPrice: price,
@@ -86,7 +95,6 @@ class AdvanceStrategy {
 
             this.logger.info(`[AdvanceStrategy] ⚡ Trigger: Gap ${gap.toFixed(4)}% > Max ${rollingMax.toFixed(4)}%`);
             
-            // 2. PASS TO EXECUTE
             await this.executeTrade(
                 asset, 
                 marketStats.direction === 'up' ? 'buy' : 'sell', 
@@ -98,18 +106,24 @@ class AdvanceStrategy {
         assetData.gapHistory.push({ t: now, v: gap });
     }
 
+    // [UPDATED] Now checks warmup too
+    onTradeUpdate(symbol, price) {
+        // 1. Check warmup here too!
+        this.checkWarmup();
+
+        const asset = Object.keys(this.assets).find(a => symbol.startsWith(a));
+        if (asset) {
+            this.updateHistory(this.assets[asset].deltaHistory, price, Date.now());
+        }
+    }
+
     async executeTrade(asset, side, productId, context) {
         this.localInPosition = true;
         this.bot.isOrderInProgress = true;
-        
         const punchStartTime = Date.now();
 
         try {
             const aggressionPercent = this.bot.config.priceAggressionOffset || 0.05;
-            
-            // [REMOVED] L1 fallback logic. 
-            // We strictly use the External (Trigger) Price as the anchor for our aggression.
-            // If Binance moves, we move to match it (plus offset).
             let basePrice = context.externalPrice; 
             
             var executionPrice = side === 'buy' 
@@ -130,7 +144,6 @@ class AdvanceStrategy {
                 bracket_stop_trigger_method: 'mark_price' 
             };
             
-            // --- EXECUTE & MEASURE LATENCY ---
             const apiStart = Date.now();
             const orderResult = await this.bot.placeOrder(orderData);
             const apiEnd = Date.now();
@@ -140,7 +153,6 @@ class AdvanceStrategy {
 
             if (orderResult && orderResult.success) {
                 this.logger.info(`[AdvanceStrategy] ✅ IOC Order Success.`);
-
                 const orderId = orderResult.result ? orderResult.result.id : 'UNKNOWN_ID';
 
                 const logPayload = JSON.stringify({
@@ -205,14 +217,6 @@ class AdvanceStrategy {
         }
     }
 
-    // [NEW] Handles real-time trade feed from Delta
-    onTradeUpdate(symbol, price) {
-        const asset = Object.keys(this.assets).find(a => symbol.startsWith(a));
-        if (asset) {
-            this.updateHistory(this.assets[asset].deltaHistory, price, Date.now());
-        }
-    }
-
     updateHistory(array, p, t) {
         array.push({ p, t });
         const cutoff = t - this.windowSizeMs;
@@ -231,4 +235,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-            
+                    
