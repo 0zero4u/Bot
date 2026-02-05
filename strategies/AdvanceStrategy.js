@@ -1,5 +1,5 @@
 // strategies/AdvanceStrategy.js
-// Version 12.0.0 - UPDATE: Sliding Window Dynamic Threshold
+// Version 12.1.0 - Bracket SL (0.01%) + 10s Fixed Lockout
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -7,7 +7,6 @@ class AdvanceStrategy {
         this.logger = bot.logger;
 
         // --- 1. MASTER ASSET METADATA (USDT / LINEAR IDS) ---
-        // CRITICAL: Ensure these IDs match the LINEAR (USDT) contracts on Delta.
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969 }, // User Provided ID for XRPUSDT
             'BTC': { deltaId: 27 },    // Common BTC-PERP (Linear) ID
@@ -35,11 +34,11 @@ class AdvanceStrategy {
         });
 
         // --- LEARNING PHASE STATE ---
-        this.windowSizeMs = 2 * 60 * 1000; // 2 Minute Sliding Window
+        this.windowSizeMs = 2 * 60 * 1000; // 2 Minute Sliding Window (Calculations)
+        this.lockDurationMs = 10000;       // [NEW] 10 Second Trading Lockout
         this.startTime = Date.now();
         this.isWarmup = true;
         
-        // This is now used primarily for logging, as threshold is calculated per-asset dynamically
         this.currentThresholdDisplay = 0; 
 
         // --- TRADING STATE ---
@@ -50,14 +49,13 @@ class AdvanceStrategy {
         this.minHistoryPoints = 2; 
     }
 
-    getName() { return "AdvanceStrategy (Dynamic Sliding Window)"; }
+    getName() { return "AdvanceStrategy (Bracket SL + 10s Lock)"; }
 
     /**
      * 1. INGEST MARKET PRICE (The "Leader" Signal)
-     * Called whenever market_listener sends a trade update.
      */
     async onPriceUpdate(asset, price, source = 'UNKNOWN') {
-        // 1. SAFETY LOCK
+        // 1. SAFETY LOCK (Updated for 10s rule)
         if (this.isLockedOut()) return;
         
         const now = Date.now();
@@ -84,11 +82,7 @@ class AdvanceStrategy {
         if (assetData.deltaHistory.length < this.minHistoryPoints) return;
 
         // --- 5. CALCULATE RELATIVE SPIKES ---
-        
-        // A. Market Spike (Self-Comparison)
         const marketStats = this.calculateSpikeStats(assetData.sources[source], price);
-        
-        // B. Delta Spike (Self-Comparison)
         const currentDeltaPrice = assetData.deltaHistory[assetData.deltaHistory.length - 1].p;
         const deltaStats = this.calculateSpikeStats(assetData.deltaHistory, currentDeltaPrice);
 
@@ -110,16 +104,13 @@ class AdvanceStrategy {
         // --- 7. SLIDING WINDOW THRESHOLD LOGIC ---
         // ==================================================================
 
-        // A. Clean up old Gap History (Keep only last 2 minutes)
+        // A. Clean up old Gap History
         const cutoff = now - this.windowSizeMs;
-        // Efficient array shifting to remove old data
         while (assetData.gapHistory.length > 0 && assetData.gapHistory[0].t < cutoff) {
             assetData.gapHistory.shift();
         }
 
-        // B. Calculate Dynamic Threshold
-        // Find the MAXIMUM gap that occurred in the last 2 minutes.
-        // We set a minimum floor (e.g., 0.05%) to prevent trading on tiny noise.
+        // B. Calculate Dynamic Threshold (Rolling Max)
         let rollingMax = 0.05; 
         
         for (const item of assetData.gapHistory) {
@@ -128,25 +119,15 @@ class AdvanceStrategy {
             }
         }
         
-        // Update display variable for logging
         this.currentThresholdDisplay = rollingMax;
 
         // ==================================================================
         // --- 8. DECISION LOGIC ---
         // ==================================================================
 
-        if (this.isWarmup) {
-            // Just recording history during warmup
-            // No action needed, pushing to history happens at end of function
-        } else {
-            // ACTIVE PHASE
-            
-            // To trigger, the current Gap must be HIGHER than the Rolling Max
-            // This means it is a "Breakout" from the recent volatility range.
-            // We use a tiny buffer (1.01x) to ensure it's strictly greater.
+        if (!this.isWarmup) {
             const triggerThreshold = rollingMax * 1.01;
 
-            // DEBUG PULSE (Log occasionally or if close to threshold)
             if (gap > (triggerThreshold * 0.5) || Math.random() < 0.05) {
                 this.logger.info(`[Pulse] ${asset} | Gap: ${gap.toFixed(4)}% | Rolling Max (2m): ${rollingMax.toFixed(4)}% | Dir: ${direction}`);
             }
@@ -154,26 +135,17 @@ class AdvanceStrategy {
             if (gap > triggerThreshold) {
                 this.logger.info(`[AdvanceStrategy] *** ANOMALY DETECTED on ${asset} via ${source} ***`);
                 this.logger.info(`Gap (${gap.toFixed(4)}%) > Rolling Max (${rollingMax.toFixed(4)}%)`);
-                this.logger.info(`Market Move: ${marketStats.changePct.toFixed(4)}% | Delta Move: ${deltaStats.changePct.toFixed(4)}%`);
                 
                 await this.executeTrade(asset, direction, assetData.deltaId);
             }
         }
 
-        // C. UPDATE HISTORY (Last Step)
-        // We push the current gap *after* the check. 
-        // This ensures the current spike becomes the new "Normal" for the next tick,
-        // preventing the bot from buying the same spike twice.
+        // C. UPDATE HISTORY
         assetData.gapHistory.push({ t: now, v: gap });
     }
 
-    /**
-     * Called by Trader when Delta WS sends L1 update.
-     */
     onOrderBookUpdate(symbol, price) {
-        // DYNAMIC LOOKUP: Check which of our active assets matches this symbol
         const asset = Object.keys(this.assets).find(a => symbol.startsWith(a));
-
         if (asset && this.assets[asset]) {
             this.updateHistory(this.assets[asset].deltaHistory, price, Date.now());
         }
@@ -210,10 +182,23 @@ class AdvanceStrategy {
         }
     }
 
+    /**
+     * [UPDATED] Check Lockout Status
+     * - Returns TRUE only if within 10 seconds of the last order.
+     * - Does NOT check `this.position` anymore, allowing re-entry after 10s.
+     */
     isLockedOut() {
-        if (this.position) return true;
+        // If we have never traded, we are not locked.
+        if (this.lastOrderTime === 0) return false;
+
         const elapsed = Date.now() - this.lastOrderTime;
-        return elapsed < this.windowSizeMs && this.lastOrderTime !== 0; 
+        
+        // Lock out if less than 10s has passed
+        if (elapsed < this.lockDurationMs) {
+            return true;
+        }
+
+        return false;
     }
 
     async executeTrade(asset, side, productId) {
@@ -226,15 +211,27 @@ class AdvanceStrategy {
 
             const bestPrice = side === 'buy' ? parseFloat(book.asks[0][0]) : parseFloat(book.bids[0][0]);
             
-            // --- UPDATED: PERCENTAGE BASED AGGRESSION ---
-            const aggressionPercent = this.bot.config.priceAggressionOffset; // e.g. 0.05
+            // --- PRICE CALCULATION ---
+            const aggressionPercent = this.bot.config.priceAggressionOffset; 
             const offsetAmount = bestPrice * (aggressionPercent / 100);
             
-            // Calculate Limit Price
             let limitPrice = side === 'buy' ? bestPrice + offsetAmount : bestPrice - offsetAmount;
-            
-            // Round to 6 decimals to be safe for API (prevents 100.123456789123)
             limitPrice = parseFloat(limitPrice.toFixed(6));
+
+            // --- [NEW] BRACKET STOP LOSS CALCULATION ---
+            // 0.01% Stop Loss (fixed percentage)
+            const slPercentage = 0.0001; 
+            let stopLossPrice;
+
+            if (side === 'buy') {
+                // For Buy, Stop Loss is BELOW entry
+                stopLossPrice = limitPrice * (1 - slPercentage);
+            } else {
+                // For Sell, Stop Loss is ABOVE entry
+                stopLossPrice = limitPrice * (1 + slPercentage);
+            }
+            // Round to 6 decimals to match API requirements
+            stopLossPrice = parseFloat(stopLossPrice.toFixed(6));
 
             const orderData = {
                 product_id: productId.toString(), 
@@ -242,17 +239,19 @@ class AdvanceStrategy {
                 side: side,
                 order_type: 'limit_order',
                 limit_price: limitPrice.toString(),
+                bracket_stop_loss_price: stopLossPrice.toString(), // [NEW] Stop Loss Trigger
                 time_in_force: 'ioc' 
             };
 
-            this.logger.info(`[AdvanceStrategy] FLEETING ${side.toUpperCase()} on ${asset} @ ${limitPrice} (Offset: ${aggressionPercent}%)`, orderData);
+            this.logger.info(`[AdvanceStrategy] FLEETING ${side.toUpperCase()} on ${asset} @ ${limitPrice} | SL: ${stopLossPrice}`, orderData);
             
+            // Update last order time immediately to trigger the 10s lock
             this.lastOrderTime = Date.now(); 
 
             const response = await this.bot.placeOrder(orderData);
             
             if (response.result) {
-                this.logger.info(`[AdvanceStrategy] Order Placed Successfully. Entering Cooldown.`);
+                this.logger.info(`[AdvanceStrategy] Order Placed Successfully. 10s Lockout Active.`);
             } else {
                 this.logger.error(`[AdvanceStrategy] Order rejected/failed: ${JSON.stringify(response)}`);
             }
@@ -275,3 +274,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
+            
