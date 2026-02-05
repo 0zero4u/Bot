@@ -32,7 +32,7 @@ class AdvanceStrategy {
 
         // --- TRADING STATE ---
         this.lastOrderTime = 0;
-        this.slPercent = 0.12;
+        this.slPercent = 0.15;
         
         // [LOCK] Local lock to prevent duplicate orders before WebSocket syncs
         this.localInPosition = false; 
@@ -76,7 +76,7 @@ class AdvanceStrategy {
         for (const item of assetData.gapHistory) { if (item.v > rollingMax) rollingMax = item.v; }
 
         // TRIGGER
-        if (gap > (rollingMax * 1.01)) {
+        if (gap > (rollingMax * 1.11)) {
             // [DOUBLE CHECK] Check again right before punching
             if (this.localInPosition) return; 
 
