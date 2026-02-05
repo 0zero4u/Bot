@@ -104,14 +104,10 @@ class DeltaClient {
         return this.#request('GET', '/v2/orders', null, query);
     }
 
-    /**
-     * [NEW] Used for Keep-Alive Loop (25s Interval)
-     * Hits /v2/wallet/balances to keep the Load Balancer connection active.
-     */
     getWalletBalance() {
         return this.#request('GET', '/v2/wallet/balances');
     }
 }
 
 module.exports = DeltaClient;
-                                   
+    
