@@ -1,4 +1,3 @@
-
 class AdvanceStrategy {
     constructor(bot) {
         this.bot = bot;
@@ -79,45 +78,57 @@ class AdvanceStrategy {
             // [DOUBLE CHECK] Check again right before punching
             if (this.localInPosition) return; 
 
+            // --- 1. CAPTURE CONTEXT FOR LOGS ---
+            const triggerContext = {
+                externalSource: source,
+                externalPrice: price,
+                deltaPrice: currentDeltaPrice,
+                gapPct: gap,
+                gapUsd: Math.abs(price - currentDeltaPrice),
+                threshold: rollingMax
+            };
+
             this.logger.info(`[AdvanceStrategy] ⚡ Trigger: Gap ${gap.toFixed(4)}% > Max ${rollingMax.toFixed(4)}%`);
-            await this.executeTrade(asset, marketStats.direction === 'up' ? 'buy' : 'sell', assetData.deltaId, price);
+            
+            // --- 2. PASS CONTEXT TO EXECUTE ---
+            await this.executeTrade(
+                asset, 
+                marketStats.direction === 'up' ? 'buy' : 'sell', 
+                assetData.deltaId, 
+                triggerContext
+            );
         }
 
         assetData.gapHistory.push({ t: now, v: gap });
     }
 
-    async executeTrade(asset, side, productId, currentPrice) {
+    async executeTrade(asset, side, productId, context) {
         // [LOCK] Instant lock
         this.localInPosition = true;
         this.bot.isOrderInProgress = true;
         
+        // Track Timing
+        const punchStartTime = Date.now();
+
         try {
             // --- PRICE CALCULATION (Limit IOC + Aggression) ---
             
-            // 1. Get Aggression % from config (default 0.05% if not set)
-            // This ensures we cross the spread to get filled immediately
             const aggressionPercent = this.bot.config.priceAggressionOffset || 0.05;
             
             // 2. Fetch Real-Time OrderBook from Bot for precision
             const ob = this.bot.getOrderBook(asset);
-            let executionPrice = currentPrice;
-
+            // Default to External Price if book is empty (fallback), otherwise use Book
+            let basePrice = context.externalPrice; 
+            
             // Determine base price from Order Book (Best Ask for Buy, Best Bid for Sell)
             if (side === 'buy') {
-                if (ob && ob.asks && ob.asks.length > 0) {
-                    executionPrice = parseFloat(ob.asks[0][0]);
-                }
-                // Add aggression to buy slightly higher than ask (guarantee fill)
-                executionPrice = executionPrice * (1 + (aggressionPercent / 100));
+                if (ob && ob.asks && ob.asks.length > 0) basePrice = parseFloat(ob.asks[0][0]);
+                var executionPrice = basePrice * (1 + (aggressionPercent / 100));
             } else {
-                if (ob && ob.bids && ob.bids.length > 0) {
-                    executionPrice = parseFloat(ob.bids[0][0]);
-                }
-                // Subtract aggression to sell slightly lower than bid (guarantee fill)
-                executionPrice = executionPrice * (1 - (aggressionPercent / 100));
+                if (ob && ob.bids && ob.bids.length > 0) basePrice = parseFloat(ob.bids[0][0]);
+                var executionPrice = basePrice * (1 - (aggressionPercent / 100));
             }
 
-            // 3. Calculate Stop Loss based on the Execution Price
             const slOffset = executionPrice * (this.slPercent / 100);
             const stopLossPrice = side === 'buy' ? (executionPrice - slOffset) : (executionPrice + slOffset);
 
@@ -125,22 +136,49 @@ class AdvanceStrategy {
                 product_id: productId.toString(), 
                 size: this.bot.config.orderSize.toString(), 
                 side: side, 
-                order_type: 'limit_order',              // <--- CHANGED to Limit
-                limit_price: executionPrice.toFixed(4), // <--- Calculated Aggressive Price
-                time_in_force: 'ioc',                   // <--- Immediate Or Cancel
+                order_type: 'limit_order',              
+                limit_price: executionPrice.toFixed(4), 
+                time_in_force: 'ioc',                   
                 bracket_stop_loss_price: stopLossPrice.toFixed(4),
-                bracket_stop_trigger_method: 'mark_price' // <--- Safer than last_traded_price
+                bracket_stop_trigger_method: 'mark_price' 
             };
             
-            this.logger.info(`[AdvanceStrategy] 🚀 Punching IOC Order: ${side.toUpperCase()} @ ${executionPrice.toFixed(4)} (SL: ${stopLossPrice.toFixed(4)})`);
+            // --- EXECUTE & MEASURE LATENCY ---
+            const apiStart = Date.now();
+            const orderResult = await this.bot.placeOrder(orderData);
+            const apiEnd = Date.now();
+            const apiLatency = apiEnd - apiStart;
+
             this.lastOrderTime = Date.now();
-            
-            await this.bot.placeOrder(orderData);
-            this.logger.info(`[AdvanceStrategy] ✅ IOC Order sent.`);
+            this.logger.info(`[AdvanceStrategy] ✅ IOC Order Success.`);
+
+            // --- FULL LIFECYCLE LOG ---
+            this.logger.info({
+                event: "TRADE_LIFECYCLE",
+                asset: asset,
+                direction: side.toUpperCase(),
+                trigger: {
+                    source: context.externalSource,
+                    external_price: context.externalPrice,
+                    delta_price: context.deltaPrice,
+                    gap_usd: context.gapUsd.toFixed(4),
+                    lead_reason: `External (${context.externalPrice}) ${side === 'buy' ? '>' : '<'} Delta (${context.deltaPrice})`
+                },
+                execution: {
+                    limit_price: executionPrice.toFixed(4),
+                    sl_price: stopLossPrice.toFixed(4),
+                    aggression: `${aggressionPercent}%`
+                },
+                timing: {
+                    punch_time_iso: new Date(punchStartTime).toISOString(),
+                    api_latency_ms: apiLatency,
+                    total_processing_ms: (apiEnd - punchStartTime)
+                },
+                delta_order_id: orderResult.id
+            });
 
         } catch (error) {
             this.logger.error(`[AdvanceStrategy] ❌ Execution Failed:`, { message: error.message });
-            // If the order fails, we unlock it so it can try again on the next signal
             this.localInPosition = false; 
         } finally {
             this.bot.isOrderInProgress = false;
@@ -149,31 +187,22 @@ class AdvanceStrategy {
 
     // Centralized lock management
     isLockedOut() {
-        // 1. Prevent trade if we locally think we are in a position
         if (this.localInPosition) return true;
-        
-        // 2. Prevent trade if a previous order is literally in flight (HTTP request hasn't returned)
         if (this.bot.isOrderInProgress) return true;
-
-        // 3. Cooldown check
         if (this.lastOrderTime === 0) return false;
         return (Date.now() - this.lastOrderTime) < this.lockDurationMs;
     }
 
-    // [UPDATED] Robust Position Sync to manage the lock
     onPositionUpdate(pos) {
-        // Handle cases where size might be a string "0" or number 0
         const rawSize = (pos && pos.size !== undefined) ? pos.size : 0;
         const size = Math.abs(parseFloat(rawSize));
         
         if (size > 0) {
-            // We are officially in a trade
             if (!this.localInPosition) {
                 this.logger.info(`[AdvanceStrategy] Exchange reports position ACTIVE. Strategy Locked.`);
             }
             this.localInPosition = true;
         } else {
-            // Position is closed, we can unlock for the next trade
             if (this.localInPosition) {
                 this.logger.info(`[AdvanceStrategy] Exchange reports position CLOSED. Strategy Unlocked.`);
             }
@@ -204,3 +233,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
+            
