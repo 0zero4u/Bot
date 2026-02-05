@@ -33,7 +33,7 @@ class AdvanceStrategy {
 
         // --- TRADING STATE ---
         this.lastOrderTime = 0;
-        this.slPercent = 0.15;
+        this.slPercent = 0.1;
         
         // [NEW] Local lock to prevent duplicate orders before WebSocket syncs
         this.localInPosition = false; 
