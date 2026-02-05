@@ -1,5 +1,5 @@
 // strategies/AdvanceStrategy.js
-// Version 13.0.0 - Hard SL Integration using Average Fill Price
+// Version 14.0.0 - Atomic Bracket Orders (No Response Dependency)
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -33,12 +33,10 @@ class AdvanceStrategy {
 
         // --- TRADING STATE ---
         this.lastOrderTime = 0;
-        this.position = null; 
-        this.entryPrice = 0; 
-        this.slPercent = 0.3; // Increased to 0.6% as discussed for better "breathing room"
+        this.slPercent = 0.3; // 0.3% is the "Sweet Spot" (Tight but safe from spread)
     }
 
-    getName() { return "AdvanceStrategy (Hard SL + Avg Fill)"; }
+    getName() { return "AdvanceStrategy (Atomic Bracket)"; }
 
     async onPriceUpdate(asset, price, source = 'UNKNOWN') {
         const now = Date.now();
@@ -67,69 +65,52 @@ class AdvanceStrategy {
         
         if (gap < 0) gap = 0;
 
-        // Sliding Window Logic
         const cutoff = now - this.windowSizeMs;
         while (assetData.gapHistory.length > 0 && assetData.gapHistory[0].t < cutoff) assetData.gapHistory.shift();
         
         let rollingMax = 0.05; 
         for (const item of assetData.gapHistory) { if (item.v > rollingMax) rollingMax = item.v; }
 
-        // TRIGGER
         if (gap > (rollingMax * 1.01)) {
             this.logger.info(`[AdvanceStrategy] ⚡ Trigger: Gap ${gap.toFixed(4)}% > Max ${rollingMax.toFixed(4)}%`);
-            await this.executeTrade(asset, marketStats.direction === 'up' ? 'buy' : 'sell', assetData.deltaId);
+            // Pass the CURRENT price to calculate SL immediately
+            await this.executeTrade(asset, marketStats.direction === 'up' ? 'buy' : 'sell', assetData.deltaId, price);
         }
 
         assetData.gapHistory.push({ t: now, v: gap });
     }
 
-    // --- EXECUTION WITH HARD SL ---
-
-    async executeTrade(asset, side, productId) {
+    // --- ATOMIC EXECUTION ---
+    async executeTrade(asset, side, productId, currentPrice) {
         this.bot.isOrderInProgress = true;
         try {
-            // 1. Send Market Order to Delta
+            // 1. Calculate SL Price BEFORE sending order
+            // We use 'currentPrice' (from signal) as the anchor.
+            const slOffset = currentPrice * (this.slPercent / 100);
+            const stopPrice = side === 'buy' 
+                ? (currentPrice - slOffset) 
+                : (currentPrice + slOffset);
+
+            // 2. Construct Order WITH Bracket
             const orderData = {
                 product_id: productId.toString(),
                 size: this.bot.config.orderSize.toString(),
                 side: side,
-                order_type: 'market_order' 
+                order_type: 'market_order',
+                // This ensures SL is set INSTANTLY by the exchange engine
+                bracket_order: {
+                    stop_loss_price: stopPrice.toFixed(4),
+                    stop_loss_type: 'mark_price' // Safer than 'last_price' for wicks
+                }
             };
-            
+
+            this.logger.info(`[EXECUTION] Placing Order with ATOMIC SL at ${stopPrice.toFixed(4)}`);
             this.lastOrderTime = Date.now();
-            const response = await this.bot.placeOrder(orderData);
-
-            // 2. Extract REAL Entry Price from Response
-            // Delta India API usually returns this in response.average_fill_price
-            const realFillPrice = parseFloat(response.average_fill_price || response.price || 0);
-
-            if (realFillPrice > 0) {
-                this.entryPrice = realFillPrice;
-                this.logger.info(`[EXECUTION] Filled at ${realFillPrice}. Calculating Hard SL...`);
-
-                // 3. Calculate SL Price (Exchange-side trigger)
-                const slOffset = realFillPrice * (this.slPercent / 100);
-                const stopPrice = side === 'buy' ? (realFillPrice - slOffset) : (realFillPrice + slOffset);
-
-                // 4. Place the Hard Stop Market Order
-                const stopPayload = {
-                    product_id: productId.toString(),
-                    size: orderData.size,
-                    side: side === 'buy' ? 'sell' : 'buy',
-                    order_type: 'stop_market_order',
-                    stop_price: stopPrice.toFixed(4) // Round to 4 decimals for XRP/BTC/ETH
-                };
-
-                // Fire and forget the SL order (background task)
-                this.bot.placeOrder(stopPayload).then(() => {
-                    this.logger.info(`[PROTECTION] 🛡️ Hard Stop placed on Delta at ${stopPrice.toFixed(4)}`);
-                }).catch(err => {
-                    this.logger.error(`[CRITICAL] Hard SL placement failed: ${err.message}`);
-                });
-
-            } else {
-                this.logger.warn(`[EXECUTION] Order placed but average_fill_price was missing in response.`);
-            }
+            
+            // 3. Send One Request
+            await this.bot.placeOrder(orderData);
+            
+            this.logger.info(`[SUCCESS] Bracket Order Placed.`);
 
         } catch (e) {
             this.logger.error(`Entry Failed: ${e.message}`);
@@ -139,22 +120,12 @@ class AdvanceStrategy {
     }
 
     isLockedOut() {
-        if (this.position) return true;
         if (this.lastOrderTime === 0) return false;
         return (Date.now() - this.lastOrderTime) < this.lockDurationMs;
     }
 
-    onPositionUpdate(pos) {
-        if (parseFloat(pos.size) !== 0) {
-            this.position = pos;
-            if (this.entryPrice === 0 && pos.entry_price) {
-                this.entryPrice = parseFloat(pos.entry_price);
-            }
-        } else {
-            this.position = null;
-            this.entryPrice = 0;
-        }
-    }
+    // Removed onPositionUpdate/entryPrice logic as we no longer need it for SL
+    onPositionUpdate(pos) {} 
 
     onOrderBookUpdate(symbol, price) {
         const asset = Object.keys(this.assets).find(a => symbol.startsWith(a));
@@ -179,4 +150,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-                    
+            
