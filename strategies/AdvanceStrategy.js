@@ -1,6 +1,5 @@
-
 // strategies/AdvanceStrategy.js
-// Version 12.3.0 - Fixed Entry Price Amnesia & Validated SL
+// Version 13.0.0 - Hard SL Integration using Average Fill Price
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -35,58 +34,16 @@ class AdvanceStrategy {
         // --- TRADING STATE ---
         this.lastOrderTime = 0;
         this.position = null; 
-        this.entryPrice = 0; // Critical Variable
-        this.slPercent = 0.01; 
+        this.entryPrice = 0; 
+        this.slPercent = 0.6; // Increased to 0.6% as discussed for better "breathing room"
     }
 
-    getName() { return "AdvanceStrategy (Persistent SL Fix)"; }
+    getName() { return "AdvanceStrategy (Hard SL + Avg Fill)"; }
 
     async onPriceUpdate(asset, price, source = 'UNKNOWN') {
         const now = Date.now();
         const assetData = this.assets[asset];
-        if (!assetData) return;
-
-        // ==================================================================
-        // --- 1. EMERGENCY SIGNAL EXIT (Priority High) ---
-        // ==================================================================
-        
-        // Only run this if we have a position and it matches the current asset
-        if (this.position && (this.position.product_id == assetData.deltaId || this.position.product_symbol.startsWith(asset))) {
-            
-            // [FIX] Self-Healing Entry Price
-            // If we have a position but entryPrice is 0 (due to restart), restore it immediately.
-            if (this.entryPrice === 0) {
-                if (this.position.entry_price && parseFloat(this.position.entry_price) > 0) {
-                    this.entryPrice = parseFloat(this.position.entry_price);
-                    this.logger.warn(`[AdvanceStrategy] ⚠️ Restored Entry Price from Delta: ${this.entryPrice}`);
-                } else {
-                    // Last Resort: Use current price to prevent divide-by-zero, but warn user
-                    this.entryPrice = price; 
-                    this.logger.error(`[AdvanceStrategy] 🚨 Entry Price Missing! Resetting SL baseline to CURRENT price: ${price}`);
-                }
-            }
-
-            // Perform SL Check
-            const side = this.position.side;
-            const priceChange = ((price - this.entryPrice) / this.entryPrice) * 100;
-
-            let shouldExit = false;
-            // Buy Position: Exit if price drops < -0.01%
-            if (side === 'buy' && priceChange <= -this.slPercent) shouldExit = true;
-            // Sell Position: Exit if price rises > 0.01%
-            if (side === 'sell' && priceChange >= this.slPercent) shouldExit = true;
-
-            if (shouldExit) {
-                this.logger.warn(`[EMERGENCY EXIT] Signal ${source} hit SL (${priceChange.toFixed(4)}%). Exiting Market.`);
-                await this.closePositionMarket(asset, assetData.deltaId);
-                return; // Stop processing
-            }
-        }
-
-        // ==================================================================
-        // --- 2. ENTRY LOGIC (Standard Gap Analysis) ---
-        // ==================================================================
-        if (this.isLockedOut()) return;
+        if (!assetData || this.isLockedOut()) return;
 
         // Populate History
         if (!assetData.sources[source]) assetData.sources[source] = [];
@@ -97,7 +54,6 @@ class AdvanceStrategy {
             this.logger.info(`[AdvanceStrategy] *** ACTIVE ***`);
         }
 
-        // Buffer Check (This is why you see Buffer 0 logs - this line prevents trading on empty history)
         if (this.isWarmup || assetData.sources[source].length < 2 || assetData.deltaHistory.length < 2) return;
 
         // Gap Calculation
@@ -121,49 +77,64 @@ class AdvanceStrategy {
         // TRIGGER
         if (gap > (rollingMax * 1.01)) {
             this.logger.info(`[AdvanceStrategy] ⚡ Trigger: Gap ${gap.toFixed(4)}% > Max ${rollingMax.toFixed(4)}%`);
-            this.entryPrice = price; // Capture Binance Price for SL
             await this.executeTrade(asset, marketStats.direction === 'up' ? 'buy' : 'sell', assetData.deltaId);
         }
 
         assetData.gapHistory.push({ t: now, v: gap });
     }
 
-    // --- EXECUTION HELPERS ---
+    // --- EXECUTION WITH HARD SL ---
 
     async executeTrade(asset, side, productId) {
         this.bot.isOrderInProgress = true;
         try {
+            // 1. Send Market Order to Delta
             const orderData = {
                 product_id: productId.toString(),
-                size: this.bot.config.orderSize,
+                size: this.bot.config.orderSize.toString(),
                 side: side,
                 order_type: 'market_order' 
             };
+            
             this.lastOrderTime = Date.now();
-            await this.bot.placeOrder(orderData);
+            const response = await this.bot.placeOrder(orderData);
+
+            // 2. Extract REAL Entry Price from Response
+            // Delta India API usually returns this in response.average_fill_price
+            const realFillPrice = parseFloat(response.average_fill_price || response.price || 0);
+
+            if (realFillPrice > 0) {
+                this.entryPrice = realFillPrice;
+                this.logger.info(`[EXECUTION] Filled at ${realFillPrice}. Calculating Hard SL...`);
+
+                // 3. Calculate SL Price (Exchange-side trigger)
+                const slOffset = realFillPrice * (this.slPercent / 100);
+                const stopPrice = side === 'buy' ? (realFillPrice - slOffset) : (realFillPrice + slOffset);
+
+                // 4. Place the Hard Stop Market Order
+                const stopPayload = {
+                    product_id: productId.toString(),
+                    size: orderData.size,
+                    side: side === 'buy' ? 'sell' : 'buy',
+                    order_type: 'stop_market_order',
+                    stop_price: stopPrice.toFixed(4) // Round to 4 decimals for XRP/BTC/ETH
+                };
+
+                // Fire and forget the SL order (background task)
+                this.bot.placeOrder(stopPayload).then(() => {
+                    this.logger.info(`[PROTECTION] 🛡️ Hard Stop placed on Delta at ${stopPrice.toFixed(4)}`);
+                }).catch(err => {
+                    this.logger.error(`[CRITICAL] Hard SL placement failed: ${err.message}`);
+                });
+
+            } else {
+                this.logger.warn(`[EXECUTION] Order placed but average_fill_price was missing in response.`);
+            }
+
         } catch (e) {
             this.logger.error(`Entry Failed: ${e.message}`);
         } finally {
             this.bot.isOrderInProgress = false;
-        }
-    }
-
-    async closePositionMarket(asset, productId) {
-        if (!this.position) return;
-        try {
-            const side = this.position.side === 'buy' ? 'sell' : 'buy';
-            const orderData = {
-                product_id: productId.toString(),
-                size: Math.abs(parseFloat(this.position.size)).toString(),
-                side: side,
-                order_type: 'market_order'
-            };
-            await this.bot.placeOrder(orderData);
-            this.position = null; 
-            this.entryPrice = 0;
-            this.lastOrderTime = Date.now(); 
-        } catch (e) {
-            this.logger.error(`Exit Failed: ${e.message}`);
         }
     }
 
@@ -174,11 +145,8 @@ class AdvanceStrategy {
     }
 
     onPositionUpdate(pos) {
-        // [FIX] Update local state
         if (parseFloat(pos.size) !== 0) {
             this.position = pos;
-            
-            // If entryPrice is missing (e.g. after restart), grab it from Delta
             if (this.entryPrice === 0 && pos.entry_price) {
                 this.entryPrice = parseFloat(pos.entry_price);
             }
@@ -211,4 +179,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-            
+                    
