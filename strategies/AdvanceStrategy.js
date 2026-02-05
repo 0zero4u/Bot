@@ -30,9 +30,7 @@ class AdvanceStrategy {
 
         // --- TRADING STATE ---
         this.lastOrderTime = 0;
-        this.slPercent = 0.15; // Tight Stop Loss
-        
-        // [LOCK] Local lock to prevent duplicate orders before WebSocket syncs
+        this.slPercent = 0.15; 
         this.localInPosition = false; 
     }
 
@@ -42,10 +40,8 @@ class AdvanceStrategy {
         const now = Date.now();
         const assetData = this.assets[asset];
         
-        // 1. Check ALL locks before even calculating gaps
         if (!assetData || this.isLockedOut()) return;
 
-        // Populate History
         if (!assetData.sources[source]) assetData.sources[source] = [];
         this.updateHistory(assetData.sources[source], price, now);
 
@@ -56,7 +52,6 @@ class AdvanceStrategy {
 
         if (this.isWarmup || assetData.sources[source].length < 2 || assetData.deltaHistory.length < 2) return;
 
-        // Gap Calculation
         const marketStats = this.calculateSpikeStats(assetData.sources[source], price);
         const currentDeltaPrice = assetData.deltaHistory[assetData.deltaHistory.length - 1].p;
         const deltaStats = this.calculateSpikeStats(assetData.deltaHistory, currentDeltaPrice);
@@ -70,15 +65,13 @@ class AdvanceStrategy {
         const cutoff = now - this.windowSizeMs;
         while (assetData.gapHistory.length > 0 && assetData.gapHistory[0].t < cutoff) assetData.gapHistory.shift();
         
-        let rollingMax = 0.25; 
+        let rollingMax = 0.4; 
         for (const item of assetData.gapHistory) { if (item.v > rollingMax) rollingMax = item.v; }
 
-        // TRIGGER
         if (gap > (rollingMax * 1.11)) {
-            // [DOUBLE CHECK] Check again right before punching
             if (this.localInPosition) return; 
 
-            // --- 1. CAPTURE CONTEXT FOR LOGS ---
+            // 1. CAPTURE CONTEXT
             const triggerContext = {
                 externalSource: source,
                 externalPrice: price,
@@ -90,7 +83,7 @@ class AdvanceStrategy {
 
             this.logger.info(`[AdvanceStrategy] ⚡ Trigger: Gap ${gap.toFixed(4)}% > Max ${rollingMax.toFixed(4)}%`);
             
-            // --- 2. PASS CONTEXT TO EXECUTE ---
+            // 2. PASS TO EXECUTE
             await this.executeTrade(
                 asset, 
                 marketStats.direction === 'up' ? 'buy' : 'sell', 
@@ -103,26 +96,17 @@ class AdvanceStrategy {
     }
 
     async executeTrade(asset, side, productId, context) {
-        // [LOCK] Instant lock
         this.localInPosition = true;
         this.bot.isOrderInProgress = true;
         
-        // Track Timing
         const punchStartTime = Date.now();
 
         try {
-            // --- PRICE CALCULATION (Limit IOC + Aggression) ---
-            
-            // 1. Get Aggression % from config (default 0.05% if not set)
             const aggressionPercent = this.bot.config.priceAggressionOffset || 0.05;
-            
-            // 2. Fetch Real-Time OrderBook from Bot for precision
             const ob = this.bot.getOrderBook(asset);
             
-            // Default to External Price if book is empty (fallback), otherwise use Book
             let basePrice = context.externalPrice; 
             
-            // Determine base price from Order Book (Best Ask for Buy, Best Bid for Sell)
             if (side === 'buy') {
                 if (ob && ob.asks && ob.asks.length > 0) basePrice = parseFloat(ob.asks[0][0]);
                 var executionPrice = basePrice * (1 + (aggressionPercent / 100));
@@ -131,7 +115,6 @@ class AdvanceStrategy {
                 var executionPrice = basePrice * (1 - (aggressionPercent / 100));
             }
 
-            // 3. Calculate Stop Loss based on the Execution Price
             const slOffset = executionPrice * (this.slPercent / 100);
             const stopLossPrice = side === 'buy' ? (executionPrice - slOffset) : (executionPrice + slOffset);
 
@@ -150,72 +133,63 @@ class AdvanceStrategy {
             const apiStart = Date.now();
             const orderResult = await this.bot.placeOrder(orderData);
             const apiEnd = Date.now();
+            
             const apiLatency = apiEnd - apiStart;
-
             this.lastOrderTime = Date.now();
+
             this.logger.info(`[AdvanceStrategy] ✅ IOC Order Success.`);
 
-            // --- FULL LIFECYCLE LOG ---
-            this.logger.info({
+            // --- [FIXED] FORCE LOG TO STRING FOR PM2 ---
+            // We use JSON.stringify() here so Winston's "simple" format prints it correctly
+            const logPayload = JSON.stringify({
                 event: "TRADE_LIFECYCLE",
                 asset: asset,
                 direction: side.toUpperCase(),
                 trigger: {
                     source: context.externalSource,
-                    external_price: context.externalPrice,
+                    ext_price: context.externalPrice,
                     delta_price: context.deltaPrice,
-                    gap_usd: context.gapUsd.toFixed(4),
-                    lead_reason: `External (${context.externalPrice}) ${side === 'buy' ? '>' : '<'} Delta (${context.deltaPrice})`
+                    gap_usd: context.gapUsd.toFixed(4)
                 },
                 execution: {
                     limit_price: executionPrice.toFixed(4),
-                    sl_price: stopLossPrice.toFixed(4),
                     aggression: `${aggressionPercent}%`
                 },
                 timing: {
-                    punch_time_iso: new Date(punchStartTime).toISOString(),
+                    punch_time: new Date(punchStartTime).toISOString(),
                     api_latency_ms: apiLatency,
-                    total_processing_ms: (apiEnd - punchStartTime)
+                    total_ms: (apiEnd - punchStartTime)
                 },
                 delta_order_id: orderResult.id
-            });
+            }, null, 2); // Indentation for readability
+
+            this.logger.info(`\n${logPayload}`); // Add newline for clean look in logs
 
         } catch (error) {
             this.logger.error(`[AdvanceStrategy] ❌ Execution Failed:`, { message: error.message });
-            // If the order fails, we unlock it so it can try again on the next signal
             this.localInPosition = false; 
         } finally {
             this.bot.isOrderInProgress = false;
         }
     }
 
-    // Centralized lock management
     isLockedOut() {
-        // 1. Prevent trade if we locally think we are in a position
         if (this.localInPosition) return true;
-        
-        // 2. Prevent trade if a previous order is literally in flight (HTTP request hasn't returned)
         if (this.bot.isOrderInProgress) return true;
-
-        // 3. Cooldown check
         if (this.lastOrderTime === 0) return false;
         return (Date.now() - this.lastOrderTime) < this.lockDurationMs;
     }
 
-    // [UPDATED] Robust Position Sync to manage the lock
     onPositionUpdate(pos) {
-        // Handle cases where size might be a string "0" or number 0
         const rawSize = (pos && pos.size !== undefined) ? pos.size : 0;
         const size = Math.abs(parseFloat(rawSize));
         
         if (size > 0) {
-            // We are officially in a trade
             if (!this.localInPosition) {
                 this.logger.info(`[AdvanceStrategy] Exchange reports position ACTIVE. Strategy Locked.`);
             }
             this.localInPosition = true;
         } else {
-            // Position is closed, we can unlock for the next trade
             if (this.localInPosition) {
                 this.logger.info(`[AdvanceStrategy] Exchange reports position CLOSED. Strategy Unlocked.`);
             }
@@ -246,4 +220,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-               
+            
