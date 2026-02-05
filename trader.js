@@ -1,14 +1,12 @@
 // trader.js
-// v58.0 - [CLEAN] All_Trades Only (No L1)
+// v59.0 - [DEBUG] Auth Diagnostics
 
 const WebSocket = require('ws');
 const winston = require('winston');
-const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 const DeltaClient = require('./client.js');
 
-// --- Configuration ---
 const config = {
     strategy: process.env.STRATEGY || 'Advance', 
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
@@ -27,7 +25,6 @@ const config = {
     priceAggressionOffset: parseFloat(process.env.PRICE_AGGRESSION_OFFSET || '0.01'),
 };
 
-// --- Logging Setup ---
 const logger = winston.createLogger({
     level: config.logLevel,
     format: winston.format.combine(
@@ -68,12 +65,9 @@ class TradingBot {
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
         this.logger.info(`Trading Targets (USDT): ${this.targetAssets.join(', ')}`);
 
-        // [REMOVED] L1 Orderbook storage
-
         this.hasOpenPosition = false;
         this.isStateSynced = false;
         this.pingInterval = null; this.heartbeatTimeout = null;
-        
         this.restKeepAliveInterval = null;
 
         try {
@@ -87,9 +81,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v58.0 - All Trades Only) ---`);
-        this.logger.info(`Strategy: ${this.strategy.getName()}`);
-        
+        this.logger.info(`--- Bot Initializing (v59.0 - Auth Debug) ---`);
         await this.syncPositionState();
         await this.initWebSocket();
         this.setupHttpServer();
@@ -107,7 +99,6 @@ class TradingBot {
         }, 25000); 
     }
     
-    // --- WebSocket Heartbeat ---
     startHeartbeat() {
         this.resetHeartbeatTimeout();
         this.pingInterval = setInterval(() => {
@@ -130,7 +121,6 @@ class TradingBot {
         clearInterval(this.pingInterval);
     }
 
-    // --- WebSocket Connection ---
     async initWebSocket() { 
         this.ws = new WebSocket(this.config.wsURL);
         
@@ -168,7 +158,6 @@ class TradingBot {
         const symbols = this.targetAssets.map(asset => `${asset}USD`);
         this.logger.info(`Subscribing to All Trades: ${symbols.join(', ')}`);
         
-        // [REMOVED] l1_orderbook from channels list
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
@@ -202,15 +191,11 @@ class TradingBot {
                     this.handlePositionUpdate(message);
                 }
                 break;
-            
             case 'all_trades':
                 const asset = this.targetAssets.find(a => message.symbol.startsWith(a));
                 if (asset) {
-                    // Handle single object or array snapshot
                     const dataPoints = message.data || (Array.isArray(message) ? message : [message]);
-
                     if (Array.isArray(dataPoints)) {
-                        // Use the last trade for the most recent price
                         const lastTrade = dataPoints[dataPoints.length - 1];
                         if (lastTrade && lastTrade.price) {
                              if (this.strategy.onTradeUpdate) {
@@ -222,6 +207,12 @@ class TradingBot {
                             this.strategy.onTradeUpdate(message.symbol, parseFloat(message.price));
                         }
                     }
+                }
+                break;
+            // [DEBUG] Log unknown message types (helps find Auth errors)
+            default:
+                if (!['success', 'subscribe'].includes(message.type)) {
+                    this.logger.info(`[WS DEBUG] Unhandled Msg: ${JSON.stringify(message)}`);
                 }
                 break;
         }
@@ -237,7 +228,12 @@ class TradingBot {
     }
 
     async handleSignalMessage(message) {
-        if (!this.authenticated) return;
+        // [DEBUG] Warn if signal arrives but not authenticated
+        if (!this.authenticated) {
+            this.logger.warn('Signal received but WebSocket NOT authenticated. Ignored.');
+            return;
+        }
+        
         try {
             const data = JSON.parse(message.toString());
             if (data.type === 'S' && data.p) {
@@ -300,8 +296,6 @@ class TradingBot {
             this.logger.info(`[Trader] Order ${orderUpdate.id} FILLED on Delta.`);
         }
     }
-
-    // [REMOVED] getOrderBook() method
 }
 
 (async () => {
@@ -317,4 +311,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-            
+        
