@@ -1,6 +1,6 @@
 
 // trader.js
-// v60.1 - [FIXED] V2 Auth: Timestamp as String
+// v61.0 - [DEBUG] Deep Logging & Auth Diagnostics
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -33,8 +33,9 @@ const logger = winston.createLogger({
     level: config.logLevel,
     format: winston.format.combine(
         winston.format.timestamp(), 
-        winston.format.errors({ stack: true }), 
-        winston.format.json()
+        winston.format.printf(({ timestamp, level, message }) => {
+            return `${timestamp} [${level.toUpperCase()}]: ${message}`;
+        })
     ),
     transports: [
         new winston.transports.File({ filename: 'error.log', level: 'error' }),
@@ -50,10 +51,14 @@ const logger = winston.createLogger({
 
 function validateConfig() {
     const required = ['apiKey', 'apiSecret', 'leverage'];
-    if (required.some(key => !config[key])) {
-        logger.error(`FATAL: Missing required configuration: ${required.filter(key => !config[key]).join(', ')}`);
+    const missing = required.filter(key => !config[key]);
+    if (missing.length > 0) {
+        logger.error(`FATAL: Missing config: ${missing.join(', ')}`);
         process.exit(1);
     }
+    // Masked Key Check
+    logger.info(`API Key Loaded: ${config.apiKey.substring(0, 4)}...${config.apiKey.slice(-4)}`);
+    logger.info(`Secret Loaded: ${config.apiSecret ? 'YES (Length: ' + config.apiSecret.length + ')' : 'NO'}`);
 }
 validateConfig();
 
@@ -85,7 +90,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v60.1 - String Timestamp Fix) ---`);
+        this.logger.info(`--- Bot Initializing (v61.0 - Deep Auth Debug) ---`);
         await this.syncPositionState();
         await this.initWebSocket();
         this.setupHttpServer();
@@ -128,13 +133,14 @@ class TradingBot {
 
     // --- WebSocket Connection ---
     async initWebSocket() { 
+        this.logger.info(`Connecting to: ${this.config.wsURL}`);
         this.ws = new WebSocket(this.config.wsURL);
         
         this.ws.on('open', () => this.authenticateWebSocket());
         this.ws.on('message', (data) => this.handleWebSocketMessage(JSON.parse(data.toString())));
         this.ws.on('error', (error) => this.logger.error('WebSocket error:', error.message));
         this.ws.on('close', (code, reason) => {
-            this.logger.warn(`WebSocket disconnected: ${code}. Reconnecting...`);
+            this.logger.warn(`WebSocket disconnected: ${code} - ${reason}. Reconnecting...`);
             this.stopHeartbeat();
             this.authenticated = false;
             setTimeout(() => this.initWebSocket(), this.config.reconnectInterval);
@@ -142,29 +148,34 @@ class TradingBot {
     }
 
     authenticateWebSocket() {
-        // [FIXED] Force Timestamp to String for both Sig and Payload
+        // [DEBUG] Capture time exactly
         const timestampNum = Math.floor(Date.now() / 1000); 
         const timestampStr = timestampNum.toString(); 
         
         // 1. Generate Signature
         // Format: 'GET' + timestampStr + '/live'
+        const signatureData = 'GET' + timestampStr + '/live';
         const signature = crypto
             .createHmac('sha256', this.config.apiSecret)
-            .update('GET' + timestampStr + '/live')
+            .update(signatureData)
             .digest('hex');
 
-        this.logger.info(`[Auth] Attempting key-auth with timestamp: ${timestampStr}`);
+        this.logger.info(`[Auth Debug] Timestamp: ${timestampStr}`);
+        this.logger.info(`[Auth Debug] Pre-Hash String: "${signatureData}"`);
+        this.logger.info(`[Auth Debug] Signature: ${signature}`);
 
         // 2. Send Auth Payload
-        // IMPORTANT: Sending timestamp as STRING to match V2 spec & Python example
-        this.ws.send(JSON.stringify({ 
+        const payload = { 
             type: 'key-auth', 
             payload: { 
                 'api-key': this.config.apiKey, 
                 timestamp: timestampStr, 
                 signature: signature 
             }
-        }));
+        };
+
+        this.logger.info(`[Auth Debug] Sending Payload: ${JSON.stringify(payload)}`);
+        this.ws.send(JSON.stringify(payload));
     }
 
     subscribeToChannels() {
@@ -179,11 +190,12 @@ class TradingBot {
     }
 
     handleWebSocketMessage(message) {
-        // [DEBUG] Log auth-related messages
-        if (message.type === 'error' || message.type === 'success') {
-            this.logger.info(`[WS Message]: ${JSON.stringify(message)}`);
+        // [DEBUG] LOG EVERYTHING until authenticated
+        if (!this.authenticated) {
+            this.logger.info(`[WS RAW]: ${JSON.stringify(message)}`);
         }
 
+        // Handle Success
         if (message.type === 'success' && (message.message === 'Authenticated' || message.result === true)) {
             this.logger.info('✅ WebSocket AUTHENTICATED Successfully.');
             this.authenticated = true; 
@@ -193,8 +205,14 @@ class TradingBot {
             return;
         }
         
+        // Handle Error
         if (message.type === 'error' && !this.authenticated) {
-            this.logger.error(`❌ Authentication Failed: ${JSON.stringify(message)}`);
+            this.logger.error(`❌ AUTH FAILED. Error Code: ${message.error ? message.error.code : 'Unknown'}`);
+            this.logger.error(`❌ Message: ${message.message}`);
+            // Check for time drift warning in error
+            if (message.error && message.error.context) {
+                this.logger.error(`❌ Context: ${JSON.stringify(message.error.context)}`);
+            }
         }
 
         if (message.type === 'pong') {
@@ -330,4 +348,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-            
+    
