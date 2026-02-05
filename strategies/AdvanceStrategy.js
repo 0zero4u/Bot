@@ -70,11 +70,11 @@ class AdvanceStrategy {
         const cutoff = now - this.windowSizeMs;
         while (assetData.gapHistory.length > 0 && assetData.gapHistory[0].t < cutoff) assetData.gapHistory.shift();
         
-        let rollingMax = 0.2; 
+        let rollingMax = 0.4; 
         for (const item of assetData.gapHistory) { if (item.v > rollingMax) rollingMax = item.v; }
 
         // TRIGGER
-        if (gap > (rollingMax * 1.3)) {
+        if (gap > (rollingMax * 1.11)) {
             // [DOUBLE CHECK] Check again right before punching
             if (this.localInPosition) return; 
 
@@ -113,10 +113,12 @@ class AdvanceStrategy {
         try {
             // --- PRICE CALCULATION (Limit IOC + Aggression) ---
             
+            // 1. Get Aggression % from config (default 0.05% if not set)
             const aggressionPercent = this.bot.config.priceAggressionOffset || 0.05;
             
             // 2. Fetch Real-Time OrderBook from Bot for precision
             const ob = this.bot.getOrderBook(asset);
+            
             // Default to External Price if book is empty (fallback), otherwise use Book
             let basePrice = context.externalPrice; 
             
@@ -129,6 +131,7 @@ class AdvanceStrategy {
                 var executionPrice = basePrice * (1 - (aggressionPercent / 100));
             }
 
+            // 3. Calculate Stop Loss based on the Execution Price
             const slOffset = executionPrice * (this.slPercent / 100);
             const stopLossPrice = side === 'buy' ? (executionPrice - slOffset) : (executionPrice + slOffset);
 
@@ -179,6 +182,7 @@ class AdvanceStrategy {
 
         } catch (error) {
             this.logger.error(`[AdvanceStrategy] ❌ Execution Failed:`, { message: error.message });
+            // If the order fails, we unlock it so it can try again on the next signal
             this.localInPosition = false; 
         } finally {
             this.bot.isOrderInProgress = false;
@@ -187,22 +191,31 @@ class AdvanceStrategy {
 
     // Centralized lock management
     isLockedOut() {
+        // 1. Prevent trade if we locally think we are in a position
         if (this.localInPosition) return true;
+        
+        // 2. Prevent trade if a previous order is literally in flight (HTTP request hasn't returned)
         if (this.bot.isOrderInProgress) return true;
+
+        // 3. Cooldown check
         if (this.lastOrderTime === 0) return false;
         return (Date.now() - this.lastOrderTime) < this.lockDurationMs;
     }
 
+    // [UPDATED] Robust Position Sync to manage the lock
     onPositionUpdate(pos) {
+        // Handle cases where size might be a string "0" or number 0
         const rawSize = (pos && pos.size !== undefined) ? pos.size : 0;
         const size = Math.abs(parseFloat(rawSize));
         
         if (size > 0) {
+            // We are officially in a trade
             if (!this.localInPosition) {
                 this.logger.info(`[AdvanceStrategy] Exchange reports position ACTIVE. Strategy Locked.`);
             }
             this.localInPosition = true;
         } else {
+            // Position is closed, we can unlock for the next trade
             if (this.localInPosition) {
                 this.logger.info(`[AdvanceStrategy] Exchange reports position CLOSED. Strategy Unlocked.`);
             }
@@ -233,4 +246,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-            
+               
