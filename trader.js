@@ -1,12 +1,15 @@
+
 // trader.js
-// v59.0 - [DEBUG] Auth Diagnostics
+// v60.0 - [FIXED] Timestamp as String for V2 Auth
 
 const WebSocket = require('ws');
 const winston = require('winston');
+const crypto = require('crypto'); // Import crypto at top level
 require('dotenv').config();
 
 const DeltaClient = require('./client.js');
 
+// --- Configuration ---
 const config = {
     strategy: process.env.STRATEGY || 'Advance', 
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
@@ -25,6 +28,7 @@ const config = {
     priceAggressionOffset: parseFloat(process.env.PRICE_AGGRESSION_OFFSET || '0.01'),
 };
 
+// --- Logging Setup ---
 const logger = winston.createLogger({
     level: config.logLevel,
     format: winston.format.combine(
@@ -81,7 +85,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v59.0 - Auth Debug) ---`);
+        this.logger.info(`--- Bot Initializing (v60.0 - String Timestamp) ---`);
         await this.syncPositionState();
         await this.initWebSocket();
         this.setupHttpServer();
@@ -99,6 +103,7 @@ class TradingBot {
         }, 25000); 
     }
     
+    // --- WebSocket Heartbeat ---
     startHeartbeat() {
         this.resetHeartbeatTimeout();
         this.pingInterval = setInterval(() => {
@@ -121,6 +126,7 @@ class TradingBot {
         clearInterval(this.pingInterval);
     }
 
+    // --- WebSocket Connection ---
     async initWebSocket() { 
         this.ws = new WebSocket(this.config.wsURL);
         
@@ -136,20 +142,26 @@ class TradingBot {
     }
 
     authenticateWebSocket() {
+        // [FIXED] Timestamp Handling
         const timestampNum = Math.floor(Date.now() / 1000); 
-        const timestampStr = timestampNum.toString();       
+        const timestampStr = timestampNum.toString(); 
         
-        const signature = require('crypto')
+        // 1. Generate Signature
+        const signature = crypto
             .createHmac('sha256', this.config.apiSecret)
             .update('GET' + timestampStr + '/live')
             .digest('hex');
 
+        this.logger.info(`[Auth] Attempting key-auth with timestamp: ${timestampStr}`);
+
+        // 2. Send Auth Payload
+        // IMPORTANT: Sending timestamp as STRING to match Python snippet
         this.ws.send(JSON.stringify({ 
             type: 'key-auth', 
             payload: { 
                 'api-key': this.config.apiKey, 
-                timestamp: timestampNum, 
-                signature 
+                timestamp: timestampStr, 
+                signature: signature 
             }
         }));
     }
@@ -166,13 +178,22 @@ class TradingBot {
     }
 
     handleWebSocketMessage(message) {
-        if (message.type === 'success' && message.message === 'Authenticated') {
-            this.logger.info('WebSocket authenticated. Subscribing...');
+        // [DEBUG] Log all non-trade messages to see Auth response
+        if (message.type !== 'all_trades' && message.type !== 'l1_orderbook' && message.type !== 'pong') {
+            this.logger.info(`[WS Message]: ${JSON.stringify(message)}`);
+        }
+
+        if (message.type === 'success' && (message.message === 'Authenticated' || message.result === true)) {
+            this.logger.info('✅ WebSocket AUTHENTICATED Successfully.');
             this.authenticated = true; 
             this.subscribeToChannels();
             this.startHeartbeat();
             this.syncPositionState(); 
             return;
+        }
+        
+        if (message.type === 'error' && !this.authenticated) {
+            this.logger.error(`❌ Authentication Failed: ${JSON.stringify(message)}`);
         }
 
         if (message.type === 'pong') {
@@ -209,12 +230,6 @@ class TradingBot {
                     }
                 }
                 break;
-            // [DEBUG] Log unknown message types (helps find Auth errors)
-            default:
-                if (!['success', 'subscribe'].includes(message.type)) {
-                    this.logger.info(`[WS DEBUG] Unhandled Msg: ${JSON.stringify(message)}`);
-                }
-                break;
         }
     }
 
@@ -228,12 +243,16 @@ class TradingBot {
     }
 
     async handleSignalMessage(message) {
-        // [DEBUG] Warn if signal arrives but not authenticated
         if (!this.authenticated) {
-            this.logger.warn('Signal received but WebSocket NOT authenticated. Ignored.');
-            return;
+             // [DEBUG] Warn only once every 10s to avoid spam
+             const now = Date.now();
+             if (!this._lastAuthWarn || now - this._lastAuthWarn > 10000) {
+                 this.logger.warn('⚠️ Signal received but Bot is NOT Authenticated yet.');
+                 this._lastAuthWarn = now;
+             }
+             return;
         }
-        
+
         try {
             const data = JSON.parse(message.toString());
             if (data.type === 'S' && data.p) {
