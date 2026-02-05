@@ -1,4 +1,4 @@
-//v25.0
+//v55.0
 
 const WebSocket = require('ws');
 const winston = require('winston');
