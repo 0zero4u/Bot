@@ -35,7 +35,7 @@ class AdvanceStrategy {
         this.lastOrderTime = 0;
         this.position = null; 
         this.entryPrice = 0; 
-        this.slPercent = 0.1; // Increased to 0.6% as discussed for better "breathing room"
+        this.slPercent = 0.3; // Increased to 0.6% as discussed for better "breathing room"
     }
 
     getName() { return "AdvanceStrategy (Hard SL + Avg Fill)"; }
