@@ -1,4 +1,3 @@
-// trader.js
 const WebSocket = require('ws');
 const winston = require('winston');
 const { v4: uuidv4 } = require('uuid');
@@ -22,7 +21,6 @@ const config = {
     reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
     pingIntervalMs: parseInt(process.env.PING_INTERVAL_MS || '30000'),
     heartbeatTimeoutMs: parseInt(process.env.HEARTBEAT_TIMEOUT_MS || '40000'),
-    // Defaulting to 0.01% (Calculated as: Price * 0.01 / 100)
     priceAggressionOffset: parseFloat(process.env.PRICE_AGGRESSION_OFFSET || '0.01'),
 };
 
@@ -76,7 +74,6 @@ class TradingBot {
         this.isStateSynced = false;
         this.pingInterval = null; this.heartbeatTimeout = null;
         
-        // [NEW] REST Keep-Alive Interval Tracker
         this.restKeepAliveInterval = null;
 
         try {
@@ -90,7 +87,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v12.0.2 - Full Sync) ---`);
+        this.logger.info(`--- Bot Initializing (v12.1.0 - Position Fix) ---`);
         this.logger.info(`Strategy: ${this.strategy.getName()}`);
         
         // 1. Check current positions on Delta
@@ -102,13 +99,12 @@ class TradingBot {
         // 3. Start Local WebSocket Server
         this.setupHttpServer();
 
-        // 4. [NEW] Start REST Keep-Alive (25s Loop)
+        // 4. Start REST Keep-Alive (25s Loop)
         this.startRestKeepAlive();
     }
 
     /**
-     * [NEW] Keeps the HTTP/2 connection warm by sending a lightweight request every 25s.
-     * This prevents Load Balancer idle timeouts.
+     * Keeps the HTTP/2 connection warm by sending a lightweight request every 25s.
      */
     startRestKeepAlive() {
         this.logger.info('Starting REST Keep-Alive Loop (25s interval)...');
@@ -117,12 +113,11 @@ class TradingBot {
 
         this.restKeepAliveInterval = setInterval(async () => {
             try {
-                // Using getWalletBalance as the "ping"
                 await this.client.getWalletBalance();
             } catch (error) {
                 this.logger.warn(`[Keep-Alive] Check Failed: ${error.message}`);
             }
-        }, 25000); // 25 seconds
+        }, 25000); 
     }
     
     // --- WebSocket Heartbeat ---
@@ -174,7 +169,6 @@ class TradingBot {
         this.logger.info(`Subscribing to L1 Books: ${symbols.join(', ')}`);
         this.logger.info(`Subscribing to Orders/Positions: ALL (Full Sync)`);
 
-        // [UPDATED] Subscribing to "all" for orders and positions ensures we never miss a state change.
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
@@ -224,11 +218,16 @@ class TradingBot {
         }
     }
 
-    // Helper to process position updates
+    // [FIXED] Properly handle 0 size updates
     handlePositionUpdate(pos) {
-        if (pos.size) {
+        // Check for undefined/null. "if (pos.size)" fails when size is 0
+        if (pos.size !== undefined && pos.size !== null) {
             this.hasOpenPosition = parseFloat(pos.size) !== 0;
-            if (this.strategy.onPositionUpdate) this.strategy.onPositionUpdate(pos);
+            
+            // Pass the update to the strategy so it can unlock 'localInPosition'
+            if (this.strategy.onPositionUpdate) {
+                this.strategy.onPositionUpdate(pos);
+            }
         }
     }
 
@@ -266,13 +265,26 @@ class TradingBot {
         return this.client.placeOrder(orderData);
     }
 
+    // [FIXED] Force strategy sync on startup
     async syncPositionState() {
         try {
             const response = await this.client.getPositions();
             const positions = response.result || [];
-            const hasActive = positions.some(p => parseFloat(p.size) !== 0);
-            this.hasOpenPosition = hasActive;
+            
+            // Find specific position for this product
+            const myPosition = positions.find(p => p.product_id == this.config.productId);
+            
+            // Determine size (default to 0)
+            const currentSize = myPosition ? parseFloat(myPosition.size) : 0;
+            
+            this.hasOpenPosition = currentSize !== 0;
             this.isStateSynced = true;
+
+            // FORCE update strategy so it knows the lock status immediately
+            if (this.strategy.onPositionUpdate) {
+                this.strategy.onPositionUpdate(myPosition || { size: 0 });
+            }
+
             this.logger.info(`Position State Synced. Open Position: ${this.hasOpenPosition}`);
         } catch (error) {
             this.logger.error('Failed to sync position state:', error.message);
@@ -307,4 +319,3 @@ class TradingBot {
         process.exit(1);
     }
 })();
-    
