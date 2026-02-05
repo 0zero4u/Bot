@@ -1,5 +1,5 @@
 // strategies/AdvanceStrategy.js
-// Version 16.0.0 - Atomic Bracket SL (Using MomentumRider Logic)
+// Version 17.0.0 - Duplicate Order Prevention (Local Locking)
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -33,14 +33,19 @@ class AdvanceStrategy {
 
         // --- TRADING STATE ---
         this.lastOrderTime = 0;
-        this.slPercent = 0.3; // Recommended "Sweet Spot" for 50x leverage
+        this.slPercent = 0.15;
+        
+        // [NEW] Local lock to prevent duplicate orders before WebSocket syncs
+        this.localInPosition = false; 
     }
 
-    getName() { return "AdvanceStrategy (Atomic Bracket Fix)"; }
+    getName() { return "AdvanceStrategy (Anti-Duplicate Fix)"; }
 
     async onPriceUpdate(asset, price, source = 'UNKNOWN') {
         const now = Date.now();
         const assetData = this.assets[asset];
+        
+        // 1. Check ALL locks before even calculating gaps
         if (!assetData || this.isLockedOut()) return;
 
         // Populate History
@@ -71,60 +76,76 @@ class AdvanceStrategy {
         let rollingMax = 0.05; 
         for (const item of assetData.gapHistory) { if (item.v > rollingMax) rollingMax = item.v; }
 
+        // TRIGGER
         if (gap > (rollingMax * 1.01)) {
+            // [NEW] DOUBLE CHECK: Check again right before punching
+            if (this.localInPosition) return; 
+
             this.logger.info(`[AdvanceStrategy] ⚡ Trigger: Gap ${gap.toFixed(4)}% > Max ${rollingMax.toFixed(4)}%`);
-            // We pass the current signal price to the executor
             await this.executeTrade(asset, marketStats.direction === 'up' ? 'buy' : 'sell', assetData.deltaId, price);
         }
 
         assetData.gapHistory.push({ t: now, v: gap });
     }
 
-    // --- ATOMIC EXECUTION (MOMENTUM RIDER STYLE) ---
     async executeTrade(asset, side, productId, currentPrice) {
+        // [NEW] Instant lock
+        this.localInPosition = true;
         this.bot.isOrderInProgress = true;
+        
         try {
-            // 1. Calculate SL Price using the proven offset logic
             const slOffset = currentPrice * (this.slPercent / 100);
-            const stopLossPrice = side === 'buy' 
-                ? (currentPrice - slOffset) 
-                : (currentPrice + slOffset);
+            const stopLossPrice = side === 'buy' ? (currentPrice - slOffset) : (currentPrice + slOffset);
 
-            // 2. Prepare Order with ATOMIC Bracket fields
-            // Using the same field names from MomentumRiderStrategy.js
             const orderData = { 
                 product_id: productId.toString(), 
                 size: this.bot.config.orderSize.toString(), 
                 side: side, 
                 order_type: 'market_order',
                 bracket_stop_loss_price: stopLossPrice.toFixed(4),
-                bracket_stop_trigger_method: 'mark_price' // 'mark_price' is usually safer for 50x leverage
+                bracket_stop_trigger_method: 'mark_price'
             };
             
             this.logger.info(`[AdvanceStrategy] 🚀 Punching Order with Atomic SL at ${stopLossPrice.toFixed(4)}`);
             this.lastOrderTime = Date.now();
             
-            const response = await this.bot.placeOrder(orderData);
+            await this.bot.placeOrder(orderData);
+            this.logger.info(`[AdvanceStrategy] ✅ Atomic entry order accepted.`);
 
-            if (response.result || (response.status && response.status === 'success')) {
-                this.logger.info(`[AdvanceStrategy] ✅ Atomic entry order accepted by Delta.`);
-            } else { 
-                throw new Error("Order rejected or unexpected response: " + JSON.stringify(response)); 
-            }
         } catch (error) {
             this.logger.error(`[AdvanceStrategy] ❌ Execution Failed:`, { message: error.message });
+            // If the order fails, we unlock it so it can try again on the next signal
+            this.localInPosition = false; 
         } finally {
             this.bot.isOrderInProgress = false;
         }
     }
 
+    // [MODIFIED] Centralized lock management
     isLockedOut() {
+        // 1. Prevent trade if we locally think we are in a position
+        if (this.localInPosition) return true;
+        
+        // 2. Prevent trade if a previous order is literally in flight (HTTP request hasn't returned)
+        if (this.bot.isOrderInProgress) return true;
+
+        // 3. Cooldown check
         if (this.lastOrderTime === 0) return false;
         return (Date.now() - this.lastOrderTime) < this.lockDurationMs;
     }
 
+    // [NEW] Use Position Sync to manage the lock
     onPositionUpdate(pos) {
-        // Strategy no longer needs to track this for SL as it's exchange-side now
+        const size = Math.abs(parseFloat(pos.size || 0));
+        
+        if (size > 0) {
+            // We are officially in a trade
+            this.localInPosition = true;
+        } else {
+            // Position is closed, we can unlock for the next trade
+            this.localInPosition = false;
+            this.logger.info(`[AdvanceStrategy] Position closed on exchange. Local lock released.`);
+        }
     }
 
     onOrderBookUpdate(symbol, price) {
@@ -150,3 +171,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
+            
