@@ -1,3 +1,6 @@
+// AdvanceStrategy.js
+// v14.3 - [CLEAN] All Trades Logic
+
 class AdvanceStrategy {
     constructor(bot) {
         this.bot = bot;
@@ -34,7 +37,7 @@ class AdvanceStrategy {
         this.localInPosition = false; 
     }
 
-    getName() { return "AdvanceStrategy (Limit IOC + Aggression)"; }
+    getName() { return "AdvanceStrategy (All Trades IOC)"; }
 
     async onPriceUpdate(asset, price, source = 'UNKNOWN') {
         const now = Date.now();
@@ -103,17 +106,15 @@ class AdvanceStrategy {
 
         try {
             const aggressionPercent = this.bot.config.priceAggressionOffset || 0.05;
-            const ob = this.bot.getOrderBook(asset);
             
+            // [REMOVED] L1 fallback logic. 
+            // We strictly use the External (Trigger) Price as the anchor for our aggression.
+            // If Binance moves, we move to match it (plus offset).
             let basePrice = context.externalPrice; 
             
-            if (side === 'buy') {
-                if (ob && ob.asks && ob.asks.length > 0) basePrice = parseFloat(ob.asks[0][0]);
-                var executionPrice = basePrice * (1 + (aggressionPercent / 100));
-            } else {
-                if (ob && ob.bids && ob.bids.length > 0) basePrice = parseFloat(ob.bids[0][0]);
-                var executionPrice = basePrice * (1 - (aggressionPercent / 100));
-            }
+            var executionPrice = side === 'buy' 
+                ? basePrice * (1 + (aggressionPercent / 100))
+                : basePrice * (1 - (aggressionPercent / 100));
 
             const slOffset = executionPrice * (this.slPercent / 100);
             const stopLossPrice = side === 'buy' ? (executionPrice - slOffset) : (executionPrice + slOffset);
@@ -137,33 +138,40 @@ class AdvanceStrategy {
             const apiLatency = apiEnd - apiStart;
             this.lastOrderTime = Date.now();
 
-            this.logger.info(`[AdvanceStrategy] ✅ IOC Order Success.`);
+            if (orderResult && orderResult.success) {
+                this.logger.info(`[AdvanceStrategy] ✅ IOC Order Success.`);
 
-            // --- [FIXED] FORCE LOG TO STRING FOR PM2 ---
-            // We use JSON.stringify() here so Winston's "simple" format prints it correctly
-            const logPayload = JSON.stringify({
-                event: "TRADE_LIFECYCLE",
-                asset: asset,
-                direction: side.toUpperCase(),
-                trigger: {
-                    source: context.externalSource,
-                    ext_price: context.externalPrice,
-                    delta_price: context.deltaPrice,
-                    gap_usd: context.gapUsd.toFixed(4)
-                },
-                execution: {
-                    limit_price: executionPrice.toFixed(4),
-                    aggression: `${aggressionPercent}%`
-                },
-                timing: {
-                    punch_time: new Date(punchStartTime).toISOString(),
-                    api_latency_ms: apiLatency,
-                    total_ms: (apiEnd - punchStartTime)
-                },
-                delta_order_id: orderResult.id
-            }, null, 2); // Indentation for readability
+                const orderId = orderResult.result ? orderResult.result.id : 'UNKNOWN_ID';
 
-            this.logger.info(`\n${logPayload}`); // Add newline for clean look in logs
+                const logPayload = JSON.stringify({
+                    event: "TRADE_LIFECYCLE",
+                    asset: asset,
+                    direction: side.toUpperCase(),
+                    trigger: {
+                        source: context.externalSource,
+                        ext_price: context.externalPrice,
+                        delta_price: context.deltaPrice,
+                        gap_usd: context.gapUsd.toFixed(4)
+                    },
+                    execution: {
+                        limit_price: executionPrice.toFixed(4),
+                        aggression: `${aggressionPercent}%`
+                    },
+                    timing: {
+                        punch_time: new Date(punchStartTime).toISOString(),
+                        api_latency_ms: apiLatency,
+                        total_ms: (apiEnd - punchStartTime)
+                    },
+                    delta_order_id: orderId
+                }, null, 2);
+
+                this.logger.info(`\n${logPayload}`);
+            } else {
+                this.logger.error(`[AdvanceStrategy] ❌ Exchange Error:`, { 
+                    error: orderResult.error || 'Unknown Error' 
+                });
+                this.localInPosition = false; 
+            }
 
         } catch (error) {
             this.logger.error(`[AdvanceStrategy] ❌ Execution Failed:`, { message: error.message });
@@ -197,9 +205,12 @@ class AdvanceStrategy {
         }
     }
 
-    onOrderBookUpdate(symbol, price) {
+    // [NEW] Handles real-time trade feed from Delta
+    onTradeUpdate(symbol, price) {
         const asset = Object.keys(this.assets).find(a => symbol.startsWith(a));
-        if (asset) this.updateHistory(this.assets[asset].deltaHistory, price, Date.now());
+        if (asset) {
+            this.updateHistory(this.assets[asset].deltaHistory, price, Date.now());
+        }
     }
 
     updateHistory(array, p, t) {
