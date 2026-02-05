@@ -90,7 +90,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v12.0.1 - Percentage Offset) ---`);
+        this.logger.info(`--- Bot Initializing (v12.0.2 - Full Sync) ---`);
         this.logger.info(`Strategy: ${this.strategy.getName()}`);
         
         // 1. Check current positions on Delta
@@ -119,8 +119,6 @@ class TradingBot {
             try {
                 // Using getWalletBalance as the "ping"
                 await this.client.getWalletBalance();
-                // Optional debug log:
-                // this.logger.debug('[Keep-Alive] Balance ping sent.');
             } catch (error) {
                 this.logger.warn(`[Keep-Alive] Check Failed: ${error.message}`);
             }
@@ -174,7 +172,9 @@ class TradingBot {
     subscribeToChannels() {
         const symbols = this.targetAssets.map(asset => `${asset}USD`);
         this.logger.info(`Subscribing to L1 Books: ${symbols.join(', ')}`);
+        this.logger.info(`Subscribing to Orders/Positions: ALL (Full Sync)`);
 
+        // [UPDATED] Subscribing to "all" for orders and positions ensures we never miss a state change.
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
@@ -202,9 +202,11 @@ class TradingBot {
                 if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
                 break;
             case 'positions':
-                if (message.size) {
-                    this.hasOpenPosition = parseFloat(message.size) !== 0;
-                    if (this.strategy.onPositionUpdate) this.strategy.onPositionUpdate(message);
+                // Handle both single object updates and array snapshots
+                if (Array.isArray(message.data)) {
+                    message.data.forEach(pos => this.handlePositionUpdate(pos));
+                } else if (message.size !== undefined) {
+                    this.handlePositionUpdate(message);
                 }
                 break;
             case 'l1_orderbook':
@@ -219,6 +221,14 @@ class TradingBot {
                     }
                 }
                 break;
+        }
+    }
+
+    // Helper to process position updates
+    handlePositionUpdate(pos) {
+        if (pos.size) {
+            this.hasOpenPosition = parseFloat(pos.size) !== 0;
+            if (this.strategy.onPositionUpdate) this.strategy.onPositionUpdate(pos);
         }
     }
 
@@ -297,3 +307,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
+    
