@@ -70,11 +70,11 @@ class AdvanceStrategy {
         const cutoff = now - this.windowSizeMs;
         while (assetData.gapHistory.length > 0 && assetData.gapHistory[0].t < cutoff) assetData.gapHistory.shift();
         
-        let rollingMax = 0.4; 
+        let rollingMax = 0.2; 
         for (const item of assetData.gapHistory) { if (item.v > rollingMax) rollingMax = item.v; }
 
         // TRIGGER
-        if (gap > (rollingMax * 1.11)) {
+        if (gap > (rollingMax * 1.3)) {
             // [DOUBLE CHECK] Check again right before punching
             if (this.localInPosition) return; 
 
