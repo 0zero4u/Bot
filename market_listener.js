@@ -1,4 +1,3 @@
-
 const WebSocket = require('ws');
 const winston = require('winston');
 require('dotenv').config();
@@ -7,7 +6,8 @@ const config = {
     internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 80}`,
     reconnectInterval: 5000,
     maxReconnectDelay: 60000,
-    assets: (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',')
+    assets: (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(','),
+    strategy: process.env.STRATEGY || 'Advance' // Read Strategy from Env
 };
 
 // --- LOGGING ---
@@ -49,14 +49,20 @@ function connectToInternal() {
 }
 
 // --- CORE LOGIC (Deduplication & Coalescing) ---
-function sendPrice(asset, price, source) {
+function sendToInternal(payload) {
+    if (internalWs && internalWs.readyState === WebSocket.OPEN) {
+        internalWs.send(JSON.stringify(payload));
+    }
+}
+
+// Buffering specifically for Prices (Trades) to reduce noise
+function bufferPrice(asset, price, source) {
     const key = `${asset}:${source}`;
     const lastPrice = lastPriceCache.get(key);
     
     if (lastPrice === price) return; 
 
     lastPriceCache.set(key, price);
-
     const payload = { type: 'S', s: asset, p: price, x: source };
     updateBuffer.set(key, payload);
 
@@ -95,13 +101,20 @@ function resetReconnectCounter(exchange) {
 }
 
 // ==========================================
-// 1. BINANCE FUTURES LISTENER (USDT)
+// BINANCE FUTURES LISTENER (Smart Switch)
 // ==========================================
 function connectBinance() {
-    const streams = config.assets.map(a => `${a.toLowerCase()}usdt@trade`).join('/');
+    const isFastStrategy = config.strategy.toLowerCase().includes('fast');
+    
+    // SWITCH: Depth5 for FastStrategy, Trade for Advance/others
+    const streamType = isFastStrategy ? 'depth5@100ms' : 'trade';
+    
+    const streams = config.assets.map(a => `${a.toLowerCase()}usdt@${streamType}`).join('/');
     const url = `wss://fstream.binance.com/stream?streams=${streams}`;
     
+    logger.info(`[Binance] Mode: ${isFastStrategy ? '⚡ FAST (Depth)' : '📈 ADVANCE (Trade)'}`);
     logger.info(`[Binance] Connecting to ${url}`);
+    
     binanceWs = new WebSocket(url);
 
     binanceWs.on('open', () => {
@@ -113,13 +126,29 @@ function connectBinance() {
         if (!data) return;
         try {
             const msg = JSON.parse(data);
-            if (!msg.data || msg.data.e !== 'trade') return;
+            if (!msg.data) return;
 
             const rawSymbol = msg.data.s; 
             const asset = rawSymbol.replace('USDT', ''); 
-            const price = parseFloat(msg.data.p);
-            
-            if (price > 0) sendPrice(asset, price, 'BINANCE');
+
+            if (isFastStrategy) {
+                // --- HANDLING DEPTH5 ---
+                if (msg.data.e === 'depthUpdate') {
+                    // Direct Forwarding (No buffering for HFT Depth)
+                    sendToInternal({
+                        type: 'D',          // 'D' for Depth
+                        s: asset,
+                        b: msg.data.b,      // Bids [[price, qty], ...]
+                        a: msg.data.a       // Asks [[price, qty], ...]
+                    });
+                }
+            } else {
+                // --- HANDLING TRADES ---
+                if (msg.data.e === 'trade') {
+                    const price = parseFloat(msg.data.p);
+                    if (price > 0) bufferPrice(asset, price, 'BINANCE');
+                }
+            }
         } catch(e) {}
     });
 
