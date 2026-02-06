@@ -1,11 +1,19 @@
 // AdvanceStrategy.js
-// v15.1 - [FIXED] Warmup Check + [X-RAY] Latency Visualization
+// v16.0 - [HFT] Micro-Burst Sniping (Sub-50ms)
 
 class AdvanceStrategy {
     constructor(bot) {
         this.bot = bot;
         this.logger = bot.logger;
 
+        // Configuration
+        this.BURST_WINDOW_MS = 30;       // Max time window to measure the move
+        this.BURST_THRESHOLD = 0.0004;   // 0.04% Move Trigger
+        this.GAP_THRESHOLD = 0.0003;     // 0.03% Price Gap (External vs Delta)
+        this.DELTA_STALE_MS = 100;       // Max allowed age of Delta price
+        this.LOCK_DURATION_MS = 2000;    // Prevent double-firing on same spike
+
+        // Mapping
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969 },
             'BTC': { deltaId: 27 },
@@ -19,225 +27,178 @@ class AdvanceStrategy {
             if (MASTER_CONFIG[asset]) {
                 this.assets[asset] = {
                     deltaId: MASTER_CONFIG[asset].deltaId,
-                    deltaHistory: [],
-                    gapHistory: [],
-                    sources: {} 
+                    deltaPrice: 0,
+                    deltaLastUpdate: 0,
+                    // "Micro-Buffers" for external sources
+                    // Structure: { 'BINANCE': [{p: 100, t: 123456789}], 'GATE': [...] }
+                    buffers: {} 
                 };
             }
         });
 
-        this.windowSizeMs = 1 * 60 * 1000; // 2 Minutes
-        this.lockDurationMs = 10000;
-        this.isWarmup = true;
-        this.startTime = Date.now();
-
-        // --- TRADING STATE ---
-        this.lastOrderTime = 0;
-        this.slPercent = 0.15; 
-        this.localInPosition = false; 
+        this.lastTriggerTime = 0;
+        this.localInPosition = false;
+        
+        // Trading Params
+        this.slPercent = 0.15;
     }
 
-    getName() { return "AdvanceStrategy (All Trades IOC + X-Ray)"; }
+    getName() { return "SniperStrategy (30ms Micro-Burst)"; }
 
-    // [FIXED] Helper to check warmup status from ANY source
-    checkWarmup() {
-        if (this.isWarmup) {
-            const now = Date.now();
-            if (now - this.startTime > this.windowSizeMs) {
-                this.isWarmup = false;
-                this.logger.info(`[AdvanceStrategy] *** ACTIVE *** (Warmup Complete)`);
-            }
-        }
-    }
-
-    async onPriceUpdate(asset, price, source = 'UNKNOWN') {
-        const now = Date.now();
-        const assetData = this.assets[asset];
-        
-        // 1. Always check warmup timer first
-        this.checkWarmup();
-
-        if (!assetData || this.isLockedOut()) return;
-
-        if (!assetData.sources[source]) assetData.sources[source] = [];
-        this.updateHistory(assetData.sources[source], price, now);
-
-        // 2. Return if still warming up OR not enough data
-        if (this.isWarmup || assetData.sources[source].length < 2 || assetData.deltaHistory.length < 2) return;
-
-        const marketStats = this.calculateSpikeStats(assetData.sources[source], price);
-        const currentDeltaPrice = assetData.deltaHistory[assetData.deltaHistory.length - 1].p;
-        const deltaStats = this.calculateSpikeStats(assetData.deltaHistory, currentDeltaPrice);
-
-        let gap = marketStats.direction === 'up' 
-            ? marketStats.changePct - deltaStats.changePct 
-            : Math.abs(marketStats.changePct) - Math.abs(deltaStats.changePct);
-        
-        if (gap < 0) gap = 0;
-
-        const cutoff = now - this.windowSizeMs;
-        while (assetData.gapHistory.length > 0 && assetData.gapHistory[0].t < cutoff) assetData.gapHistory.shift();
-        
-        let rollingMax = 0.25; 
-        for (const item of assetData.gapHistory) { if (item.v > rollingMax) rollingMax = item.v; }
-
-        if (gap > (rollingMax * 1.11)) {
-            if (this.localInPosition) return; 
-
-            const triggerContext = {
-                externalSource: source,
-                externalPrice: price,
-                deltaPrice: currentDeltaPrice,
-                gapPct: gap,
-                gapUsd: Math.abs(price - currentDeltaPrice),
-                threshold: rollingMax
-            };
-
-            this.logger.info(`[AdvanceStrategy] ⚡ Trigger: Gap ${gap.toFixed(4)}% > Max ${rollingMax.toFixed(4)}%`);
-            
-            await this.executeTrade(
-                asset, 
-                marketStats.direction === 'up' ? 'buy' : 'sell', 
-                assetData.deltaId, 
-                triggerContext
-            );
-        }
-
-        assetData.gapHistory.push({ t: now, v: gap });
-    }
-
-    // [FIXED] Checks warmup here too!
+    // 1. UPDATE INTERNAL PRICE (Delta)
+    // We just store the latest price. No history needed.
     onTradeUpdate(symbol, price) {
-        this.checkWarmup();
         const asset = Object.keys(this.assets).find(a => symbol.startsWith(a));
         if (asset) {
-            this.updateHistory(this.assets[asset].deltaHistory, price, Date.now());
+            this.assets[asset].deltaPrice = price;
+            this.assets[asset].deltaLastUpdate = Date.now();
         }
     }
 
-    async executeTrade(asset, side, productId, context) {
+    // 2. PROCESS EXTERNAL PRICE (The Snipe Logic)
+    async onPriceUpdate(asset, price, source = 'UNKNOWN') {
+        // Fail-fast checks
+        if (this.localInPosition || this.bot.isOrderInProgress) return;
+        
+        const now = Date.now();
+        if (now - this.lastTriggerTime < this.LOCK_DURATION_MS) return;
+
+        const assetData = this.assets[asset];
+        if (!assetData) return;
+
+        // Initialize buffer if new source
+        if (!assetData.buffers[source]) assetData.buffers[source] = [];
+        const buffer = assetData.buffers[source];
+
+        // A. Add new tick
+        buffer.push({ p: price, t: now });
+
+        // B. Prune buffer (Remove ticks older than 30ms)
+        // Since array is sorted by time, we just shift from front. 
+        // Fast operation for small arrays.
+        while (buffer.length > 0 && (now - buffer[0].t > this.BURST_WINDOW_MS)) {
+            buffer.shift();
+        }
+
+        // Need at least 2 ticks to measure a move
+        if (buffer.length < 2) return;
+
+        // C. Calculate Move (High/Low within 30ms window)
+        // We compare Current Price (newest) vs Extremes in the window
+        let minP = buffer[0].p;
+        let maxP = buffer[0].p;
+
+        // Tiny loop (likely < 5 iterations) -> Extremely fast
+        for (let i = 1; i < buffer.length; i++) {
+            if (buffer[i].p < minP) minP = buffer[i].p;
+            if (buffer[i].p > maxP) maxP = buffer[i].p;
+        }
+
+        // D. Check Burst Criteria
+        let direction = null;
+        
+        // Did we pump > 0.04% from the LOW of the last 30ms?
+        if ((price - minP) / minP >= this.BURST_THRESHOLD) {
+            direction = 'buy';
+        }
+        // Did we dump > 0.04% from the HIGH of the last 30ms?
+        else if ((maxP - price) / maxP >= this.BURST_THRESHOLD) {
+            direction = 'sell';
+        }
+
+        if (!direction) return; // No burst detected
+
+        // E. Check Gap vs Delta (Arbitrage Opportunity)
+        // Ensure Delta price is fresh
+        if (now - assetData.deltaLastUpdate > this.DELTA_STALE_MS) {
+            // Optional: Log warning if debugging, otherwise skip to save CPU
+            return; 
+        }
+
+        const deltaP = assetData.deltaPrice;
+        if (deltaP === 0) return;
+
+        let gap = 0;
+        if (direction === 'buy') {
+            // External Pumping, Delta lagging low
+            gap = (price - deltaP) / deltaP;
+        } else {
+            // External Dumping, Delta lagging high
+            gap = (deltaP - price) / deltaP;
+        }
+
+        // F. FIRE TRIGGER
+        if (gap >= this.GAP_THRESHOLD) {
+            this.lastTriggerTime = now;
+            
+            this.logger.info(`[Sniper] 🔫 FIRE: ${asset} ${direction.toUpperCase()} | Burst: 30ms | Gap: ${(gap*100).toFixed(4)}%`);
+            
+            await this.executeSnipe(asset, direction, assetData.deltaId, price, deltaP);
+        }
+    }
+
+    async executeSnipe(asset, side, productId, externalPrice, deltaPrice) {
         this.localInPosition = true;
         this.bot.isOrderInProgress = true;
-        const punchStartTime = Date.now();
 
         try {
+            // Use config aggression, default to 0.05%
             const aggressionPercent = this.bot.config.priceAggressionOffset || 0.05;
-            let basePrice = context.externalPrice; 
             
-            var executionPrice = side === 'buy' 
-                ? basePrice * (1 + (aggressionPercent / 100))
-                : basePrice * (1 - (aggressionPercent / 100));
+            // Calculate Limit Price
+            let limitPrice;
+            if (side === 'buy') {
+                // We want to buy, so we bid slightly higher than market to ensure fill
+                limitPrice = externalPrice * (1 + (aggressionPercent / 100));
+            } else {
+                // We want to sell, so we ask slightly lower
+                limitPrice = externalPrice * (1 - (aggressionPercent / 100));
+            }
 
-            const slOffset = executionPrice * (this.slPercent / 100);
-            const stopLossPrice = side === 'buy' ? (executionPrice - slOffset) : (executionPrice + slOffset);
+            // Calculate Stop Loss
+            const slOffset = limitPrice * (this.slPercent / 100);
+            const stopLossPrice = side === 'buy' 
+                ? (limitPrice - slOffset) 
+                : (limitPrice + slOffset);
 
             const orderData = { 
                 product_id: productId.toString(), 
                 size: this.bot.config.orderSize.toString(), 
                 side: side, 
                 order_type: 'limit_order',              
-                limit_price: executionPrice.toFixed(4), 
-                time_in_force: 'ioc',                   
+                limit_price: limitPrice.toFixed(4), 
+                time_in_force: 'ioc', // Immediate or Cancel (Sniping Mode)                  
                 bracket_stop_loss_price: stopLossPrice.toFixed(4),
                 bracket_stop_trigger_method: 'mark_price' 
             };
             
-            const apiStart = Date.now();
+            const startT = Date.now();
             const orderResult = await this.bot.placeOrder(orderData);
-            const apiEnd = Date.now();
-            
-            const apiLatency = apiEnd - apiStart;
-            this.lastOrderTime = Date.now();
+            const latency = Date.now() - startT;
 
             if (orderResult && orderResult.success) {
-                this.logger.info(`[AdvanceStrategy] ✅ IOC Order Success.`);
-                
-                const orderId = orderResult.result ? orderResult.result.id : 'UNKNOWN_ID';
-
-                // [X-RAY] Extract precise timings from the client's internal metrics
-                const metrics = orderResult._metrics || { dns: 0, tcp: 0, tls: 0, server: 0 };
-
-                const logPayload = JSON.stringify({
-                    event: "TRADE_LIFECYCLE",
-                    asset: asset,
-                    direction: side.toUpperCase(),
-                    trigger: {
-                        source: context.externalSource,
-                        ext_price: context.externalPrice,
-                        delta_price: context.deltaPrice,
-                        gap_usd: context.gapUsd.toFixed(4)
-                    },
-                    execution: {
-                        limit_price: executionPrice.toFixed(4),
-                        aggression: `${aggressionPercent}%`
-                    },
-                    // [NEW] PRECISE LATENCY BREAKDOWN
-                    latency_breakdown: {
-                        "1_dns_lookup": `${metrics.dns.toFixed(2)}ms`,   
-                        "2_tcp_connect": `${metrics.tcp.toFixed(2)}ms`,  
-                        "3_tls_handshake": `${metrics.tls.toFixed(2)}ms`,
-                        "4_network_transit": `${metrics.server.toFixed(2)}ms`, 
-                        "5_total_roundtrip": `${apiLatency.toFixed(2)}ms`
-                    },
-                    delta_order_id: orderId
-                }, null, 2);
-
-                this.logger.info(`\n${logPayload}`);
+                 // [X-RAY LOGGING]
+                 const metrics = orderResult._metrics || { server: 0 };
+                 this.logger.info(`[Sniper] 🎯 HIT ${asset} | Roundtrip: ${latency}ms | Net: ${metrics.server.toFixed(2)}ms`);
             } else {
-                this.logger.error(`[AdvanceStrategy] ❌ Exchange Error:`, { 
-                    error: orderResult.error || 'Unknown Error' 
-                });
+                this.logger.error(`[Sniper] 💨 MISS: ${orderResult.error || 'Unknown'}`);
                 this.localInPosition = false; 
             }
 
         } catch (error) {
-            this.logger.error(`[AdvanceStrategy] ❌ Execution Failed:`, { message: error.message });
+            this.logger.error(`[Sniper] ❌ CRITICAL: ${error.message}`);
             this.localInPosition = false; 
         } finally {
             this.bot.isOrderInProgress = false;
         }
     }
 
-    isLockedOut() {
-        if (this.localInPosition) return true;
-        if (this.bot.isOrderInProgress) return true;
-        if (this.lastOrderTime === 0) return false;
-        return (Date.now() - this.lastOrderTime) < this.lockDurationMs;
-    }
-
+    // Standard position state management
     onPositionUpdate(pos) {
-        const rawSize = (pos && pos.size !== undefined) ? pos.size : 0;
-        const size = Math.abs(parseFloat(rawSize));
-        
-        if (size > 0) {
-            if (!this.localInPosition) {
-                this.logger.info(`[AdvanceStrategy] Exchange reports position ACTIVE. Strategy Locked.`);
-            }
-            this.localInPosition = true;
-        } else {
-            if (this.localInPosition) {
-                this.logger.info(`[AdvanceStrategy] Exchange reports position CLOSED. Strategy Unlocked.`);
-            }
-            this.localInPosition = false;
-        }
-    }
-
-    updateHistory(array, p, t) {
-        array.push({ p, t });
-        const cutoff = t - this.windowSizeMs;
-        while (array.length > 0 && array[0].t < cutoff) array.shift();
-    }
-
-    calculateSpikeStats(history, currentPrice) {
-        let min = Math.min(...history.map(h => h.p));
-        let max = Math.max(...history.map(h => h.p));
-        if (Math.abs(currentPrice - min) > Math.abs(currentPrice - max)) {
-            return { direction: 'up', changePct: ((currentPrice - min) / min) * 100 };
-        } else {
-            return { direction: 'down', changePct: -((max - currentPrice) / max) * 100 };
-        }
+        const size = (pos && pos.size) ? parseFloat(pos.size) : 0;
+        this.localInPosition = size !== 0;
     }
 }
 
 module.exports = AdvanceStrategy;
-                
+                    
