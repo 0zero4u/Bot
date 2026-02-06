@@ -1,5 +1,5 @@
 // AdvanceStrategy.js
-// v14.4 - [FIXED] Warmup Check on All Updates
+// v15.1 - [FIXED] Warmup Check + [X-RAY] Latency Visualization
 
 class AdvanceStrategy {
     constructor(bot) {
@@ -37,9 +37,9 @@ class AdvanceStrategy {
         this.localInPosition = false; 
     }
 
-    getName() { return "AdvanceStrategy (All Trades IOC)"; }
+    getName() { return "AdvanceStrategy (All Trades IOC + X-Ray)"; }
 
-    // [NEW] Helper to check warmup status from ANY source
+    // [FIXED] Helper to check warmup status from ANY source
     checkWarmup() {
         if (this.isWarmup) {
             const now = Date.now();
@@ -106,11 +106,9 @@ class AdvanceStrategy {
         assetData.gapHistory.push({ t: now, v: gap });
     }
 
-    // [UPDATED] Now checks warmup too
+    // [FIXED] Checks warmup here too!
     onTradeUpdate(symbol, price) {
-        // 1. Check warmup here too!
         this.checkWarmup();
-
         const asset = Object.keys(this.assets).find(a => symbol.startsWith(a));
         if (asset) {
             this.updateHistory(this.assets[asset].deltaHistory, price, Date.now());
@@ -153,7 +151,11 @@ class AdvanceStrategy {
 
             if (orderResult && orderResult.success) {
                 this.logger.info(`[AdvanceStrategy] ✅ IOC Order Success.`);
+                
                 const orderId = orderResult.result ? orderResult.result.id : 'UNKNOWN_ID';
+
+                // [X-RAY] Extract precise timings from the client's internal metrics
+                const metrics = orderResult._metrics || { dns: 0, tcp: 0, tls: 0, server: 0 };
 
                 const logPayload = JSON.stringify({
                     event: "TRADE_LIFECYCLE",
@@ -169,10 +171,13 @@ class AdvanceStrategy {
                         limit_price: executionPrice.toFixed(4),
                         aggression: `${aggressionPercent}%`
                     },
-                    timing: {
-                        punch_time: new Date(punchStartTime).toISOString(),
-                        api_latency_ms: apiLatency,
-                        total_ms: (apiEnd - punchStartTime)
+                    // [NEW] PRECISE LATENCY BREAKDOWN
+                    latency_breakdown: {
+                        "1_dns_lookup": `${metrics.dns.toFixed(2)}ms`,   
+                        "2_tcp_connect": `${metrics.tcp.toFixed(2)}ms`,  
+                        "3_tls_handshake": `${metrics.tls.toFixed(2)}ms`,
+                        "4_network_transit": `${metrics.server.toFixed(2)}ms`, 
+                        "5_total_roundtrip": `${apiLatency.toFixed(2)}ms`
                     },
                     delta_order_id: orderId
                 }, null, 2);
@@ -235,4 +240,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-                    
+                
