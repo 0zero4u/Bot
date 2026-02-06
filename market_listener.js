@@ -3,7 +3,7 @@ const winston = require('winston');
 require('dotenv').config();
 
 const config = {
-    internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
+    internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 80}`,
     reconnectInterval: 5000,
     maxReconnectDelay: 60000,
     assets: (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',')
