@@ -1,5 +1,5 @@
 // client.js
-// Version 14.1.0 - [FIXED] Stability Restore + OS Cache Warming
+// Version 15.0.0 - [X-RAY] Granular Latency Logging
 
 const got = require('got');
 const crypto = require('crypto');
@@ -14,69 +14,45 @@ class DeltaClient {
     #dnsTimer;
 
     constructor(apiKey, apiSecret, baseURL, logger) {
-        if (!apiKey || !apiSecret || !baseURL || !logger) {
-            throw new Error('DeltaClient requires apiKey, apiSecret, baseURL and logger');
-        }
         this.#apiKey = apiKey;
         this.#apiSecret = apiSecret;
         this.#logger = logger;
 
-        // --- 1. OS CACHE WARMING (Safe Mode) ---
-        // Instead of overriding the agent's lookup (which caused the crash),
-        // we force the OS to refresh its DNS cache every 30 seconds.
-        // This ensures the main request always hits a "warm" OS cache (0ms latency).
-        
+        // --- 1. OS CACHE WARMING ---
         try {
             const hostname = new URL(baseURL).hostname;
-            // Run immediately
             this.#warmDNS(hostname);
-            // Run every 30s (Beat the 60s TTL safely)
             this.#dnsTimer = setInterval(() => this.#warmDNS(hostname), 30000);
         } catch (e) {
             this.#logger.warn(`[DeltaClient] DNS Warming setup failed: ${e.message}`);
         }
 
-        // --- 2. OPTIMIZED HTTPS AGENT ---
+        // --- 2. OPTIMIZED AGENT ---
         const httpsAgent = new https.Agent({
-            keepAlive: true,             // Reuse TCP connection (Critical)
-            keepAliveMsecs: 1000,        // Send Keep-Alive packets every 1s
-            maxSockets: 64,              // Allow high concurrency
-            maxFreeSockets: 16,          // Keep 16 hot connections ready
-            scheduling: 'lifo',          // Use the most recently used socket (Lowest Latency)
-            timeout: 15000               // Socket timeout
+            keepAlive: true,
+            keepAliveMsecs: 1000,
+            maxSockets: 64,
+            maxFreeSockets: 16,
+            scheduling: 'lifo',
+            timeout: 15000
         });
 
-        // --- 3. GOT CLIENT CONFIGURATION ---
         this.#client = got.extend({
             prefixUrl: baseURL,
-            http2: false,                // DISABLED (Stability)
-            agent: {
-                https: httpsAgent        // Use optimized agent
-            },
-            timeout: { 
-                request: 10000,          // 10s Request timeout
-                connect: 2000            // Fast fail on connection (2s)
-            },
-            retry: { limit: 0 },         // Zero retries (Fail Fast)
+            http2: false,
+            agent: { https: httpsAgent },
+            timeout: { request: 10000, connect: 2000 },
+            retry: { limit: 0 },
             headers: {
-                'User-Agent': 'nodejs-delta-opt-v14.1',
+                'User-Agent': 'nodejs-delta-xray',
                 'Accept': 'application/json',
                 'Connection': 'keep-alive' 
             }
         });
     }
 
-    // Background function to keep OS DNS Cache fresh
     #warmDNS(hostname) {
-        dns.lookup(hostname, { family: 4 }, (err, address) => {
-            if (err) {
-                // Just warn, don't crash. The main request will retry lookup.
-                // this.#logger.warn(`[DNS] Warming Failed: ${err.message}`); 
-            } else {
-                // Optional: Log purely for confirmation, or disable to reduce noise
-                // this.#logger.info(`[DNS] Cache Warmed: ${hostname} -> ${address}`);
-            }
-        });
+        dns.lookup(hostname, { family: 4 }, (err, address) => { });
     }
 
     async #request(method, path, data = null, query = null) {
@@ -104,40 +80,38 @@ class DeltaClient {
                 responseType: 'json'
             });
 
+            // [X-RAY] Extract precise timings from the response
+            const timings = response.timings;
+            
+            // Attach timings to the body so Strategy can log them
+            // We use a non-enumerable property to avoid breaking normal usage
+            if (response.body && typeof response.body === 'object') {
+                Object.defineProperty(response.body, '_metrics', {
+                    value: {
+                        dns: timings.phases.dns,      // Should be ~0ms
+                        tcp: timings.phases.tcp,      // Should be ~0ms
+                        tls: timings.phases.tls,      // Should be ~0ms
+                        server: timings.phases.total  // Total Request time
+                    },
+                    enumerable: false
+                });
+            }
+
             return response.body;
         } catch (err) {
             const status = err.response?.statusCode;
             const responseData = err.response?.body;
-            
             if (status !== 400 && status !== 404) {
-                this.#logger.error(
-                    `[DeltaClient] ${method} ${path} FAILED (Status: ${status}).`, 
-                    { error: responseData || err.message }
-                );
+                this.#logger.error(`[DeltaClient] Request Failed: ${err.message}`);
             }
             throw err; 
         }
     }
 
-    // --- ORDER MANAGEMENT ---
-
-    placeOrder(payload) {
-        return this.#request('POST', '/v2/orders', payload);
-    }
-    
-    getPositions() {
-        return this.#request('GET', '/v2/positions/margined');
-    }
-
-    getLiveOrders(productId, opts = {}) {
-        const query = { product_id: productId, states: opts.states || 'open,pending' };
-        return this.#request('GET', '/v2/orders', null, query);
-    }
-
-    getWalletBalance() {
-        return this.#request('GET', '/v2/wallet/balances');
-    }
+    placeOrder(payload) { return this.#request('POST', '/v2/orders', payload); }
+    getPositions() { return this.#request('GET', '/v2/positions/margined'); }
+    getLiveOrders(productId, opts = {}) { return this.#request('GET', '/v2/orders', null, {}); }
+    getWalletBalance() { return this.#request('GET', '/v2/wallet/balances'); }
 }
 
 module.exports = DeltaClient;
-    
