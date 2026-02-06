@@ -1,15 +1,18 @@
 // client.js
-// Version 13.2.0 - [FIXED] HTTP/1.1 Fallback (Stability)
+// Version 14.0.0 - Final Low Latency (HTTP/1.1 + KeepAlive + Active DNS Cache)
 
 const got = require('got');
 const crypto = require('crypto');
-const http2 = require('http2-wrapper');
+const https = require('https');
+const dns = require('dns');
 
 class DeltaClient {
     #apiKey;
     #apiSecret;
     #client;
     #logger;
+    #dnsCache;
+    #dnsTimer;
 
     constructor(apiKey, apiSecret, baseURL, logger) {
         if (!apiKey || !apiSecret || !baseURL || !logger) {
@@ -19,30 +22,70 @@ class DeltaClient {
         this.#apiSecret = apiSecret;
         this.#logger = logger;
 
-        // --- HTTP Agent ---
-        // Using standard agent for HTTP/1.1 reliability
-        const agent = {
-            http2: new http2.Agent({
-                keepAlive: true,
-                keepAliveMsecs: 1000,
-                maxSockets: 32,
-                timeout: 5000
-            })
-        };
+        // --- 1. ACTIVE DNS CACHING ---
+        // Prevents the 79ms lookup spike by caching the IP and refreshing it 
+        // in the background *before* the 60s TTL expires.
+        this.#dnsCache = { ip: null, family: 4 };
+        
+        // Extract hostname for DNS lookup (remove https://)
+        const hostname = new URL(baseURL).hostname;
+        
+        // Initial Lookup & Start Refresh Loop (Every 45s to beat 60s TTL)
+        this.#refreshDNS(hostname);
+        this.#dnsTimer = setInterval(() => this.#refreshDNS(hostname), 45000);
 
+        // --- 2. OPTIMIZED HTTPS AGENT ---
+        // Tailored for high-frequency small-packet transmission
+        const httpsAgent = new https.Agent({
+            keepAlive: true,             // Reuse TCP connection (Critical)
+            keepAliveMsecs: 1000,        // Send Keep-Alive packets every 1s
+            maxSockets: 64,              // Allow high concurrency
+            maxFreeSockets: 16,          // Keep 16 hot connections ready
+            scheduling: 'lifo',          // Use the most recently used socket (Lowest Latency)
+            timeout: 15000,              // Socket timeout
+            
+            // Custom Lookup to use our Cache
+            lookup: (host, options, callback) => {
+                if (host === hostname && this.#dnsCache.ip) {
+                    // Instant return from cache (0ms latency)
+                    return callback(null, this.#dnsCache.ip, this.#dnsCache.family);
+                }
+                // Fallback to OS lookup if cache empty
+                dns.lookup(host, options, callback);
+            }
+        });
+
+        // --- 3. GOT CLIENT CONFIGURATION ---
         this.#client = got.extend({
             prefixUrl: baseURL,
-            // [FIXED] Set to false to prevent HTTP/2 handshake timeouts
-            http2: false, 
-            agent: agent,
-            timeout: { 
-                request: 10000, // Increased timeout for stability
-                connect: 5000 
+            http2: false,                // DISABLED (Stability wins over complexity)
+            agent: {
+                https: httpsAgent        // Explicitly use our optimized agent
             },
-            retry: { limit: 2 },
+            timeout: { 
+                request: 10000,          // 10s Request timeout
+                connect: 2000            // Fast fail on connection (2s)
+            },
+            retry: { limit: 0 },         // Zero retries (Fail Fast strategy)
             headers: {
-                'User-Agent': 'nodejs-delta',
-                'Accept': 'application/json'
+                'User-Agent': 'nodejs-delta-opt-v14',
+                'Accept': 'application/json',
+                'Connection': 'keep-alive' 
+            }
+        });
+    }
+
+    // Background DNS Refresher
+    #refreshDNS(hostname) {
+        dns.lookup(hostname, { family: 4 }, (err, address, family) => {
+            if (!err && address) {
+                // Only update if changed to avoid noise, but typically CloudFront IPs rotate
+                if (this.#dnsCache.ip !== address) {
+                    this.#dnsCache = { ip: address, family };
+                    this.#logger.info(`[DNS] Active Cache Updated: ${hostname} -> ${address}`);
+                }
+            } else if (err) {
+                this.#logger.warn(`[DNS] Background Refresh Failed: ${err.message}`);
             }
         });
     }
@@ -71,10 +114,13 @@ class DeltaClient {
                 headers: headers,
                 responseType: 'json'
             });
+
             return response.body;
         } catch (err) {
             const status = err.response?.statusCode;
             const responseData = err.response?.body;
+            
+            // Log real errors, ignore standard 400/404s to keep logs clean
             if (status !== 400 && status !== 404) {
                 this.#logger.error(
                     `[DeltaClient] ${method} ${path} FAILED (Status: ${status}).`, 
@@ -88,6 +134,7 @@ class DeltaClient {
     // --- ORDER MANAGEMENT ---
 
     placeOrder(payload) {
+        // [LATENCY CRITICAL] This uses the hot socket + cached DNS
         return this.#request('POST', '/v2/orders', payload);
     }
     
@@ -106,4 +153,3 @@ class DeltaClient {
 }
 
 module.exports = DeltaClient;
-            
