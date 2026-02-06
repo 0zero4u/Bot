@@ -1,5 +1,5 @@
 // trader.js
-// v62.0 - [FIXED] Auth Response Handling & Deep Debug
+// v62.1 - [INTEGRATION] Depth5 Support & Signal Routing
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -87,7 +87,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v62.0 - Auth Response Fix) ---`);
+        this.logger.info(`--- Bot Initializing (v62.1 - Depth Support) ---`);
         await this.syncPositionState();
         await this.initWebSocket();
         this.setupHttpServer();
@@ -145,11 +145,9 @@ class TradingBot {
     }
 
     authenticateWebSocket() {
-        // [DEBUG] Capture time exactly
         const timestampNum = Math.floor(Date.now() / 1000); 
         const timestampStr = timestampNum.toString(); 
         
-        // 1. Generate Signature
         const signatureData = 'GET' + timestampStr + '/live';
         const signature = crypto
             .createHmac('sha256', this.config.apiSecret)
@@ -157,10 +155,7 @@ class TradingBot {
             .digest('hex');
 
         this.logger.info(`[Auth Debug] Timestamp: ${timestampStr}`);
-        this.logger.info(`[Auth Debug] Pre-Hash String: "${signatureData}"`);
-        this.logger.info(`[Auth Debug] Signature: ${signature}`);
 
-        // 2. Send Auth Payload
         const payload = { 
             type: 'key-auth', 
             payload: { 
@@ -170,7 +165,6 @@ class TradingBot {
             }
         };
 
-        this.logger.info(`[Auth Debug] Sending Payload: ${JSON.stringify(payload)}`);
         this.ws.send(JSON.stringify(payload));
     }
 
@@ -186,13 +180,6 @@ class TradingBot {
     }
 
     handleWebSocketMessage(message) {
-        // [DEBUG] LOG EVERYTHING until authenticated
-        if (!this.authenticated) {
-            this.logger.info(`[WS RAW]: ${JSON.stringify(message)}`);
-        }
-
-        // [FIXED] Updated Success Check for V2 'key-auth' response
-        // Accepts: { type: 'success', message: 'Authenticated' } OR { type: 'key-auth', status: 'authenticated' }
         if (
             (message.type === 'success' && message.message === 'Authenticated') || 
             (message.type === 'key-auth' && message.status === 'authenticated') ||
@@ -206,10 +193,8 @@ class TradingBot {
             return;
         }
         
-        // Handle Error
         if (message.type === 'error' && !this.authenticated) {
             this.logger.error(`❌ AUTH FAILED. Error Code: ${message.error ? message.error.code : 'Unknown'}`);
-            this.logger.error(`❌ Message: ${message.message}`);
         }
 
         if (message.type === 'pong') {
@@ -270,6 +255,8 @@ class TradingBot {
 
         try {
             const data = JSON.parse(message.toString());
+            
+            // TYPE 'S': Standard Price Signal (AdvanceStrategy)
             if (data.type === 'S' && data.p) {
                 const asset = data.s || 'BTC'; 
                 const price = parseFloat(data.p);
@@ -277,6 +264,16 @@ class TradingBot {
                 if (this.targetAssets.includes(asset)) {
                     if (this.strategy.onPriceUpdate) {
                         await this.strategy.onPriceUpdate(asset, price, source);
+                    }
+                }
+            }
+            // TYPE 'D': Depth Update (FastStrategy)
+            else if (data.type === 'D' && data.b && data.a) {
+                const asset = data.s || 'BTC';
+                const depth = { bids: data.b, asks: data.a };
+                if (this.targetAssets.includes(asset)) {
+                    if (this.strategy.onDepthUpdate) {
+                        await this.strategy.onDepthUpdate(asset, depth);
                     }
                 }
             }
@@ -321,10 +318,6 @@ class TradingBot {
         }
     }
     
-    registerPendingOrder(clientOrderId) { }
-    confirmRegisteredOrder(clientOrderId, orderResult) { }
-    cancelPendingOrder(clientOrderId) { }
-
     handleOrderUpdate(orderUpdate) {
         if (orderUpdate.state === 'filled') {
             this.logger.info(`[Trader] Order ${orderUpdate.id} FILLED on Delta.`);
@@ -345,4 +338,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                                    
+            
