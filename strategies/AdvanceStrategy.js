@@ -8,8 +8,8 @@ class AdvanceStrategy {
 
         // Configuration
         this.BURST_WINDOW_MS = 50;       // Max time window to measure the move
-        this.BURST_THRESHOLD = 0.0004;   // 0.04% Move Trigger
-        this.GAP_THRESHOLD = 0.0003;     // 0.03% Price Gap (External vs Delta)
+        this.BURST_THRESHOLD = 0.0003;   // 0.04% Move Trigger
+        this.GAP_THRESHOLD = 0.0002;     // 0.03% Price Gap (External vs Delta)
         this.DELTA_STALE_MS = 100;       // Max allowed age of Delta price
         this.LOCK_DURATION_MS = 2000;    // Prevent double-firing on same spike
 
