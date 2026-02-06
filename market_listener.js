@@ -1,3 +1,4 @@
+
 const WebSocket = require('ws');
 const winston = require('winston');
 require('dotenv').config();
@@ -22,10 +23,9 @@ const logger = winston.createLogger({
 // Connection references
 let internalWs = null;
 let binanceWs = null;
-let gateWs = null;
 
 // Reconnection tracking
-const reconnectAttempts = { BINANCE: 0, GATE: 0 };
+const reconnectAttempts = { BINANCE: 0 };
 
 // --- OPTIMIZATION STATE ---
 const lastPriceCache = new Map(); 
@@ -132,72 +132,16 @@ function connectBinance() {
 }
 
 // ==========================================
-// 2. GATE.IO (FUTURES) LISTENER (USDT)
-// ==========================================
-function connectGate() {
-    const url = 'wss://fx-ws.gateio.ws/v4/ws/usdt';
-    logger.info(`[Gate.io] Connecting to ${url}`);
-    gateWs = new WebSocket(url);
-
-    gateWs.on('open', () => {
-        logger.info('[Gate.io] ✓ Connected.');
-        resetReconnectCounter('GATE');
-        
-        // Subscribe to futures.trades
-        const symbols = config.assets.map(a => `${a}_USDT`);
-        const subMessage = {
-            time: Math.floor(Date.now() / 1000),
-            channel: 'futures.trades',
-            event: 'subscribe',
-            payload: symbols
-        };
-
-        logger.info(`[Gate.io] Subscribing: ${JSON.stringify(subMessage.payload)}`);
-        gateWs.send(JSON.stringify(subMessage));
-    });
-
-    // Gate.io Server sends a "Ping" (OpCode 0x9) ~every 30s.
-    // The 'ws' library automatically replies with "Pong" (OpCode 0xA).
-    // We listen to 'ping' just to confirm the connection is alive.
-    gateWs.on('ping', () => {
-        // logger.debug('[Gate.io] Received Server Ping (Auto-Pong sent)');
-    });
-
-    gateWs.on('message', (data) => {
-        try {
-            const msg = JSON.parse(data.toString());
-            
-            if (msg.event === 'update' && msg.channel === 'futures.trades' && Array.isArray(msg.result) && msg.result.length > 0) {
-                const trade = msg.result[msg.result.length - 1];
-                if (trade && trade.contract && trade.price) {
-                    const asset = trade.contract.split('_')[0]; 
-                    const price = parseFloat(trade.price);
-                    if (price > 0) sendPrice(asset, price, 'GATE');
-                }
-            }
-        } catch (e) {}
-    });
-
-    gateWs.on('close', () => {
-        logger.warn('[Gate.io] ✗ Connection closed.');
-        reconnectWithBackoff('GATE', connectGate);
-    });
-    
-    gateWs.on('error', (e) => logger.error(`[Gate.io] Error: ${e.message}`));
-}
-
-// ==========================================
 // HEALTH & SHUTDOWN
 // ==========================================
 function monitorConnections() {
     setInterval(() => {
         const status = {
             internal: internalWs?.readyState === WebSocket.OPEN,
-            binance: binanceWs?.readyState === WebSocket.OPEN,
-            gate: gateWs?.readyState === WebSocket.OPEN
+            binance: binanceWs?.readyState === WebSocket.OPEN
         };
         const connected = Object.values(status).filter(v => v).length;
-        logger.info(`📊 Health: ${connected}/3 active | Buffer Size: ${updateBuffer.size}`);
+        logger.info(`📊 Health: ${connected}/2 active | Buffer Size: ${updateBuffer.size}`);
         
         if (!status.internal) logger.error('🚨 Internal Bot WS DOWN');
     }, 60000);
@@ -205,7 +149,7 @@ function monitorConnections() {
 
 function gracefulShutdown() {
     logger.info('🛑 Shutting down...');
-    [internalWs, binanceWs, gateWs].forEach(ws => {
+    [internalWs, binanceWs].forEach(ws => {
         if (ws && ws.readyState === WebSocket.OPEN) ws.close();
     });
     setTimeout(() => process.exit(0), 1000);
@@ -218,5 +162,4 @@ process.on('uncaughtException', (err) => logger.error(`💥 Uncaught: ${err.mess
 // START
 connectToInternal();
 connectBinance();
-connectGate();
 setTimeout(monitorConnections, 10000);
