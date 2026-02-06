@@ -11,7 +11,7 @@ const DeltaClient = require('./client.js');
 // --- Configuration ---
 const config = {
     strategy: process.env.STRATEGY || 'Advance', 
-    port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
+    port: parseInt(process.env.INTERNAL_WS_PORT || '80'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
