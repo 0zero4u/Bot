@@ -1,17 +1,15 @@
 // client.js
-// Version 14.1.0 - [FIXED] Stability Restore + OS Cache Warming
+// Version 13.2.0 - [FIXED] HTTP/1.1 Fallback (Stability)
 
 const got = require('got');
 const crypto = require('crypto');
-const https = require('https');
-const dns = require('dns');
+const http2 = require('http2-wrapper');
 
 class DeltaClient {
     #apiKey;
     #apiSecret;
     #client;
     #logger;
-    #dnsTimer;
 
     constructor(apiKey, apiSecret, baseURL, logger) {
         if (!apiKey || !apiSecret || !baseURL || !logger) {
@@ -21,60 +19,30 @@ class DeltaClient {
         this.#apiSecret = apiSecret;
         this.#logger = logger;
 
-        // --- 1. OS CACHE WARMING (Safe Mode) ---
-        // Instead of overriding the agent's lookup (which caused the crash),
-        // we force the OS to refresh its DNS cache every 30 seconds.
-        // This ensures the main request always hits a "warm" OS cache (0ms latency).
-        
-        try {
-            const hostname = new URL(baseURL).hostname;
-            // Run immediately
-            this.#warmDNS(hostname);
-            // Run every 30s (Beat the 60s TTL safely)
-            this.#dnsTimer = setInterval(() => this.#warmDNS(hostname), 30000);
-        } catch (e) {
-            this.#logger.warn(`[DeltaClient] DNS Warming setup failed: ${e.message}`);
-        }
+        // --- HTTP Agent ---
+        // Using standard agent for HTTP/1.1 reliability
+        const agent = {
+            http2: new http2.Agent({
+                keepAlive: true,
+                keepAliveMsecs: 1000,
+                maxSockets: 32,
+                timeout: 5000
+            })
+        };
 
-        // --- 2. OPTIMIZED HTTPS AGENT ---
-        const httpsAgent = new https.Agent({
-            keepAlive: true,             // Reuse TCP connection (Critical)
-            keepAliveMsecs: 1000,        // Send Keep-Alive packets every 1s
-            maxSockets: 64,              // Allow high concurrency
-            maxFreeSockets: 16,          // Keep 16 hot connections ready
-            scheduling: 'lifo',          // Use the most recently used socket (Lowest Latency)
-            timeout: 15000               // Socket timeout
-        });
-
-        // --- 3. GOT CLIENT CONFIGURATION ---
         this.#client = got.extend({
             prefixUrl: baseURL,
-            http2: false,                // DISABLED (Stability)
-            agent: {
-                https: httpsAgent        // Use optimized agent
-            },
+            // [FIXED] Set to false to prevent HTTP/2 handshake timeouts
+            http2: false, 
+            agent: agent,
             timeout: { 
-                request: 10000,          // 10s Request timeout
-                connect: 2000            // Fast fail on connection (2s)
+                request: 10000, // Increased timeout for stability
+                connect: 5000 
             },
-            retry: { limit: 0 },         // Zero retries (Fail Fast)
+            retry: { limit: 2 },
             headers: {
-                'User-Agent': 'nodejs-delta-opt-v14.1',
-                'Accept': 'application/json',
-                'Connection': 'keep-alive' 
-            }
-        });
-    }
-
-    // Background function to keep OS DNS Cache fresh
-    #warmDNS(hostname) {
-        dns.lookup(hostname, { family: 4 }, (err, address) => {
-            if (err) {
-                // Just warn, don't crash. The main request will retry lookup.
-                // this.#logger.warn(`[DNS] Warming Failed: ${err.message}`); 
-            } else {
-                // Optional: Log purely for confirmation, or disable to reduce noise
-                // this.#logger.info(`[DNS] Cache Warmed: ${hostname} -> ${address}`);
+                'User-Agent': 'nodejs-delta',
+                'Accept': 'application/json'
             }
         });
     }
@@ -103,12 +71,10 @@ class DeltaClient {
                 headers: headers,
                 responseType: 'json'
             });
-
             return response.body;
         } catch (err) {
             const status = err.response?.statusCode;
             const responseData = err.response?.body;
-            
             if (status !== 400 && status !== 404) {
                 this.#logger.error(
                     `[DeltaClient] ${method} ${path} FAILED (Status: ${status}).`, 
