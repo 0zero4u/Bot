@@ -26,7 +26,7 @@ class AdvanceStrategy {
             }
         });
 
-        this.windowSizeMs = 2 * 60 * 1000; // 2 Minutes
+        this.windowSizeMs = 1 * 60 * 1000; // 2 Minutes
         this.lockDurationMs = 10000;
         this.isWarmup = true;
         this.startTime = Date.now();
@@ -78,7 +78,7 @@ class AdvanceStrategy {
         const cutoff = now - this.windowSizeMs;
         while (assetData.gapHistory.length > 0 && assetData.gapHistory[0].t < cutoff) assetData.gapHistory.shift();
         
-        let rollingMax = 0.1; 
+        let rollingMax = 0.07; 
         for (const item of assetData.gapHistory) { if (item.v > rollingMax) rollingMax = item.v; }
 
         if (gap > (rollingMax * 1.11)) {
