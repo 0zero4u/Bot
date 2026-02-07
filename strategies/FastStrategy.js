@@ -17,7 +17,7 @@ class FastStrategy {
         this.LOCK_DURATION_MS = 2000; // Cooldown between signals to prevent spam
         
         // --- EXIT CONFIGURATION ---
-        this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '2'); 
+        this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '5'); 
         this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '60'); 
         this.TRAILING_DIP_TICKS = 100;   
         this.slPercent = 0.15;         
