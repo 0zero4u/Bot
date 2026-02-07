@@ -1,5 +1,5 @@
 // FastStrategy.js
-// v6.1.0 - [VIP-0ms] Volume-Filtered Pulls | Tick-Based Deltas | Configurable Weights
+// v6.2.0 - [PROD] VAMP-Effective | VIP-0ms Filters | Predictive Weights | State Recovery
 
 class FastStrategy {
     constructor(bot) {
@@ -7,30 +7,32 @@ class FastStrategy {
         this.logger = bot.logger;
 
         // --- CORE STRATEGY CONFIG ---
-        this.OBI_WINDOW = parseInt(process.env.OBI_WINDOW || '500'); // Increased for 0ms stability
+        // Increase OBI_WINDOW for stability with 0ms firehose data
+        this.OBI_WINDOW = parseInt(process.env.OBI_WINDOW || '500'); 
         this.LOG_FREQ_MS = 5000;
         
         // --- TIERED ENTRY THRESHOLDS ---
-        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '80');
+        // 74-84: Limit Order | 85+: Aggressive Market Order
+        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '74');
         this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '85');
-        
         this.LOCK_DURATION_MS = 2000; 
         
-        // --- 0ms VIP FILTERS ---
-        // Minimum quantity change to count as a "Real Pull" (Noise Reduction)
-        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '1.05'); 
+        // --- VIP 0ms FILTERS (Noise Reduction) ---
+        // Ignore small "dust" cancellations to prevent fake signals
+        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '0.05'); 
 
-        // --- CONFIGURABLE WEIGHTS (Sum should be 100) ---
+        // --- PREDICTIVE SCORING WEIGHTS ---
+        // Boosted Gate 4 (Liquidity Pull) as it is the most predictive
         this.WEIGHTS = {
-            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '40'),
-            GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '10'),
-            GATE3_SHIFT: parseInt(process.env.W_SHIFT || '20'),
-            GATE4_PULL: parseInt(process.env.W_PULL || '30') // Predictive Heavy for VIP
+            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '25'), // Baseline Pressure
+            GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '10'), // Lagging Velocity
+            GATE3_SHIFT: parseInt(process.env.W_SHIFT || '20'),    // Reactive Gravity
+            GATE4_PULL: parseInt(process.env.W_PULL || '45')      // PREDICTIVE INTENT
         };
         
         // --- EXIT CONFIGURATION ---
         this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '0'); 
-        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '75'); 
+        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '65'); 
         this.TRAILING_DIP_TICKS = 100;   
         this.slPercent = 0.15;         
 
@@ -58,7 +60,7 @@ class FastStrategy {
         this.isOrderInProgress = false;
     }
 
-    getName() { return "FastStrategy (VIP-v6.1)"; }
+    getName() { return "FastStrategy (VIP-v6.2)"; }
 
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
@@ -67,7 +69,7 @@ class FastStrategy {
         const now = Date.now();
 
         try {
-            // --- 1. DATA PROCESSING (VAMP-Effective) ---
+            // --- 1. VAMP-EFFECTIVE MATH ---
             let totalBidQty = 0, totalAskQty = 0;
             let sumBidPQ = 0, sumAskPQ = 0;         
 
@@ -78,12 +80,13 @@ class FastStrategy {
                 sumBidPQ += (bP * bQ); sumAskPQ += (aP * aQ);
             }
 
+            // Calculate stable anchor price
             const pEffBid = sumBidPQ / totalBidQty;
             const pEffAsk = sumAskPQ / totalAskQty;
             const vampEff = (pEffBid * totalAskQty + pEffAsk * totalBidQty) / (totalBidQty + totalAskQty);
-            const standardMid = (parseFloat(depth.bids[0][0]) + parseFloat(depth.asks[0][0])) / 2;
+            const currentPrice = vampEff;
 
-            // --- 2. SIGNAL GENERATION ---
+            // --- 2. SIGNAL GATES (TICK-BASED) ---
             const obi = (totalBidQty - totalAskQty) / (totalBidQty + totalAskQty);
             asset.history.obi.push(obi);
             if (asset.history.obi.length > this.OBI_WINDOW) asset.history.obi.shift();
@@ -92,21 +95,16 @@ class FastStrategy {
             const rawDOBI = obi - asset.history.prevOBI;
             
             const wdobp = (sumBidPQ + sumAskPQ) / (totalBidQty + totalAskQty);
-            const rawShiftTicks = (wdobp - vampEff) / asset.config.tickSize;
+            const rawShiftTicks = (wdobp - currentPrice) / asset.config.tickSize;
             
-            // --- [FIX] TICK-BASED LIQUIDITY PULL WITH NOISE FILTER ---
-            // We compare current total qty to the previous tick's total qty.
+            // GATE 4: Liquidity Pull Detection (Most Predictive)
             const askDelta = asset.history.prevAskQty - totalAskQty;
             const bidDelta = asset.history.prevBidQty - totalBidQty;
-
-            // Apply Micro-Pull Filter: Only count deltas larger than MIN_PULL_QTY
             const filteredAskPull = Math.abs(askDelta) >= this.MIN_PULL_QTY ? askDelta : 0;
             const filteredBidPull = Math.abs(bidDelta) >= this.MIN_PULL_QTY ? bidDelta : 0;
-            
-            // Net result: Positive if Asks are evaporating faster (Bullish)
             const rawPull = filteredAskPull - filteredBidPull;
 
-            // --- 3. REFINED WEIGHTED SCORING (VIP SETTINGS) ---
+            // --- 3. WEIGHTED SCORING ---
             const buyScore = 
                 this.getScore(rawZ, 2.5, this.WEIGHTS.GATE1_ZSCORE) + 
                 this.getScore(rawDOBI, 0.4, this.WEIGHTS.GATE2_MOMENTUM) + 
@@ -121,7 +119,7 @@ class FastStrategy {
 
             // --- 4. POSITION MANAGEMENT ---
             if (this.bot.hasOpenPosition && asset.position) {
-                this.manageExits(symbol, vampEff, buyScore, sellScore);
+                this.manageExits(symbol, currentPrice, buyScore, sellScore);
                 this.updateHistory(asset, obi, totalBidQty, totalAskQty);
                 return; 
             }
@@ -131,7 +129,7 @@ class FastStrategy {
                 const isBuyStronger = buyScore >= sellScore;
                 const score = isBuyStronger ? buyScore : sellScore;
                 const sideTag = isBuyStronger ? '[BUY]' : '[SELL]';
-                this.logger.info(`[VIP Heartbeat] ${symbol} Strength: ${score.toFixed(1)}% ${sideTag}`);
+                this.logger.info(`[VIP Heartbeat] ${symbol} Strength: ${score.toFixed(1)}% ${sideTag} | VAMP: ${currentPrice.toFixed(asset.config.precision)}`);
                 asset.lastLogTime = now;
             }
 
@@ -146,31 +144,32 @@ class FastStrategy {
                 if (side && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS)) {
                     asset.lastTriggerTime = now;
                     const orderType = finalScore >= this.MIN_SCORE_MARKET ? 'market_order' : 'limit_order';
-                    const execPrice = side === 'buy' ? Math.min(vampEff, standardMid) : Math.max(vampEff, standardMid);
                     
                     this.logger.info(`[🔥 TRIGGER] ${side.toUpperCase()} ${symbol} | CONF: ${finalScore.toFixed(1)}% | TYPE: ${orderType}`);
-                    asset.position = { side: side, entryPrice: vampEff, peakPrice: vampEff };
-                    await this.executeMicroTrade(symbol, side, execPrice, asset.config, orderType);
+                    asset.position = { side: side, entryPrice: currentPrice, peakPrice: currentPrice };
+                    
+                    await this.executeMicroTrade(symbol, side, currentPrice, asset.config, orderType);
                 }
             }
 
             this.updateHistory(asset, obi, totalBidQty, totalAskQty);
 
         } catch (e) {
-            this.logger.error(`[FastStrategy] Error: ${e.message}`);
+            this.logger.error(`[FastStrategy] Loop Error: ${e.message}`);
         }
     }
 
-    // [Standard Exits Unchanged - Using vampEff as currentPrice]
     manageExits(symbol, currentPrice, buyScore, sellScore) {
         if (this.isOrderInProgress || this.bot.isOrderInProgress) return;
         const asset = this.assets[symbol];
         const pos = asset.position;
         if (!pos) return;
 
-        let dip = pos.side === 'buy' ? Math.max(0, pos.peakPrice - currentPrice) : Math.max(0, currentPrice - pos.peakPrice);
+        // Peak Tracking for Trailing Dip
         if (pos.side === 'buy' && currentPrice > pos.peakPrice) pos.peakPrice = currentPrice;
         if (pos.side === 'sell' && currentPrice < pos.peakPrice) pos.peakPrice = currentPrice;
+
+        const dip = pos.side === 'buy' ? pos.peakPrice - currentPrice : currentPrice - pos.peakPrice;
 
         if (dip >= (this.TRAILING_DIP_TICKS * asset.config.tickSize)) {
             return this.executeMarketExit(symbol, `Trailing Dip Triggered ($${dip.toFixed(4)})`);
@@ -183,22 +182,42 @@ class FastStrategy {
         }
     }
 
+    /**
+     * EXIT EXECUTION with STATE RECOVERY
+     */
     async executeMarketExit(symbol, reason) {
         if (this.isOrderInProgress) return;
-        this.isOrderInProgress = true; this.bot.isOrderInProgress = true;
+        this.isOrderInProgress = true; 
+        this.bot.isOrderInProgress = true;
+        
         const asset = this.assets[symbol];
         try {
+            const side = asset.position.side === 'buy' ? 'sell' : 'buy';
+            this.logger.warn(`[Exiting] ${symbol} | Reason: ${reason}`);
+
             const orderData = {
                 product_id: asset.config.deltaId.toString(),
                 size: this.bot.config.orderSize,
-                side: asset.position.side === 'buy' ? 'sell' : 'buy',
-                order_type: 'market_order', reduce_only: true
+                side: side,
+                order_type: 'market_order',
+                reduce_only: true
             };
-            this.logger.warn(`[Exiting] ${symbol} | Reason: ${reason}`);
+
             await this.bot.placeOrder(orderData);
             asset.position = null; 
-        } catch (err) { this.logger.error(`[Exit Error] ${err.message}`); }
-        finally { this.isOrderInProgress = false; this.bot.isOrderInProgress = false; }
+
+        } catch (err) {
+            this.logger.error(`[Exit Error] ${err.message}`);
+            // STATE RECOVERY FIX: Reset if exchange has no position to close
+            if (err.message.includes('no_position_for_reduce_only') || err.message.includes('400')) {
+                this.logger.info(`[State Recovery] Forced position reset for ${symbol}.`);
+                asset.position = null;
+                this.bot.hasOpenPosition = false;
+            }
+        } finally {
+            this.isOrderInProgress = false; 
+            this.bot.isOrderInProgress = false;
+        }
     }
 
     getScore(val, saturation, maxPoints) {
@@ -220,7 +239,8 @@ class FastStrategy {
     }
 
     async executeMicroTrade(symbol, side, price, assetConfig, orderType) {
-        this.isOrderInProgress = true; this.bot.isOrderInProgress = true;
+        this.isOrderInProgress = true; 
+        this.bot.isOrderInProgress = true;
         try {
             const rawSize = parseFloat(this.bot.config.orderSize);
             const sizeStr = (Math.floor(rawSize / assetConfig.lotSize) * assetConfig.lotSize).toFixed(assetConfig.sizeDecimals);
@@ -235,14 +255,20 @@ class FastStrategy {
                 orderData.bracket_stop_loss_price = slPriceNum.toFixed(assetConfig.precision);
                 orderData.bracket_stop_trigger_method = 'mark_price';
             }
+            
             await this.bot.placeOrder(orderData);
+            
         } catch (err) {
-            this.logger.warn(`[Execution Error] ${err.message}`);
+            this.logger.warn(`[Entry Error] ${err.message}`);
+            // Zombie Position Prevention
             const asset = this.assets[symbol];
-            if (asset) asset.position = null; // Zombie Fix
-        } finally { this.isOrderInProgress = false; this.bot.isOrderInProgress = false; }
+            if (asset) asset.position = null; 
+        } finally { 
+            this.isOrderInProgress = false; 
+            this.bot.isOrderInProgress = false; 
+        }
     }
 }
 
 module.exports = FastStrategy;
-            
+                              
