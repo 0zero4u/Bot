@@ -11,8 +11,8 @@ class FastStrategy {
         this.LOG_FREQ_MS = 5000;
         
         // --- TIERED ENTRY THRESHOLDS ---
-        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '85');
-        this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '90');
+        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '75');
+        this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '80');
         this.LOCK_DURATION_MS = 2000; 
         
         // --- VIP 0ms FILTERS (Noise Reduction) ---
@@ -28,7 +28,7 @@ class FastStrategy {
         
         // --- EXIT CONFIGURATION ---
         this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '0'); 
-        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '85'); 
+        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '75'); 
         this.TRAILING_DIP_TICKS = 100;   
         this.slPercent = 0.15;         
 
