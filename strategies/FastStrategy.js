@@ -22,10 +22,10 @@ class FastStrategy {
 
         // --- CONFIGURABLE WEIGHTS (Sum should be 100) ---
         this.WEIGHTS = {
-            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '25'),
+            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '30'),
             GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '10'),
             GATE3_SHIFT: parseInt(process.env.W_SHIFT || '20'),
-            GATE4_PULL: parseInt(process.env.W_PULL || '45') // Predictive Heavy for VIP
+            GATE4_PULL: parseInt(process.env.W_PULL || '40') // Predictive Heavy for VIP
         };
         
         // --- EXIT CONFIGURATION ---
