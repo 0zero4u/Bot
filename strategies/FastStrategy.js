@@ -1,33 +1,27 @@
 // FastStrategy.js
-// v1.6.2 - [FIX] Precision & Data Typing to resolve 400 Bad Request
-// - Added: Rounding logic for specific asset lot sizes
-// - Added: String casting for all API-bound numeric fields
-// - Fixed: High-frequency log spam
+// v1.7.0 - [FIX] Math Precision & Zero-Size Safety
+// Solves 400 Bad Request by sanitizing floating point math
 
 class FastStrategy {
     constructor(bot) {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- Model Configuration ---
+        // Configuration
         this.OBI_WINDOW = 100;
         this.Z_THRESHOLD = 1.1;
         this.SHIFT_THRESHOLD = 0.5;
         this.MIN_CONF_FIRE = 0.40;
         this.LOCK_DURATION_MS = 1500;
-        
         this.LOG_HEARTBEAT_MS = 30000; 
         
-        /**
-         * MASTER_CONFIG Documentation:
-         * tickSize: Minimum price increment.
-         * lotSize: Minimum quantity increment. (XRP = 1, BTC = 0.001, etc.)
-         * precision: Number of decimals for the limit price.
-         */
+        // MASTER CONFIG
+        // precision: Decimals for Price
+        // sizeDecimals: Decimals for Quantity (CRITICAL FIX)
         const MASTER_CONFIG = {
-            'XRP': { deltaId: 14969, tickSize: 0.0001, lotSize: 1, precision: 4 },
-            'BTC': { deltaId: 27,    tickSize: 0.1,    lotSize: 0.001, precision: 1 },
-            'ETH': { deltaId: 299,   tickSize: 0.01,   lotSize: 0.01, precision: 2 }
+            'XRP': { deltaId: 14969, tickSize: 0.0001, lotSize: 1,     precision: 4, sizeDecimals: 0 },
+            'BTC': { deltaId: 27,    tickSize: 0.1,    lotSize: 0.001, precision: 1, sizeDecimals: 3 },
+            'ETH': { deltaId: 299,   tickSize: 0.01,   lotSize: 0.01,  precision: 2, sizeDecimals: 2 }
         };
 
         const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
@@ -48,7 +42,7 @@ class FastStrategy {
         this.slPercent = 0.12;
     }
 
-    getName() { return "FastStrategy (Precision-Fixed v1.6.2)"; }
+    getName() { return "FastStrategy (Math-Fixed v1.7)"; }
 
     async onDepthUpdate(symbol, depth) {
         if (this.isOrderInProgress || this.bot.isOrderInProgress) return;
@@ -59,7 +53,7 @@ class FastStrategy {
         const now = Date.now();
 
         try {
-            // 1. DATA SUMMATION
+            // 1. DATA PROCESSING
             let bidQty = 0, askQty = 0, sumBidPQ = 0, sumAskPQ = 0;
             for (let i = 0; i < 5; i++) {
                 const bP = parseFloat(depth.bids[i][0]);
@@ -74,7 +68,7 @@ class FastStrategy {
             const bestAsk = parseFloat(depth.asks[0][0]);
             const midPrice = (bestBid + bestAsk) / 2;
 
-            // 2. MODEL MATH
+            // 2. SIGNAL MATH
             const obi = (bidQty - askQty) / (bidQty + askQty);
             asset.history.obi.push(obi);
             if (asset.history.obi.length > this.OBI_WINDOW) asset.history.obi.shift();
@@ -83,17 +77,15 @@ class FastStrategy {
             const dOBI = obi - asset.history.prevOBI;
             const wdShift = ((sumBidPQ + sumAskPQ) / (bidQty + askQty) - midPrice) / asset.config.tickSize;
 
-            // 3. CONFIDENCE
+            // 3. CONFIDENCE & TRIGGER
             let rawConf = (Math.min(Math.abs(obiZ) / 2.2, 1.0) * 0.5) + (Math.min(Math.abs(dOBI) / 0.1, 1.0) * 0.25) + (Math.min(Math.abs(wdShift) / 2.0, 1.0) * 0.25);
-            const finalConfidence = rawConf * 0.8; // Normalized
+            const finalConfidence = rawConf * 0.8; 
 
-            // 4. LOGGING (Heartbeat)
             if (now - asset.lastLogTime > this.LOG_HEARTBEAT_MS) {
                 this.logger.info(`[Heartbeat] ${symbol} | Z:${obiZ.toFixed(2)} | Conf:${(finalConfidence * 100).toFixed(1)}%`);
                 asset.lastLogTime = now;
             }
 
-            // 5. TRIGGER
             const shouldFire = (finalConfidence >= this.MIN_CONF_FIRE) && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS);
 
             if (shouldFire) {
@@ -104,7 +96,7 @@ class FastStrategy {
                 if (side) {
                     asset.lastTriggerTime = now;
                     this.logger.info(`[Micro-Alpha] 🔫 FIRE: ${side.toUpperCase()} ${symbol} | Conf: ${(finalConfidence * 100).toFixed(1)}%`);
-                    await this.executeMicroTrade(symbol, side, midPrice, asset.config, finalConfidence);
+                    await this.executeMicroTrade(symbol, side, midPrice, asset.config);
                 }
             }
 
@@ -122,46 +114,55 @@ class FastStrategy {
         return std === 0 ? 0 : (values[values.length - 1] - mean) / std;
     }
 
-    /**
-     * Documentation for executeMicroTrade:
-     * - size: Rounded down to the nearest multiple of asset.lotSize to avoid 400 errors.
-     * - price: Formatted to asset.precision decimals.
-     * - strings: All numeric values sent as strings to comply with Delta API v2.
-     */
-    async executeMicroTrade(symbol, side, price, assetConfig, confidence) {
+    async executeMicroTrade(symbol, side, price, assetConfig) {
         this.isOrderInProgress = true; 
         this.bot.isOrderInProgress = true;
         
         try {
-            // A. Calculate Size based on Lot Size (Avoids "0.42 XRP" error)
+            // --- STEP A: Calculate Safe Size ---
             const rawSize = parseFloat(this.bot.config.orderSize);
-            const size = (Math.floor(rawSize / assetConfig.lotSize) * assetConfig.lotSize).toString();
+            
+            // 1. Math to fit into lot size chunks
+            let calculatedSize = Math.floor(rawSize / assetConfig.lotSize) * assetConfig.lotSize;
+            
+            // 2. FIX: Handle floating point errors (e.g. 0.3000000004 -> "0.3")
+            const sizeStr = calculatedSize.toFixed(assetConfig.sizeDecimals);
 
-            // B. Apply Aggression and Format Price Precision
+            // 3. FIX: Stop if size is 0
+            if (parseFloat(sizeStr) === 0) {
+                this.logger.warn(`[Order Aborted] Size too small for ${symbol}. Config: ${rawSize}, Required: ${assetConfig.lotSize}`);
+                return;
+            }
+
+            // --- STEP B: Calculate Safe Prices ---
             const aggression = this.bot.config.priceAggressionOffset || 0.02;
             const limitPriceNum = (side === 'buy' ? price * (1 + aggression/100) : price * (1 - aggression/100));
-            const limitPrice = limitPriceNum.toFixed(assetConfig.precision);
+            
+            // Format Price to correct decimals
+            const limitPriceStr = limitPriceNum.toFixed(assetConfig.precision);
 
-            // C. Stop Loss Calculation and Formatting
+            // Calculate Stop Loss
             const slPriceNum = (side === 'buy' ? limitPriceNum * (1 - this.slPercent/100) : limitPriceNum * (1 + this.slPercent/100));
-            const slPrice = slPriceNum.toFixed(assetConfig.precision);
+            const slPriceStr = slPriceNum.toFixed(assetConfig.precision);
 
+            // --- STEP C: Construct Payload ---
             const orderData = {
-                product_id: assetConfig.deltaId.toString(), // Must be String
-                size: size,                                 // Must be String & Whole Number for XRP
+                product_id: parseInt(assetConfig.deltaId), // Send as Integer
+                size: sizeStr,                             // Send as Clean String
                 side: side,
                 order_type: 'limit_order',
-                limit_price: limitPrice,                    // Must be String
+                limit_price: limitPriceStr,
                 time_in_force: 'ioc',
-                bracket_stop_loss_price: slPrice,           // Must be String
+                bracket_stop_loss_price: slPriceStr,
                 bracket_stop_trigger_method: 'mark_price'
             };
 
-            this.logger.debug(`[Order Debug] ${symbol} payload: ${JSON.stringify(orderData)}`);
+            this.logger.info(`[Order Payload] ${symbol} -> ${JSON.stringify(orderData)}`);
             await this.bot.placeOrder(orderData);
             
         } catch (err) {
-            this.logger.error(`[Execution Error] ${symbol}: ${err.message}`);
+            // Client.js will now log the detailed 400 error body
+            this.logger.warn(`[Strategy Error] ${symbol}: ${err.message}`);
         } finally {
             this.isOrderInProgress = false; 
             this.bot.isOrderInProgress = false;
@@ -170,3 +171,4 @@ class FastStrategy {
 }
 
 module.exports = FastStrategy;
+    
