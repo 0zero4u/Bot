@@ -13,21 +13,21 @@ class FastStrategy {
         
         // --- TIERED ENTRY THRESHOLDS ---
         // 74-84: Limit Order | 85+: Aggressive Market Order
-        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '74');
+        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '80');
         this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '85');
         this.LOCK_DURATION_MS = 2000; 
         
         // --- VIP 0ms FILTERS (Noise Reduction) ---
         // Ignore small "dust" cancellations to prevent fake signals
-        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '0.05'); 
+        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '1.05'); 
 
         // --- PREDICTIVE SCORING WEIGHTS ---
         // Boosted Gate 4 (Liquidity Pull) as it is the most predictive
         this.WEIGHTS = {
-            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '25'), // Baseline Pressure
+            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '40'), // Baseline Pressure
             GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '10'), // Lagging Velocity
             GATE3_SHIFT: parseInt(process.env.W_SHIFT || '20'),    // Reactive Gravity
-            GATE4_PULL: parseInt(process.env.W_PULL || '45')      // PREDICTIVE INTENT
+            GATE4_PULL: parseInt(process.env.W_PULL || '30')      // PREDICTIVE INTENT
         };
         
         // --- EXIT CONFIGURATION ---
