@@ -1,5 +1,5 @@
 // FastStrategy.js
-// v4.1.0 - [FINAL] Weighted Confidence, Trailing Stop, Alpha Decay & Momentum Flip
+// v4.2.0 - [FINAL] Weighted Confidence, Trailing Stop, & Reason-Based Exit Logging
 
 class FastStrategy {
     constructor(bot) {
@@ -8,17 +8,16 @@ class FastStrategy {
 
         // --- CORE STRATEGY CONFIG ---
         this.OBI_WINDOW = 100;
-        this.LOG_FREQ_MS = 5000;      // Heartbeat frequency (5s)
-        this.MIN_SCORE_FIRE = 75;     // Threshold to enter (0-100)
-        this.LOCK_DURATION_MS = 2000; // Cooldown after trade attempt
+        this.LOG_FREQ_MS = 5000;      
+        this.MIN_SCORE_FIRE = 75;     
+        this.LOCK_DURATION_MS = 2000; 
         
-        // --- EXIT CONFIGURATION (Configurable Thresholds) ---
-        this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '30'); // Exit if confidence < 30%
-        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '65'); // Exit if opposite signal > 65%
-        this.TRAILING_DIP_TICKS = 2;   // Exit if price dips 2 ticks from peak
-        this.slPercent = 0.15;         // Initial Safety SL (%)
+        // --- EXIT CONFIGURATION (Defaults provided) ---
+        this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '30'); 
+        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '65'); 
+        this.TRAILING_DIP_TICKS = 2;   
+        this.slPercent = 0.15;         
 
-        // MASTER ASSET CONFIG (Saturation for 100% confidence per gate)
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, tickSize: 0.0001, lotSize: 1,     precision: 4, sizeDecimals: 0, saturationQty: 50000 },
             'BTC': { deltaId: 27,    tickSize: 0.1,    lotSize: 0.001, precision: 1, sizeDecimals: 3, saturationQty: 5.0 },
@@ -33,7 +32,7 @@ class FastStrategy {
                 this.assets[asset] = {
                     config: MASTER_CONFIG[asset],
                     history: { obi: [], prevOBI: 0, prevBidQty: 0, prevAskQty: 0 },
-                    position: null, // Tracks {side, entryPrice, peakPrice}
+                    position: null, 
                     lastTriggerTime: 0,
                     lastLogTime: 0 
                 };
@@ -43,7 +42,7 @@ class FastStrategy {
         this.isOrderInProgress = false;
     }
 
-    getName() { return "FastStrategy (Weighted-Pro v4.1)"; }
+    getName() { return "FastStrategy (HFT-Log v4.2)"; }
 
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
@@ -52,7 +51,7 @@ class FastStrategy {
         const now = Date.now();
 
         try {
-            // 1. DATA PROCESSING (Depth 5)
+            // 1. DATA PROCESSING
             let totalBidQty = 0, totalAskQty = 0;
             let sumBidPQ = 0, sumAskPQ = 0;         
             let sumBidP_AskQ = 0, sumAskP_BidQ = 0; 
@@ -60,7 +59,6 @@ class FastStrategy {
             for (let i = 0; i < 5; i++) {
                 const bP = parseFloat(depth.bids[i][0]); const bQ = parseFloat(depth.bids[i][1]);
                 const aP = parseFloat(depth.asks[i][0]); const aQ = parseFloat(depth.asks[i][1]);
-
                 totalBidQty += bQ; totalAskQty += aQ;
                 sumBidPQ += (bP * bQ); sumAskPQ += (aP * aQ);
                 sumBidP_AskQ += (bP * aQ); sumAskP_BidQ += (aP * bQ);
@@ -70,7 +68,7 @@ class FastStrategy {
             const vamp = (sumBidP_AskQ + sumAskP_BidQ) / (totalBidQty + totalAskQty);
             const currentPrice = vamp; 
 
-            // 2. MICROSTRUCTURE CALCULATIONS
+            // 2. RAW CALCULATIONS
             const obi = (totalBidQty - totalAskQty) / (totalBidQty + totalAskQty);
             asset.history.obi.push(obi);
             if (asset.history.obi.length > this.OBI_WINDOW) asset.history.obi.shift();
@@ -88,22 +86,21 @@ class FastStrategy {
             const sellScore = this.getScore(-rawZ, 2.5, 30) + this.getScore(-rawDOBI, 0.4, 20) + 
                               this.getScore(-rawShiftTicks, 2.0, 30) + this.getScore(-rawPull, asset.config.saturationQty, 20);
 
-            // 4. OPEN POSITION MANAGEMENT (EXITS)
+            // 4. OPEN POSITION MANAGEMENT (EXIT REASONS)
             if (this.bot.hasOpenPosition && asset.position) {
                 this.manageExits(symbol, currentPrice, buyScore, sellScore);
                 this.updateHistory(asset, obi, totalBidQty, totalAskQty);
-                return; // One Punch Rule: Lock Entry Logic
+                return; 
             }
 
             // 5. HEARTBEAT LOGGING (5s)
             if (now - asset.lastLogTime > this.LOG_FREQ_MS) {
-                const dominant = buyScore > sellScore ? 'BUY' : 'SELL';
                 const score = Math.max(buyScore, sellScore).toFixed(1);
-                this.logger.info(`[H-Beat] ${symbol} Strength: ${score}% (${dominant}) | Pos: ${this.bot.hasOpenPosition}`);
+                this.logger.info(`[H-Beat] ${symbol} Strength: ${score}% | Pos: ${this.bot.hasOpenPosition}`);
                 asset.lastLogTime = now;
             }
 
-            // 6. ENTRY GATES
+            // 6. ENTRY LOGIC
             if (!this.bot.hasOpenPosition && !this.isOrderInProgress && !this.bot.isOrderInProgress) {
                 let side = null;
                 let finalScore = 0;
@@ -116,7 +113,6 @@ class FastStrategy {
                     this.logger.info(`[🔥 TRIGGER] ${side.toUpperCase()} ${symbol} | CONF: ${finalScore.toFixed(1)}%`);
                     
                     asset.position = { side: side, entryPrice: currentPrice, peakPrice: currentPrice };
-                    
                     const execPrice = side === 'buy' ? Math.min(vamp, standardMid) : Math.max(vamp, standardMid);
                     await this.executeMicroTrade(symbol, side, execPrice, asset.config);
                 }
@@ -125,7 +121,7 @@ class FastStrategy {
             this.updateHistory(asset, obi, totalBidQty, totalAskQty);
 
         } catch (e) {
-            this.logger.error(`[FastStrategy] Loop Error: ${e.message}`);
+            this.logger.error(`[FastStrategy] Error: ${e.message}`);
         }
     }
 
@@ -134,7 +130,7 @@ class FastStrategy {
         const pos = asset.position;
         if (!pos) return;
 
-        // --- A. TRAILING STOP (2 Ticks) ---
+        // A. TRAILING STOP
         let dip = 0;
         const dipThreshold = this.TRAILING_DIP_TICKS * asset.config.tickSize;
 
@@ -147,32 +143,31 @@ class FastStrategy {
         }
 
         if (dip >= dipThreshold) {
-            this.logger.warn(`[EXIT] Trailing Stop hit for ${symbol} (Dipped ${this.TRAILING_DIP_TICKS} ticks)`);
-            return this.executeMarketExit(symbol);
+            return this.executeMarketExit(symbol, `2-tick dip from peak ($${dip.toFixed(4)})`);
         }
 
-        // --- B. ALPHA DECAY (Confidence Drop) ---
+        // B. ALPHA DECAY
         const currentConf = pos.side === 'buy' ? buyScore : sellScore;
         if (currentConf < this.ALPHA_DECAY_THRESHOLD) {
-            this.logger.warn(`[EXIT] Alpha Decay for ${symbol} (Strength ${currentConf.toFixed(1)}% < ${this.ALPHA_DECAY_THRESHOLD}%)`);
-            return this.executeMarketExit(symbol);
+            return this.executeMarketExit(symbol, `Alpha Decay (Strength ${currentConf.toFixed(1)}% < ${this.ALPHA_DECAY_THRESHOLD}%)`);
         }
 
-        // --- C. MOMENTUM FLIP (Opposing Signal) ---
+        // C. MOMENTUM FLIP
         const opposingConf = pos.side === 'buy' ? sellScore : buyScore;
         if (opposingConf >= this.MOMENTUM_FLIP_THRESHOLD) {
-            this.logger.warn(`[EXIT] Momentum Flip for ${symbol} (Opposing Strength ${opposingConf.toFixed(1)}% > ${this.MOMENTUM_FLIP_THRESHOLD}%)`);
-            return this.executeMarketExit(symbol);
+            return this.executeMarketExit(symbol, `Momentum Flip (Opposing Strength ${opposingConf.toFixed(1)}% > ${this.MOMENTUM_FLIP_THRESHOLD}%)`);
         }
     }
 
-    async executeMarketExit(symbol) {
+    async executeMarketExit(symbol, reason) {
         if (this.isOrderInProgress) return;
         this.isOrderInProgress = true;
         this.bot.isOrderInProgress = true;
         const asset = this.assets[symbol];
         try {
             const side = asset.position.side === 'buy' ? 'sell' : 'buy';
+            this.logger.warn(`[Position Closed] Trigger: ${reason}`); // <--- REASON LOG
+
             const orderData = {
                 product_id: asset.config.deltaId.toString(),
                 size: this.bot.config.orderSize,
@@ -180,7 +175,6 @@ class FastStrategy {
                 order_type: 'market_order',
                 reduce_only: true
             };
-            this.logger.info(`[EXIT] Sending Market Order to close ${symbol} position.`);
             await this.bot.placeOrder(orderData);
             asset.position = null; 
         } catch (err) {
@@ -244,4 +238,4 @@ class FastStrategy {
 }
 
 module.exports = FastStrategy;
-                
+        
