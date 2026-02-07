@@ -11,7 +11,7 @@ class FastStrategy {
         this.LOG_FREQ_MS = 5000;      // Heartbeat log frequency
         
         // --- TIERED ENTRY THRESHOLDS ---
-        this.MIN_SCORE_LIMIT = 70;    // Tier 1: Place Limit Order (Standard)
+        this.MIN_SCORE_LIMIT = 74;    // Tier 1: Place Limit Order (Standard)
         this.MIN_SCORE_MARKET = 85;   // Tier 2: Place Market Order (High Confidence)
         
         this.LOCK_DURATION_MS = 2000; // Cooldown between signals to prevent spam
@@ -19,7 +19,7 @@ class FastStrategy {
         // --- EXIT CONFIGURATION ---
         this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '0'); 
         this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '65'); 
-        this.TRAILING_DIP_TICKS = 50;   
+        this.TRAILING_DIP_TICKS = 100;   
         this.slPercent = 0.15;         
 
         // Asset Specific Configurations (Delta Exchange Specs)
