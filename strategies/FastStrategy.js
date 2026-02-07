@@ -13,7 +13,7 @@ class FastStrategy {
         this.LOG_FREQ_MS = 5000;      // Log every 5 seconds (Heartbeat)
         
         // EXECUTION CONFIG
-        this.MIN_SCORE_FIRE = 75;     // Fire if Total Confidence > 75%
+        this.MIN_SCORE_FIRE = 50;     // Fire if Total Confidence > 75%
         this.LOCK_DURATION_MS = 1500;
         
         // Safety
