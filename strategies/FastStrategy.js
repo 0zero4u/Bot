@@ -11,26 +11,26 @@ class FastStrategy {
         this.LOG_FREQ_MS = 5000;
         
         // --- TIERED ENTRY THRESHOLDS ---
-        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '74');
+        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '80');
         this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '85');
         
         this.LOCK_DURATION_MS = 2000; 
         
         // --- 0ms VIP FILTERS ---
         // Minimum quantity change to count as a "Real Pull" (Noise Reduction)
-        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '0.05'); 
+        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '1.05'); 
 
         // --- CONFIGURABLE WEIGHTS (Sum should be 100) ---
         this.WEIGHTS = {
-            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '30'),
+            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '40'),
             GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '10'),
             GATE3_SHIFT: parseInt(process.env.W_SHIFT || '20'),
-            GATE4_PULL: parseInt(process.env.W_PULL || '40') // Predictive Heavy for VIP
+            GATE4_PULL: parseInt(process.env.W_PULL || '30') // Predictive Heavy for VIP
         };
         
         // --- EXIT CONFIGURATION ---
         this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '0'); 
-        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '65'); 
+        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '90'); 
         this.TRAILING_DIP_TICKS = 100;   
         this.slPercent = 0.15;         
 
