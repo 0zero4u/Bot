@@ -16,7 +16,7 @@ class FastStrategy {
         this.LOCK_DURATION_MS = 2000; 
         
         // --- VIP 0ms FILTERS (Noise Reduction) ---
-        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '1.05'); 
+        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '1.0'); 
 
         // --- PREDICTIVE SCORING WEIGHTS ---
         this.WEIGHTS = {
@@ -28,7 +28,7 @@ class FastStrategy {
         
         // --- EXIT CONFIGURATION ---
         this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '0'); 
-        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '65'); 
+        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '85'); 
         this.TRAILING_DIP_TICKS = 100;   
         this.slPercent = 0.15;         
 
