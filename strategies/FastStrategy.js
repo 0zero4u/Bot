@@ -1,5 +1,5 @@
 // FastStrategy.js
-// v6.2.0 - [PROD] VAMP-Effective | VIP-0ms Filters | Predictive Weights | State Recovery
+// v6.3.0 - [PROD] VAMP-Effective | Granular Force Logging | Predictive Weights
 
 class FastStrategy {
     constructor(bot) {
@@ -7,27 +7,23 @@ class FastStrategy {
         this.logger = bot.logger;
 
         // --- CORE STRATEGY CONFIG ---
-        // Increase OBI_WINDOW for stability with 0ms firehose data
         this.OBI_WINDOW = parseInt(process.env.OBI_WINDOW || '500'); 
         this.LOG_FREQ_MS = 5000;
         
         // --- TIERED ENTRY THRESHOLDS ---
-        // 74-84: Limit Order | 85+: Aggressive Market Order
         this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '80');
         this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '85');
         this.LOCK_DURATION_MS = 2000; 
         
         // --- VIP 0ms FILTERS (Noise Reduction) ---
-        // Ignore small "dust" cancellations to prevent fake signals
         this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '1.05'); 
 
         // --- PREDICTIVE SCORING WEIGHTS ---
-        // Boosted Gate 4 (Liquidity Pull) as it is the most predictive
         this.WEIGHTS = {
-            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '40'), // Baseline Pressure
+            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '40'),   // Baseline Pressure
             GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '10'), // Lagging Velocity
-            GATE3_SHIFT: parseInt(process.env.W_SHIFT || '20'),    // Reactive Gravity
-            GATE4_PULL: parseInt(process.env.W_PULL || '30')      // PREDICTIVE INTENT
+            GATE3_SHIFT: parseInt(process.env.W_SHIFT || '20'),      // Reactive Gravity
+            GATE4_PULL: parseInt(process.env.W_PULL || '30')        // PREDICTIVE INTENT
         };
         
         // --- EXIT CONFIGURATION ---
@@ -60,7 +56,7 @@ class FastStrategy {
         this.isOrderInProgress = false;
     }
 
-    getName() { return "FastStrategy (VIP-v6.2)"; }
+    getName() { return "FastStrategy (VIP-v6.3 Granular)"; }
 
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
@@ -80,7 +76,6 @@ class FastStrategy {
                 sumBidPQ += (bP * bQ); sumAskPQ += (aP * aQ);
             }
 
-            // Calculate stable anchor price
             const pEffBid = sumBidPQ / totalBidQty;
             const pEffAsk = sumAskPQ / totalAskQty;
             const vampEff = (pEffBid * totalAskQty + pEffAsk * totalBidQty) / (totalBidQty + totalAskQty);
@@ -97,25 +92,28 @@ class FastStrategy {
             const wdobp = (sumBidPQ + sumAskPQ) / (totalBidQty + totalAskQty);
             const rawShiftTicks = (wdobp - currentPrice) / asset.config.tickSize;
             
-            // GATE 4: Liquidity Pull Detection (Most Predictive)
             const askDelta = asset.history.prevAskQty - totalAskQty;
             const bidDelta = asset.history.prevBidQty - totalBidQty;
             const filteredAskPull = Math.abs(askDelta) >= this.MIN_PULL_QTY ? askDelta : 0;
             const filteredBidPull = Math.abs(bidDelta) >= this.MIN_PULL_QTY ? bidDelta : 0;
             const rawPull = filteredAskPull - filteredBidPull;
 
-            // --- 3. WEIGHTED SCORING ---
-            const buyScore = 
-                this.getScore(rawZ, 2.5, this.WEIGHTS.GATE1_ZSCORE) + 
-                this.getScore(rawDOBI, 0.4, this.WEIGHTS.GATE2_MOMENTUM) + 
-                this.getScore(rawShiftTicks, 2.0, this.WEIGHTS.GATE3_SHIFT) + 
-                this.getScore(rawPull, asset.config.saturationQty, this.WEIGHTS.GATE4_PULL);
+            // --- 3. GRANULAR WEIGHTED SCORING ---
+            // Calculate components individually for visibility
+            
+            // BUY Components
+            const b_Z = this.getScore(rawZ, 2.5, this.WEIGHTS.GATE1_ZSCORE);
+            const b_M = this.getScore(rawDOBI, 0.4, this.WEIGHTS.GATE2_MOMENTUM);
+            const b_S = this.getScore(rawShiftTicks, 2.0, this.WEIGHTS.GATE3_SHIFT);
+            const b_P = this.getScore(rawPull, asset.config.saturationQty, this.WEIGHTS.GATE4_PULL);
+            const buyScore = b_Z + b_M + b_S + b_P;
 
-            const sellScore = 
-                this.getScore(-rawZ, 2.5, this.WEIGHTS.GATE1_ZSCORE) + 
-                this.getScore(-rawDOBI, 0.4, this.WEIGHTS.GATE2_MOMENTUM) + 
-                this.getScore(-rawShiftTicks, 2.0, this.WEIGHTS.GATE3_SHIFT) + 
-                this.getScore(-rawPull, asset.config.saturationQty, this.WEIGHTS.GATE4_PULL);
+            // SELL Components
+            const s_Z = this.getScore(-rawZ, 2.5, this.WEIGHTS.GATE1_ZSCORE);
+            const s_M = this.getScore(-rawDOBI, 0.4, this.WEIGHTS.GATE2_MOMENTUM);
+            const s_S = this.getScore(-rawShiftTicks, 2.0, this.WEIGHTS.GATE3_SHIFT);
+            const s_P = this.getScore(-rawPull, asset.config.saturationQty, this.WEIGHTS.GATE4_PULL);
+            const sellScore = s_Z + s_M + s_S + s_P;
 
             // --- 4. POSITION MANAGEMENT ---
             if (this.bot.hasOpenPosition && asset.position) {
@@ -124,12 +122,18 @@ class FastStrategy {
                 return; 
             }
 
-            // --- 5. LOGGING ---
+            // --- 5. LOGGING (With Granularity) ---
             if (now - asset.lastLogTime > this.LOG_FREQ_MS) {
                 const isBuyStronger = buyScore >= sellScore;
                 const score = isBuyStronger ? buyScore : sellScore;
                 const sideTag = isBuyStronger ? '[BUY]' : '[SELL]';
-                this.logger.info(`[VIP Heartbeat] ${symbol} Strength: ${score.toFixed(1)}% ${sideTag} | VAMP: ${currentPrice.toFixed(asset.config.precision)}`);
+                
+                // Construct Force String: (Z:10 M:5 S:20 P:30)
+                const f = isBuyStronger 
+                    ? `Z:${b_Z.toFixed(0)} M:${b_M.toFixed(0)} S:${b_S.toFixed(0)} P:${b_P.toFixed(0)}`
+                    : `Z:${s_Z.toFixed(0)} M:${s_M.toFixed(0)} S:${s_S.toFixed(0)} P:${s_P.toFixed(0)}`;
+
+                this.logger.info(`[VIP Heartbeat] ${symbol} Strength: ${score.toFixed(1)}% ${sideTag} (${f}) | VAMP: ${currentPrice.toFixed(asset.config.precision)}`);
                 asset.lastLogTime = now;
             }
 
@@ -137,15 +141,24 @@ class FastStrategy {
             if (!this.bot.hasOpenPosition && !this.isOrderInProgress && !this.bot.isOrderInProgress) {
                 let side = null;
                 let finalScore = 0;
+                let forceString = "";
 
-                if (buyScore >= this.MIN_SCORE_LIMIT && buyScore >= sellScore) { side = 'buy'; finalScore = buyScore; }
-                else if (sellScore >= this.MIN_SCORE_LIMIT) { side = 'sell'; finalScore = sellScore; }
+                if (buyScore >= this.MIN_SCORE_LIMIT && buyScore >= sellScore) { 
+                    side = 'buy'; 
+                    finalScore = buyScore;
+                    forceString = `Z:${b_Z.toFixed(1)} M:${b_M.toFixed(1)} S:${b_S.toFixed(1)} P:${b_P.toFixed(1)}`;
+                }
+                else if (sellScore >= this.MIN_SCORE_LIMIT) { 
+                    side = 'sell'; 
+                    finalScore = sellScore;
+                    forceString = `Z:${s_Z.toFixed(1)} M:${s_M.toFixed(1)} S:${s_S.toFixed(1)} P:${s_P.toFixed(1)}`;
+                }
 
                 if (side && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS)) {
                     asset.lastTriggerTime = now;
                     const orderType = finalScore >= this.MIN_SCORE_MARKET ? 'market_order' : 'limit_order';
                     
-                    this.logger.info(`[🔥 TRIGGER] ${side.toUpperCase()} ${symbol} | CONF: ${finalScore.toFixed(1)}% | TYPE: ${orderType}`);
+                    this.logger.info(`[🔥 TRIGGER] ${side.toUpperCase()} ${symbol} | CONF: ${finalScore.toFixed(1)}% [${forceString}] | TYPE: ${orderType}`);
                     asset.position = { side: side, entryPrice: currentPrice, peakPrice: currentPrice };
                     
                     await this.executeMicroTrade(symbol, side, currentPrice, asset.config, orderType);
@@ -208,7 +221,7 @@ class FastStrategy {
 
         } catch (err) {
             this.logger.error(`[Exit Error] ${err.message}`);
-            // STATE RECOVERY FIX: Reset if exchange has no position to close
+            // STATE RECOVERY FIX
             if (err.message.includes('no_position_for_reduce_only') || err.message.includes('400')) {
                 this.logger.info(`[State Recovery] Forced position reset for ${symbol}.`);
                 asset.position = null;
@@ -260,7 +273,6 @@ class FastStrategy {
             
         } catch (err) {
             this.logger.warn(`[Entry Error] ${err.message}`);
-            // Zombie Position Prevention
             const asset = this.assets[symbol];
             if (asset) asset.position = null; 
         } finally { 
@@ -271,4 +283,4 @@ class FastStrategy {
 }
 
 module.exports = FastStrategy;
-                              
+        
