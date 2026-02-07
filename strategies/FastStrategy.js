@@ -1,6 +1,5 @@
 // FastStrategy.js
-// v1.7.0 - [FIX] Math Precision & Zero-Size Safety
-// Solves 400 Bad Request by sanitizing floating point math
+// v1.8.0 - [FIX] String IDs & Error Loop Prevention
 
 class FastStrategy {
     constructor(bot) {
@@ -15,9 +14,10 @@ class FastStrategy {
         this.LOCK_DURATION_MS = 1500;
         this.LOG_HEARTBEAT_MS = 30000; 
         
-        // MASTER CONFIG
-        // precision: Decimals for Price
-        // sizeDecimals: Decimals for Quantity (CRITICAL FIX)
+        // Anti-Spam: cooldown if we get an error
+        this.lastErrorTime = 0;
+        this.ERROR_COOLDOWN_MS = 5000; 
+
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, tickSize: 0.0001, lotSize: 1,     precision: 4, sizeDecimals: 0 },
             'BTC': { deltaId: 27,    tickSize: 0.1,    lotSize: 0.001, precision: 1, sizeDecimals: 3 },
@@ -42,10 +42,14 @@ class FastStrategy {
         this.slPercent = 0.12;
     }
 
-    getName() { return "FastStrategy (Math-Fixed v1.7)"; }
+    getName() { return "FastStrategy (String-ID Fix v1.8)"; }
 
     async onDepthUpdate(symbol, depth) {
+        // 1. Check Global Lock
         if (this.isOrderInProgress || this.bot.isOrderInProgress) return;
+
+        // 2. Check Error Cooldown (Prevents Spamming 400s)
+        if (Date.now() - this.lastErrorTime < this.ERROR_COOLDOWN_MS) return;
 
         const asset = this.assets[symbol];
         if (!asset || !depth.bids.length || !depth.asks.length) return;
@@ -53,7 +57,7 @@ class FastStrategy {
         const now = Date.now();
 
         try {
-            // 1. DATA PROCESSING
+            // --- DATA PROCESSING ---
             let bidQty = 0, askQty = 0, sumBidPQ = 0, sumAskPQ = 0;
             for (let i = 0; i < 5; i++) {
                 const bP = parseFloat(depth.bids[i][0]);
@@ -68,7 +72,7 @@ class FastStrategy {
             const bestAsk = parseFloat(depth.asks[0][0]);
             const midPrice = (bestBid + bestAsk) / 2;
 
-            // 2. SIGNAL MATH
+            // --- SIGNAL MATH ---
             const obi = (bidQty - askQty) / (bidQty + askQty);
             asset.history.obi.push(obi);
             if (asset.history.obi.length > this.OBI_WINDOW) asset.history.obi.shift();
@@ -77,7 +81,7 @@ class FastStrategy {
             const dOBI = obi - asset.history.prevOBI;
             const wdShift = ((sumBidPQ + sumAskPQ) / (bidQty + askQty) - midPrice) / asset.config.tickSize;
 
-            // 3. CONFIDENCE & TRIGGER
+            // --- CONFIDENCE ---
             let rawConf = (Math.min(Math.abs(obiZ) / 2.2, 1.0) * 0.5) + (Math.min(Math.abs(dOBI) / 0.1, 1.0) * 0.25) + (Math.min(Math.abs(wdShift) / 2.0, 1.0) * 0.25);
             const finalConfidence = rawConf * 0.8; 
 
@@ -86,6 +90,7 @@ class FastStrategy {
                 asset.lastLogTime = now;
             }
 
+            // --- TRIGGER ---
             const shouldFire = (finalConfidence >= this.MIN_CONF_FIRE) && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS);
 
             if (shouldFire) {
@@ -119,36 +124,26 @@ class FastStrategy {
         this.bot.isOrderInProgress = true;
         
         try {
-            // --- STEP A: Calculate Safe Size ---
+            // 1. Calculate Size
             const rawSize = parseFloat(this.bot.config.orderSize);
-            
-            // 1. Math to fit into lot size chunks
             let calculatedSize = Math.floor(rawSize / assetConfig.lotSize) * assetConfig.lotSize;
             
-            // 2. FIX: Handle floating point errors (e.g. 0.3000000004 -> "0.3")
+            // Format to correct decimals (0 for XRP, 3 for BTC)
             const sizeStr = calculatedSize.toFixed(assetConfig.sizeDecimals);
 
-            // 3. FIX: Stop if size is 0
-            if (parseFloat(sizeStr) === 0) {
-                this.logger.warn(`[Order Aborted] Size too small for ${symbol}. Config: ${rawSize}, Required: ${assetConfig.lotSize}`);
-                return;
-            }
-
-            // --- STEP B: Calculate Safe Prices ---
+            // 2. Calculate Prices
             const aggression = this.bot.config.priceAggressionOffset || 0.02;
             const limitPriceNum = (side === 'buy' ? price * (1 + aggression/100) : price * (1 - aggression/100));
-            
-            // Format Price to correct decimals
             const limitPriceStr = limitPriceNum.toFixed(assetConfig.precision);
 
-            // Calculate Stop Loss
             const slPriceNum = (side === 'buy' ? limitPriceNum * (1 - this.slPercent/100) : limitPriceNum * (1 + this.slPercent/100));
             const slPriceStr = slPriceNum.toFixed(assetConfig.precision);
 
-            // --- STEP C: Construct Payload ---
+            // 3. Construct Payload - [SOLUTION 2 APPLIED HERE]
+            // We force product_id to be a STRING to match AdvanceStrategy
             const orderData = {
-                product_id: parseInt(assetConfig.deltaId), // Send as Integer
-                size: sizeStr,                             // Send as Clean String
+                product_id: assetConfig.deltaId.toString(),  // <--- FIXED: Now a String
+                size: sizeStr,
                 side: side,
                 order_type: 'limit_order',
                 limit_price: limitPriceStr,
@@ -161,8 +156,9 @@ class FastStrategy {
             await this.bot.placeOrder(orderData);
             
         } catch (err) {
-            // Client.js will now log the detailed 400 error body
-            this.logger.warn(`[Strategy Error] ${symbol}: ${err.message}`);
+            // 4. Handle Error & TRIGGER COOLDOWN
+            this.lastErrorTime = Date.now(); // <--- This stops the spam for 5 seconds
+            this.logger.warn(`[Strategy Error] ${symbol}: ${err.message}. Pausing for 5s.`);
         } finally {
             this.isOrderInProgress = false; 
             this.bot.isOrderInProgress = false;
@@ -171,4 +167,4 @@ class FastStrategy {
 }
 
 module.exports = FastStrategy;
-    
+                    
