@@ -19,7 +19,7 @@ class FastStrategy {
         // --- EXIT CONFIGURATION ---
         this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '0'); 
         this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '65'); 
-        this.TRAILING_DIP_TICKS = 8;   
+        this.TRAILING_DIP_TICKS = 12;   
         this.slPercent = 0.15;         
 
         // Asset Specific Configurations (Delta Exchange Specs)
