@@ -1,5 +1,5 @@
 // FastStrategy.js
-// v3.1.0 - [FINAL] Weighted Confidence, VAMP Integration, & Dual-Mode Logging
+// v3.2.0 - [FINAL] Weighted Confidence, VAMP math, & One-Punch Logic
 
 class FastStrategy {
     constructor(bot) {
@@ -8,16 +8,16 @@ class FastStrategy {
 
         // --- STRATEGY CONFIG ---
         this.OBI_WINDOW = 100;
-        this.LOG_FREQ_MS = 5000;      // Heartbeat every 5s
-        this.MIN_SCORE_FIRE = 75;     // Threshold for trade (Out of 100)
-        this.LOCK_DURATION_MS = 1500; // Post-trade cooldown
+        this.LOG_FREQ_MS = 5000;      // Heartbeat frequency
+        this.MIN_SCORE_FIRE = 75;     // Threshold to punch order (out of 100)
+        this.LOCK_DURATION_MS = 2000; // Cooldown after a trade attempt
         
         // Safety & SL
         this.lastErrorTime = 0;
         this.ERROR_COOLDOWN_MS = 5000;
-        this.slPercent = 0.15;        // 0.15% safety net
+        this.slPercent = 0.15;        // 0.15% Safety Net
 
-        // MASTER ASSET CONFIG (Saturation values for 100% confidence)
+        // MASTER ASSET CONFIG (Saturation for 100% confidence per gate)
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, tickSize: 0.0001, lotSize: 1,     precision: 4, sizeDecimals: 0, saturationQty: 50000 },
             'BTC': { deltaId: 27,    tickSize: 0.1,    lotSize: 0.001, precision: 1, sizeDecimals: 3, saturationQty: 5.0 },
@@ -41,11 +41,11 @@ class FastStrategy {
         this.isOrderInProgress = false;
     }
 
-    getName() { return "FastStrategy (Micro-Weighted v3.1)"; }
+    getName() { return "FastStrategy (Micro-Weighted v3.2)"; }
 
     async onDepthUpdate(symbol, depth) {
-        // Prevent concurrent orders or firing during error cooldown
-        if (this.isOrderInProgress || this.bot.isOrderInProgress) return;
+        // --- ONE PUNCH RULE: Only trade if NO position exists and NO order is in flight ---
+        if (this.bot.hasOpenPosition || this.isOrderInProgress || this.bot.isOrderInProgress) return;
         if (Date.now() - this.lastErrorTime < this.ERROR_COOLDOWN_MS) return;
 
         const asset = this.assets[symbol];
@@ -54,12 +54,10 @@ class FastStrategy {
         const now = Date.now();
 
         try {
-            // ============================================
             // 1. DATA PROCESSING (Depth 5)
-            // ============================================
             let totalBidQty = 0, totalAskQty = 0;
-            let sumBidPQ = 0, sumAskPQ = 0;         // Weighted Price
-            let sumBidP_AskQ = 0, sumAskP_BidQ = 0; // VAMP Cross-Mult
+            let sumBidPQ = 0, sumAskPQ = 0;         // For Weighted Price (WDOBP)
+            let sumBidP_AskQ = 0, sumAskP_BidQ = 0; // For VAMP (Cross-mult)
 
             for (let i = 0; i < 5; i++) {
                 const bP = parseFloat(depth.bids[i][0]); const bQ = parseFloat(depth.bids[i][1]);
@@ -77,86 +75,54 @@ class FastStrategy {
                 return;
             }
 
-            // ============================================
-            // 2. RAW CALCULATIONS (Microstructure)
-            // ============================================
-            
-            // Gate 1: OBI Z-Score
+            // 2. RAW MICROSTRUCTURE CALCULATIONS
             const obi = (totalBidQty - totalAskQty) / (totalBidQty + totalAskQty);
             asset.history.obi.push(obi);
             if (asset.history.obi.length > this.OBI_WINDOW) asset.history.obi.shift();
+            
             const rawZ = this.calculateZScore(asset.history.obi);
-
-            // Gate 2: Momentum (dOBI)
             const rawDOBI = obi - asset.history.prevOBI;
-
-            // Gate 3: WD Shift (Ticks relative to VAMP)
+            
             const wdobp = (sumBidPQ + sumAskPQ) / (totalBidQty + totalAskQty);
             const vamp = (sumBidP_AskQ + sumAskP_BidQ) / (totalBidQty + totalAskQty);
             const rawShiftTicks = (wdobp - vamp) / asset.config.tickSize;
-
-            // Gate 4: Gravity Pull (Change in Quantities)
+            
             const rawPull = (asset.history.prevAskQty - totalAskQty) - (asset.history.prevBidQty - totalBidQty);
 
-            // ============================================
-            // 3. WEIGHTED CONFIDENCE SCORING
-            // ============================================
-            
-            // --- Scoring Parameters ---
-            // OBI: 30%, Momentum: 20%, Shift: 30%, Gravity Pull: 20%
-            
-            const buyScore = 
-                this.getScore(rawZ, 2.5, 30) + 
-                this.getScore(rawDOBI, 0.4, 20) + 
-                this.getScore(rawShiftTicks, 2.0, 30) + 
-                this.getScore(rawPull, asset.config.saturationQty, 20);
+            // 3. WEIGHTED SCORING (30/20/30/20)
+            const buyScore = this.getScore(rawZ, 2.5, 30) + this.getScore(rawDOBI, 0.4, 20) + 
+                             this.getScore(rawShiftTicks, 2.0, 30) + this.getScore(rawPull, asset.config.saturationQty, 20);
 
-            const sellScore = 
-                this.getScore(-rawZ, 2.5, 30) + 
-                this.getScore(-rawDOBI, 0.4, 20) + 
-                this.getScore(-rawShiftTicks, 2.0, 30) + 
-                this.getScore(-rawPull, asset.config.saturationQty, 20);
+            const sellScore = this.getScore(-rawZ, 2.5, 30) + this.getScore(-rawDOBI, 0.4, 20) + 
+                              this.getScore(-rawShiftTicks, 2.0, 30) + this.getScore(-rawPull, asset.config.saturationQty, 20);
 
-            // ============================================
-            // 4. DUAL-MODE LOGGING
-            // ============================================
-            
-            // MODE A: Heartbeat (Background Log every 5s)
+            const maxScore = Math.max(buyScore, sellScore);
+            const direction = buyScore > sellScore ? 'BUY' : 'SELL';
+
+            // 4. DUAL LOGGING
+            // Mode A: Heartbeat (5s)
             if (now - asset.lastLogTime > this.LOG_FREQ_MS) {
-                const direction = buyScore > sellScore ? 'BUY' : 'SELL';
-                const score = Math.max(buyScore, sellScore).toFixed(1);
-                this.logger.info(`[H-Beat] ${symbol} Strength: ${score}% (${direction}) -> [ Z:${rawZ.toFixed(2)} | dOBI:${rawDOBI.toFixed(3)} | Shift:${rawShiftTicks.toFixed(2)} | Pull:${rawPull.toFixed(2)} ]`);
+                this.logger.info(`[H-Beat] ${symbol} Strength: ${maxScore.toFixed(1)}% (${direction}) | Pos: ${this.bot.hasOpenPosition}`);
                 asset.lastLogTime = now;
             }
 
-            // ============================================
-            // 5. EXECUTION GATES
-            // ============================================
-            
-            if (!this.bot.hasOpenPosition && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS)) {
-                let side = null;
-                let finalScore = 0;
+            // 5. EXECUTION TRIGGER
+            if (maxScore >= this.MIN_SCORE_FIRE && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS)) {
+                asset.lastTriggerTime = now;
+                const side = direction.toLowerCase();
 
-                if (buyScore >= this.MIN_SCORE_FIRE) { side = 'buy'; finalScore = buyScore; }
-                else if (sellScore >= this.MIN_SCORE_FIRE) { side = 'sell'; finalScore = sellScore; }
+                // Mode B: Immediate Trigger Log
+                this.logger.info(`[🔥 TRIGGER] ${direction} ${symbol} | CONFIDENCE: ${maxScore.toFixed(1)}%`);
+                this.logger.info(`[Signal Breakdown] Z:${rawZ.toFixed(2)} | dOBI:${rawDOBI.toFixed(3)} | Shift:${rawShiftTicks.toFixed(2)} | Pull:${rawPull.toFixed(2)}`);
 
-                if (side) {
-                    asset.lastTriggerTime = now;
-                    
-                    // MODE B: Trigger Log (Immediate on Order Punch)
-                    this.logger.info(`[🔥 TRIGGER] ${side.toUpperCase()} ${symbol} | CONFIDENCE: ${finalScore.toFixed(1)}%`);
-                    this.logger.info(`[Signal Breakdown] Z:${rawZ.toFixed(2)} | dOBI:${rawDOBI.toFixed(3)} | Shift:${rawShiftTicks.toFixed(2)} | Pull:${rawPull.toFixed(2)}`);
-
-                    // Use VAMP for smarter entry price anchor
-                    const execPrice = side === 'buy' ? Math.min(vamp, standardMid) : Math.max(vamp, standardMid);
-                    await this.executeMicroTrade(symbol, side, execPrice, asset.config);
-                }
+                const execPrice = side === 'buy' ? Math.min(vamp, standardMid) : Math.max(vamp, standardMid);
+                await this.executeMicroTrade(symbol, side, execPrice, asset.config);
             }
 
             this.updateHistory(asset, obi, totalBidQty, totalAskQty);
 
         } catch (e) {
-            this.logger.error(`[FastStrategy] Critical Error: ${e.message}`);
+            this.logger.error(`[FastStrategy] Error: ${e.message}`);
         }
     }
 
@@ -200,7 +166,7 @@ class FastStrategy {
                 bracket_stop_trigger_method: 'mark_price'
             };
 
-            this.logger.info(`[Order Payload] Sending Aggressive IOC + Safety SL...`);
+            this.logger.info(`[Order Payload] PUNCHING ${side.toUpperCase()} @ ${orderData.limit_price} (SL: ${orderData.bracket_stop_loss_price})`);
             await this.bot.placeOrder(orderData);
             
         } catch (err) {
@@ -214,4 +180,4 @@ class FastStrategy {
 }
 
 module.exports = FastStrategy;
-        
+                        
