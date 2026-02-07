@@ -1,5 +1,5 @@
 // client.js
-// Version 15.0.0 - [X-RAY] Granular Latency Logging
+// Version 15.1.0 - [FIX] Exposed 400 Errors & Detailed Debugging
 
 const got = require('got');
 const crypto = require('crypto');
@@ -80,18 +80,15 @@ class DeltaClient {
                 responseType: 'json'
             });
 
-            // [X-RAY] Extract precise timings from the response
+            // [X-RAY] Extract precise timings
             const timings = response.timings;
-            
-            // Attach timings to the body so Strategy can log them
-            // We use a non-enumerable property to avoid breaking normal usage
             if (response.body && typeof response.body === 'object') {
                 Object.defineProperty(response.body, '_metrics', {
                     value: {
-                        dns: timings.phases.dns,      // Should be ~0ms
-                        tcp: timings.phases.tcp,      // Should be ~0ms
-                        tls: timings.phases.tls,      // Should be ~0ms
-                        server: timings.phases.total  // Total Request time
+                        dns: timings.phases.dns,
+                        tcp: timings.phases.tcp,
+                        tls: timings.phases.tls,
+                        server: timings.phases.total
                     },
                     enumerable: false
                 });
@@ -99,11 +96,17 @@ class DeltaClient {
 
             return response.body;
         } catch (err) {
+            // --- ERROR HANDLING FIX ---
             const status = err.response?.statusCode;
-            const responseData = err.response?.body;
-            if (status !== 400 && status !== 404) {
-                this.#logger.error(`[DeltaClient] Request Failed: ${err.message}`);
+            const errorBody = err.response?.body;
+            
+            // Log the specifics of the 400 Bad Request
+            if (status === 400 || status === 422) {
+                this.#logger.error(`[DeltaClient] ❌ API REJECTED (${status}): ${JSON.stringify(errorBody)}`);
+            } else {
+                this.#logger.error(`[DeltaClient] Request Failed (${status || 'Net'}): ${err.message}`);
             }
+            
             throw err; 
         }
     }
@@ -115,3 +118,4 @@ class DeltaClient {
 }
 
 module.exports = DeltaClient;
+            
