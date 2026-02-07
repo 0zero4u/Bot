@@ -11,7 +11,7 @@ class FastStrategy {
         this.LOG_FREQ_MS = 5000;      // Heartbeat log frequency
         
         // --- TIERED ENTRY THRESHOLDS ---
-        this.MIN_SCORE_LIMIT = 73;    // Tier 1: Place Limit Order (Standard)
+        this.MIN_SCORE_LIMIT = 43;    // Tier 1: Place Limit Order (Standard)
         this.MIN_SCORE_MARKET = 85;   // Tier 2: Place Market Order (High Confidence)
         
         this.LOCK_DURATION_MS = 2000; // Cooldown between signals to prevent spam
