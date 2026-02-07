@@ -13,7 +13,7 @@ class FastStrategy {
         this.LOCK_DURATION_MS = 2000; 
         
         // --- EXIT CONFIGURATION (Defaults provided) ---
-        this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '40'); 
+        this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '80'); 
         this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '55'); 
         this.TRAILING_DIP_TICKS = 2;   
         this.slPercent = 0.15;         
