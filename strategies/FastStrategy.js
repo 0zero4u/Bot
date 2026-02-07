@@ -9,7 +9,7 @@ class FastStrategy {
         // --- STRATEGY CONFIG ---
         this.OBI_WINDOW = 100;
         this.LOG_FREQ_MS = 5000;      // Heartbeat frequency
-        this.MIN_SCORE_FIRE = 75;     // Threshold to punch order (out of 100)
+        this.MIN_SCORE_FIRE = 60;     // Threshold to punch order (out of 100)
         this.LOCK_DURATION_MS = 2000; // Cooldown after a trade attempt
         
         // Safety & SL
