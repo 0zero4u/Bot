@@ -1,5 +1,5 @@
 // FastStrategy.js
-// v1.6 - [Microstructure] Strict 30s Heartbeat & Order-Only Logging
+// v1.6.1 - [Microstructure] Fixed High-Frequency Log Spam
 
 class FastStrategy {
     constructor(bot) {
@@ -8,9 +8,9 @@ class FastStrategy {
 
         // --- Model Configuration ---
         this.OBI_WINDOW = 100;
-        this.Z_THRESHOLD = 1.1; 
+        this.Z_THRESHOLD = 1.1;
         this.SHIFT_THRESHOLD = 0.5;
-        this.MIN_CONF_FIRE = 0.40; 
+        this.MIN_CONF_FIRE = 0.40;
         this.LOCK_DURATION_MS = 1500;
         
         // --- LOG FREQUENCY CONFIG ---
@@ -37,10 +37,10 @@ class FastStrategy {
         });
 
         this.isOrderInProgress = false;
-        this.slPercent = 0.12; 
+        this.slPercent = 0.12;
     }
 
-    getName() { return "FastStrategy (Strict-Log v1.6)"; }
+    getName() { return "FastStrategy (Optimized-Log v1.6.1)"; }
 
     async onDepthUpdate(symbol, depth) {
         if (this.isOrderInProgress || this.bot.isOrderInProgress) return;
@@ -79,24 +79,22 @@ class FastStrategy {
 
             // 3. CONFIDENCE & VOLATILITY
             let rawConf = (Math.min(Math.abs(obiZ) / 2.2, 1.0) * 0.5) + (Math.min(Math.abs(dOBI) / 0.1, 1.0) * 0.25) + (Math.min(Math.abs(wdShift) / 2.0, 1.0) * 0.25);
-            const vol = this.bot.volatility_estimate || 0.001; 
+            const vol = this.bot.volatility_estimate || 0.001;
             const finalConfidence = rawConf * Math.max(0.3, 1.0 - (vol * 150));
 
-            // 4. TRIGGER EVALUATION
-            const shouldFire = (finalConfidence >= this.MIN_CONF_FIRE) && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS);
-            
-            // --- UPDATED LOGGING LOGIC ---
-            // Only log if 30s passed OR we are actually firing an order
-            if (now - asset.lastLogTime > this.LOG_HEARTBEAT_MS || shouldFire) {
+            // 4. LOGGING LOGIC (HEARTBEAT ONLY)
+            // Separated from Trigger to stop high-frequency logging
+            if (now - asset.lastLogTime > this.LOG_HEARTBEAT_MS) {
                 this.logger.info(
-                    `[Model] ${symbol} | Z:${obiZ.toFixed(2)} | dOBI:${dOBI.toFixed(3)} | ` +
-                    `WDS:${wdShift.toFixed(2)} | TickDelta:${tickDelta.toFixed(6)} | ` +
+                    `[Heartbeat] ${symbol} | Z:${obiZ.toFixed(2)} | dOBI:${dOBI.toFixed(3)} | ` +
                     `MicroP:${microPrice.toFixed(4)} | Conf:${(finalConfidence * 100).toFixed(1)}%`
                 );
                 asset.lastLogTime = now;
             }
 
-            // 5. EXECUTION
+            // 5. TRIGGER EVALUATION
+            const shouldFire = (finalConfidence >= this.MIN_CONF_FIRE) && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS);
+
             if (shouldFire) {
                 let side = null;
                 if (obiZ > this.Z_THRESHOLD && dOBI > 0 && wdShift > this.SHIFT_THRESHOLD) side = 'buy';
