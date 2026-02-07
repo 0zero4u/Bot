@@ -1,5 +1,5 @@
 // FastStrategy.js
-// v1.8.0 - [FIX] String IDs & Error Loop Prevention
+// v1.9.0 - [FIX] Bracket Position Conflict & Anti-Spam
 
 class FastStrategy {
     constructor(bot) {
@@ -18,6 +18,7 @@ class FastStrategy {
         this.lastErrorTime = 0;
         this.ERROR_COOLDOWN_MS = 5000; 
 
+        // MASTER CONFIG
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, tickSize: 0.0001, lotSize: 1,     precision: 4, sizeDecimals: 0 },
             'BTC': { deltaId: 27,    tickSize: 0.1,    lotSize: 0.001, precision: 1, sizeDecimals: 3 },
@@ -42,13 +43,10 @@ class FastStrategy {
         this.slPercent = 0.12;
     }
 
-    getName() { return "FastStrategy (String-ID Fix v1.8)"; }
+    getName() { return "FastStrategy (Bracket-Fix v1.9)"; }
 
     async onDepthUpdate(symbol, depth) {
-        // 1. Check Global Lock
         if (this.isOrderInProgress || this.bot.isOrderInProgress) return;
-
-        // 2. Check Error Cooldown (Prevents Spamming 400s)
         if (Date.now() - this.lastErrorTime < this.ERROR_COOLDOWN_MS) return;
 
         const asset = this.assets[symbol];
@@ -90,7 +88,6 @@ class FastStrategy {
                 asset.lastLogTime = now;
             }
 
-            // --- TRIGGER ---
             const shouldFire = (finalConfidence >= this.MIN_CONF_FIRE) && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS);
 
             if (shouldFire) {
@@ -128,7 +125,6 @@ class FastStrategy {
             const rawSize = parseFloat(this.bot.config.orderSize);
             let calculatedSize = Math.floor(rawSize / assetConfig.lotSize) * assetConfig.lotSize;
             
-            // Format to correct decimals (0 for XRP, 3 for BTC)
             const sizeStr = calculatedSize.toFixed(assetConfig.sizeDecimals);
 
             // 2. Calculate Prices
@@ -139,10 +135,9 @@ class FastStrategy {
             const slPriceNum = (side === 'buy' ? limitPriceNum * (1 - this.slPercent/100) : limitPriceNum * (1 + this.slPercent/100));
             const slPriceStr = slPriceNum.toFixed(assetConfig.precision);
 
-            // 3. Construct Payload - [SOLUTION 2 APPLIED HERE]
-            // We force product_id to be a STRING to match AdvanceStrategy
+            // 3. Construct Payload
             const orderData = {
-                product_id: assetConfig.deltaId.toString(),  // <--- FIXED: Now a String
+                product_id: assetConfig.deltaId.toString(),
                 size: sizeStr,
                 side: side,
                 order_type: 'limit_order',
@@ -152,12 +147,20 @@ class FastStrategy {
                 bracket_stop_trigger_method: 'mark_price'
             };
 
+            // --- CRITICAL FIX: REMOVE BRACKET IF POSITION EXISTS ---
+            // If we already have a position, the API rejects new brackets with code "bracket_order_position_exists"
+            if (this.bot.hasOpenPosition) {
+                this.logger.info(`[Strategy] Open Position detected! Removing Bracket Params to prevent 400 Error.`);
+                delete orderData.bracket_stop_loss_price;
+                delete orderData.bracket_stop_trigger_method;
+            }
+
             this.logger.info(`[Order Payload] ${symbol} -> ${JSON.stringify(orderData)}`);
             await this.bot.placeOrder(orderData);
             
         } catch (err) {
             // 4. Handle Error & TRIGGER COOLDOWN
-            this.lastErrorTime = Date.now(); // <--- This stops the spam for 5 seconds
+            this.lastErrorTime = Date.now();
             this.logger.warn(`[Strategy Error] ${symbol}: ${err.message}. Pausing for 5s.`);
         } finally {
             this.isOrderInProgress = false; 
@@ -167,4 +170,4 @@ class FastStrategy {
 }
 
 module.exports = FastStrategy;
-                    
+            
