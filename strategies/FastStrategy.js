@@ -1,5 +1,5 @@
 // FastStrategy.js
-// v1.5 - [Microstructure] Low-Frequency Model Logging (30s)
+// v1.5 - [Microstructure] Gravity-Alpha with 30s Heartbeat Logging
 
 class FastStrategy {
     constructor(bot) {
@@ -7,15 +7,16 @@ class FastStrategy {
         this.logger = bot.logger;
 
         // --- Model Configuration ---
-        this.OBI_WINDOW = 100;
-        this.Z_THRESHOLD = 1.1; 
-        this.SHIFT_THRESHOLD = 0.5;
-        this.MIN_CONF_FIRE = 0.40; 
-        this.LOCK_DURATION_MS = 1500;
+        this.OBI_WINDOW = 100;           // Rolling window for Z-Score
+        this.Z_THRESHOLD = 1.1;          // Min Z-Score required to trigger
+        this.SHIFT_THRESHOLD = 0.5;      // Min Tick Shift required
+        this.MIN_CONF_FIRE = 0.40;       // Minimum 40% confidence to execute
+        this.LOCK_DURATION_MS = 1500;    // Execution cooldown
         
-        // --- LOG FREQUENCY CONFIG ---
-        this.LOG_HEARTBEAT_MS = 30000; // Updated to 30 seconds
-        
+        // --- Log Frequency Config ---
+        this.LOG_HEARTBEAT_MS = 30000;   // 30s status update if no order fires
+
+        // Asset Master Config
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, tickSize: 0.0001 },
             'BTC': { deltaId: 27,    tickSize: 0.1 },
@@ -40,8 +41,12 @@ class FastStrategy {
         this.slPercent = 0.12; 
     }
 
-    getName() { return "FastStrategy (30s-Log v1.5)"; }
+    getName() { return "FastStrategy (Gravity-Alpha v1.5)"; }
 
+    /**
+     * @param {string} symbol 
+     * @param {object} depth - { bids: [["p","q"],...], asks: [["p","q"],...] }
+     */
     async onDepthUpdate(symbol, depth) {
         if (this.isOrderInProgress || this.bot.isOrderInProgress) return;
 
@@ -51,43 +56,56 @@ class FastStrategy {
         const now = Date.now();
 
         try {
-            // 1. DATA PARSING
+            // 1. DATA SUMMATION (Top 5 Levels)
             let bidQty = 0, askQty = 0, sumBidPQ = 0, sumAskPQ = 0;
+
             for (let i = 0; i < 5; i++) {
                 const bP = parseFloat(depth.bids[i][0]);
                 const bQ = parseFloat(depth.bids[i][1]);
                 const aP = parseFloat(depth.asks[i][0]);
                 const aQ = parseFloat(depth.asks[i][1]);
-                bidQty += bQ; askQty += aQ;
-                sumBidPQ += (bP * bQ); sumAskPQ += (aP * aQ);
+
+                bidQty += bQ;
+                askQty += aQ;
+                sumBidPQ += (bP * bQ);
+                sumAskPQ += (aP * aQ);
             }
 
             const bestBid = parseFloat(depth.bids[0][0]);
             const bestAsk = parseFloat(depth.asks[0][0]);
             const midPrice = (bestBid + bestAsk) / 2;
 
-            // 2. MODEL MATH
+            // 2. MATHEMATICAL FEATURES
             const obi = (bidQty - askQty) / (bidQty + askQty);
             asset.history.obi.push(obi);
             if (asset.history.obi.length > this.OBI_WINDOW) asset.history.obi.shift();
             
             const obiZ = this.calculateZScore(asset.history.obi);
             const dOBI = obi - asset.history.prevOBI;
+            
+            // Micro-Price & Gravity (Tick Delta)
             const microPrice = ((bidQty * bestAsk) + (askQty * bestBid)) / (bidQty + askQty);
-            const wdShift = ((sumBidPQ + sumAskPQ) / (bidQty + askQty) - midPrice) / asset.config.tickSize;
+            const pWD = (sumBidPQ + sumAskPQ) / (bidQty + askQty);
+            const wdShift = (pWD - midPrice) / asset.config.tickSize;
             const tickDelta = wdShift * asset.config.tickSize;
 
-            // 3. CONFIDENCE & PENALTY
-            let rawConf = (Math.min(Math.abs(obiZ) / 2.2, 1.0) * 0.5) + (Math.min(Math.abs(dOBI) / 0.1, 1.0) * 0.25) + (Math.min(Math.abs(wdShift) / 2.0, 1.0) * 0.25);
-            const vol = this.bot.volatility_estimate || 0.001; 
-            const finalConfidence = rawConf * Math.max(0.3, 1.0 - (vol * 150));
+            // 3. CONFIDENCE & VOLATILITY PENALTY
+            const c_obiZ = Math.min(Math.abs(obiZ) / 2.2, 1.0);
+            const c_mom = Math.min(Math.abs(dOBI) / 0.1, 1.0);
+            const c_shift = Math.min(Math.abs(wdShift) / 2.0, 1.0);
+            
+            let rawConf = (c_obiZ * 0.5) + (c_mom * 0.25) + (c_shift * 0.25);
+            
+            // Adjust confidence based on real-time volatility
+            const vol = this.bot.volatility_estimate || 0.001;
+            const volPenalty = Math.max(0.3, 1.0 - (vol * 150));
+            const finalConfidence = rawConf * volPenalty;
 
-            // 4. LOW FREQUENCY LOGGING LOGIC
+            // 4. THROTTLED LOGGING (30s Heartbeat)
             const shouldFire = (finalConfidence >= this.MIN_CONF_FIRE) && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS);
-            const isHeartbeatTime = (now - asset.lastLogTime > this.LOG_HEARTBEAT_MS);
+            const isHeartbeat = (now - asset.lastLogTime > this.LOG_HEARTBEAT_MS);
 
-            // Logic: Only log if we are about to trade OR if 30 seconds have passed
-            if (shouldFire || isHeartbeatTime) {
+            if (shouldFire || isHeartbeat) {
                 this.logger.info(
                     `[Model] ${symbol} | Z:${obiZ.toFixed(2)} | dOBI:${dOBI.toFixed(3)} | ` +
                     `WDS:${wdShift.toFixed(2)} | TickDelta:${tickDelta.toFixed(6)} | ` +
@@ -96,50 +114,71 @@ class FastStrategy {
                 asset.lastLogTime = now;
             }
 
-            // 5. EXECUTION
+            // 5. TRIGGER & EXECUTION
+            let side = null;
             if (shouldFire) {
-                let side = null;
                 if (obiZ > this.Z_THRESHOLD && dOBI > 0 && wdShift > this.SHIFT_THRESHOLD) side = 'buy';
                 else if (obiZ < -this.Z_THRESHOLD && dOBI < 0 && wdShift < -this.SHIFT_THRESHOLD) side = 'sell';
-
-                if (side) {
-                    asset.lastTriggerTime = now;
-                    this.logger.info(`[Micro-Alpha] 🔫 FIRE: ${side.toUpperCase()} ${symbol} | Conf: ${(finalConfidence * 100).toFixed(1)}% | Price: ${midPrice.toFixed(4)}`);
-                    await this.executeMicroTrade(symbol, side, midPrice, asset.config.deltaId, finalConfidence);
-                }
             }
 
-            asset.history.prevOBI = obi; asset.history.prevAskQty = askQty; asset.history.prevBidQty = bidQty;
+            if (side) {
+                asset.lastTriggerTime = now;
+                
+                this.logger.info(
+                    `[Micro-Alpha] 🔫 FIRE: ${side.toUpperCase()} ${symbol} | ` +
+                    `Conf: ${(finalConfidence * 100).toFixed(1)}% | ` +
+                    `Size: ${parseFloat(this.bot.config.orderSize).toFixed(2)} | ` +
+                    `Price: ${midPrice.toFixed(4)}`
+                );
+                
+                await this.executeMicroTrade(symbol, side, midPrice, asset.config.deltaId, finalConfidence);
+            }
+
+            // History Update
+            asset.history.prevOBI = obi;
+            asset.history.prevAskQty = askQty;
+            asset.history.prevBidQty = bidQty;
 
         } catch (e) {
-            this.logger.error(`[FastStrategy] Error: ${e.message}`);
+            this.logger.error(`[FastStrategy] Model Error: ${e.message}`);
         }
     }
 
     calculateZScore(values) {
         if (values.length < 20) return 0;
-        const mean = values.reduce((a, b) => a + b) / values.length;
-        const std = Math.sqrt(values.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b) / values.length);
-        return std === 0 ? 0 : (values[values.length - 1] - mean) / std;
+        const n = values.length;
+        const mean = values.reduce((a, b) => a + b) / n;
+        const std = Math.sqrt(values.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b) / n);
+        return std === 0 ? 0 : (values[n - 1] - mean) / std;
     }
 
     async executeMicroTrade(asset, side, price, productId, confidence) {
-        this.isOrderInProgress = true; this.bot.isOrderInProgress = true;
+        this.isOrderInProgress = true;
+        this.bot.isOrderInProgress = true;
         try {
-            const size = (parseFloat(this.bot.config.orderSize) * confidence).toFixed(2);
+            // size is fixed to configured ORDER_SIZE to ensure API compatibility
+            const size = parseFloat(this.bot.config.orderSize).toFixed(2);
             const aggression = this.bot.config.priceAggressionOffset || 0.02;
             const limitPrice = (side === 'buy' ? price * (1 + aggression/100) : price * (1 - aggression/100)).toFixed(4);
+            
             const orderData = {
-                product_id: productId.toString(), size, side, order_type: 'limit_order', limit_price: limitPrice,
-                time_in_force: 'ioc', bracket_stop_loss_price: (side === 'buy' ? limitPrice * (1 - this.slPercent/100) : limitPrice * (1 + this.slPercent/100)).toFixed(4),
+                product_id: productId.toString(),
+                size: size,
+                side: side,
+                order_type: 'limit_order',
+                limit_price: limitPrice,
+                time_in_force: 'ioc',
+                bracket_stop_loss_price: (side === 'buy' ? limitPrice * (1 - this.slPercent/100) : limitPrice * (1 + this.slPercent/100)).toFixed(4),
                 bracket_stop_trigger_method: 'mark_price'
             };
+
             await this.bot.placeOrder(orderData);
         } finally {
-            this.isOrderInProgress = false; this.bot.isOrderInProgress = false;
+            this.isOrderInProgress = false;
+            this.bot.isOrderInProgress = false;
         }
     }
 }
 
 module.exports = FastStrategy;
-            
+                           
