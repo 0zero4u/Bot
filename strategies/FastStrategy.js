@@ -1,5 +1,5 @@
 // FastStrategy.js
-// v5.0.0 - [Dual-Tier Entry] Limit (74+) vs Market (85+) | Enhanced Logging & Safety
+// v6.0.0 - [FINAL] VAMP-Effective Math | Dual-Tier Entry | Zombie State Fix
 
 class FastStrategy {
     constructor(bot) {
@@ -7,14 +7,14 @@ class FastStrategy {
         this.logger = bot.logger;
 
         // --- CORE STRATEGY CONFIG ---
-        this.OBI_WINDOW = 100;
-        this.LOG_FREQ_MS = 5000;
+        this.OBI_WINDOW = 100;        // Window size for Order Book Imbalance history
+        this.LOG_FREQ_MS = 5000;      // Heartbeat log frequency
         
         // --- TIERED ENTRY THRESHOLDS ---
-        this.MIN_SCORE_LIMIT = 74;    // Tier 1: Limit Order
-        this.MIN_SCORE_MARKET = 85;   // Tier 2: Market Order (Aggressive)
+        this.MIN_SCORE_LIMIT = 74;    // Tier 1: Place Limit Order (Standard)
+        this.MIN_SCORE_MARKET = 85;   // Tier 2: Place Market Order (High Confidence)
         
-        this.LOCK_DURATION_MS = 2000; 
+        this.LOCK_DURATION_MS = 2000; // Cooldown between signals to prevent spam
         
         // --- EXIT CONFIGURATION ---
         this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '0'); 
@@ -22,6 +22,7 @@ class FastStrategy {
         this.TRAILING_DIP_TICKS = 100;   
         this.slPercent = 0.15;         
 
+        // Asset Specific Configurations (Delta Exchange Specs)
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, tickSize: 0.0001, lotSize: 1,     precision: 4, sizeDecimals: 0, saturationQty: 50000 },
             'BTC': { deltaId: 27,    tickSize: 0.1,    lotSize: 0.001, precision: 1, sizeDecimals: 3, saturationQty: 5.0 },
@@ -46,8 +47,12 @@ class FastStrategy {
         this.isOrderInProgress = false;
     }
 
-    getName() { return "FastStrategy (Dual-Tier v5.0)"; }
+    getName() { return "FastStrategy (VAMP-Eff v6.0)"; }
 
+    /**
+     * Core Loop: Processes Depth5 updates from Binance/Internal Feed
+     * Calculates VAMP, OBI, and triggers trades based on weighted scores.
+     */
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
         if (!asset || !depth.bids.length || !depth.asks.length) return;
@@ -55,64 +60,86 @@ class FastStrategy {
         const now = Date.now();
 
         try {
-            // 1. DATA PROCESSING
+            // --- 1. VAMP & DATA PROCESSING (IMPROVED FORMULA) ---
             let totalBidQty = 0, totalAskQty = 0;
             let sumBidPQ = 0, sumAskPQ = 0;         
-            let sumBidP_AskQ = 0, sumAskP_BidQ = 0; 
 
+            // Iterate top 5 levels
             for (let i = 0; i < 5; i++) {
                 const bP = parseFloat(depth.bids[i][0]); const bQ = parseFloat(depth.bids[i][1]);
                 const aP = parseFloat(depth.asks[i][0]); const aQ = parseFloat(depth.asks[i][1]);
-                totalBidQty += bQ; totalAskQty += aQ;
-                sumBidPQ += (bP * bQ); sumAskPQ += (aP * aQ);
-                sumBidP_AskQ += (bP * aQ); sumAskP_BidQ += (aP * bQ);
+                
+                totalBidQty += bQ; 
+                totalAskQty += aQ;
+                
+                // Accumulate Weighted Price for "Effective Price" Calc
+                sumBidPQ += (bP * bQ); 
+                sumAskPQ += (aP * aQ);
             }
 
-            const standardMid = (parseFloat(depth.bids[0][0]) + parseFloat(depth.asks[0][0])) / 2;
-            const vamp = (sumBidP_AskQ + sumAskP_BidQ) / (totalBidQty + totalAskQty);
-            const currentPrice = vamp; 
+            // [MATH FIX] VAMP-Effective Calculation
+            // Step A: Calculate Effective Price (Weighted Average Price) for each side
+            const pEffectiveBid = sumBidPQ / totalBidQty;
+            const pEffectiveAsk = sumAskPQ / totalAskQty;
 
-            // 2. RAW CALCULATIONS
+            // Step B: Calculate VAMP_Effective by cross-weighting (P_bid * Q_ask + P_ask * Q_bid) / Total_Q
+            // This is more stable than raw cross-multiplication for HFT.
+            const vampEffective = (pEffectiveBid * totalAskQty + pEffectiveAsk * totalBidQty) / (totalBidQty + totalAskQty);
+            const currentPrice = vampEffective; 
+            
+            // Standard Mid Price for sanity check / limit orders
+            const standardMid = (parseFloat(depth.bids[0][0]) + parseFloat(depth.asks[0][0])) / 2;
+
+            // --- 2. SIGNAL GENERATION ---
+            // Standard OBI Calculation
             const obi = (totalBidQty - totalAskQty) / (totalBidQty + totalAskQty);
             asset.history.obi.push(obi);
             if (asset.history.obi.length > this.OBI_WINDOW) asset.history.obi.shift();
             
+            // Z-Score of OBI (Statistical deviation)
             const rawZ = this.calculateZScore(asset.history.obi);
+            // Delta OBI (Momentum of imbalance)
             const rawDOBI = obi - asset.history.prevOBI;
+            
+            // Weighted Depth Order Book Price (WDOBP) Shift
+            // WDOBP uses same-side weighting: (SumBidPQ + SumAskPQ) / TotalQ
             const wdobp = (sumBidPQ + sumAskPQ) / (totalBidQty + totalAskQty);
-            const rawShiftTicks = (wdobp - vamp) / asset.config.tickSize;
+            const rawShiftTicks = (wdobp - vampEffective) / asset.config.tickSize;
+            
+            // Order Book Pull (Liquidity disappearing)
             const rawPull = (asset.history.prevAskQty - totalAskQty) - (asset.history.prevBidQty - totalBidQty);
 
-            // 3. WEIGHTED SCORING
+            // --- 3. WEIGHTED SCORING ---
             const buyScore = this.getScore(rawZ, 2.5, 30) + this.getScore(rawDOBI, 0.4, 20) + 
                              this.getScore(rawShiftTicks, 2.0, 30) + this.getScore(rawPull, asset.config.saturationQty, 20);
 
             const sellScore = this.getScore(-rawZ, 2.5, 30) + this.getScore(-rawDOBI, 0.4, 20) + 
                               this.getScore(-rawShiftTicks, 2.0, 30) + this.getScore(-rawPull, asset.config.saturationQty, 20);
 
-            // 4. OPEN POSITION MANAGEMENT
+            // --- 4. POSITION MANAGEMENT ---
             if (this.bot.hasOpenPosition && asset.position) {
                 this.manageExits(symbol, currentPrice, buyScore, sellScore);
                 this.updateHistory(asset, obi, totalBidQty, totalAskQty);
                 return; 
             }
 
-            // 5. HEARTBEAT LOGGING (Enhanced with Direction)
+            // --- 5. INTELLIGENT LOGGING ---
             if (now - asset.lastLogTime > this.LOG_FREQ_MS) {
+                // Determine which side is stronger for the log
                 const isBuyStronger = buyScore >= sellScore;
                 const score = isBuyStronger ? buyScore : sellScore;
                 const sideTag = isBuyStronger ? '[BUY]' : '[SELL]';
                 
-                this.logger.info(`[H-Beat] ${symbol} Strength: ${score.toFixed(1)}% ${sideTag} | Pos: ${this.bot.hasOpenPosition}`);
+                this.logger.info(`[H-Beat] ${symbol} Strength: ${score.toFixed(1)}% ${sideTag} | VAMP: ${currentPrice.toFixed(asset.config.precision)}`);
                 asset.lastLogTime = now;
             }
 
-            // 6. ENTRY LOGIC (DUAL-TIER)
+            // --- 6. DUAL-TIER ENTRY LOGIC ---
             if (!this.bot.hasOpenPosition && !this.isOrderInProgress && !this.bot.isOrderInProgress) {
                 let side = null;
                 let finalScore = 0;
 
-                // [Fix] Determine side based on which score is higher if both are active
+                // [LOGIC FIX] Pick the stronger side if both are active
                 if (buyScore >= this.MIN_SCORE_LIMIT && buyScore >= sellScore) { 
                     side = 'buy'; finalScore = buyScore; 
                 }
@@ -123,17 +150,20 @@ class FastStrategy {
                 if (side && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS)) {
                     asset.lastTriggerTime = now;
 
-                    // --- DETERMINE ORDER TYPE ---
-                    // 85+ = Market | 74-84 = Limit
+                    // [TIERED ENTRY]
+                    // Score 85+ -> MARKET Order (Get in NOW)
+                    // Score 74-84 -> LIMIT Order (Try to catch price)
                     const orderType = finalScore >= this.MIN_SCORE_MARKET ? 'market_order' : 'limit_order';
                     const typeTag = orderType === 'market_order' ? '🚀 MARKET' : 'LIMIT';
 
                     this.logger.info(`[🔥 TRIGGER] ${side.toUpperCase()} ${symbol} | CONF: ${finalScore.toFixed(1)}% | TYPE: ${typeTag}`);
                     
-                    // Optimistic state set (will be cleared if order fails)
+                    // Optimistic state set (Cleared if order fails)
                     asset.position = { side: side, entryPrice: currentPrice, peakPrice: currentPrice };
                     
-                    const execPrice = side === 'buy' ? Math.min(vamp, standardMid) : Math.max(vamp, standardMid);
+                    // Limit price logic: Buy below VAMP, Sell above VAMP (or at VAMP based on aggression)
+                    const execPrice = side === 'buy' ? Math.min(vampEffective, standardMid) : Math.max(vampEffective, standardMid);
+                    
                     await this.executeMicroTrade(symbol, side, execPrice, asset.config, orderType);
                 }
             }
@@ -146,7 +176,7 @@ class FastStrategy {
     }
 
     manageExits(symbol, currentPrice, buyScore, sellScore) {
-        // [Fix] Concurrency check
+        // [SAFETY] Prevent double-firing exit orders
         if (this.isOrderInProgress || this.bot.isOrderInProgress) return;
 
         const asset = this.assets[symbol];
@@ -169,13 +199,13 @@ class FastStrategy {
             return this.executeMarketExit(symbol, `2-tick dip from peak ($${dip.toFixed(4)})`);
         }
 
-        // B. ALPHA DECAY
+        // B. ALPHA DECAY (Exit if signal strength drops too low)
         const currentConf = pos.side === 'buy' ? buyScore : sellScore;
         if (currentConf < this.ALPHA_DECAY_THRESHOLD) {
             return this.executeMarketExit(symbol, `Alpha Decay (Strength ${currentConf.toFixed(1)}% < ${this.ALPHA_DECAY_THRESHOLD}%)`);
         }
 
-        // C. MOMENTUM FLIP
+        // C. MOMENTUM FLIP (Exit if opposing signal becomes strong)
         const opposingConf = pos.side === 'buy' ? sellScore : buyScore;
         if (opposingConf >= this.MOMENTUM_FLIP_THRESHOLD) {
             return this.executeMarketExit(symbol, `Momentum Flip (Opposing Strength ${opposingConf.toFixed(1)}% > ${this.MOMENTUM_FLIP_THRESHOLD}%)`);
@@ -227,7 +257,10 @@ class FastStrategy {
         return std === 0 ? 0 : (values[values.length - 1] - mean) / std;
     }
 
-    // [Refined] Now supports distinct Limit vs Market order types
+    /**
+     * Executes the entry order using either LIMIT (IOC) or MARKET.
+     * Includes "Zombie State" fix to clear position if order fails.
+     */
     async executeMicroTrade(symbol, side, price, assetConfig, orderType) {
         this.isOrderInProgress = true; 
         this.bot.isOrderInProgress = true;
@@ -244,18 +277,16 @@ class FastStrategy {
                 order_type: orderType, // 'limit_order' or 'market_order'
             };
 
-            // Add Limit Order specific fields
+            // Limit Order Specifics (Aggressive Price + Bracket SL)
             if (orderType === 'limit_order') {
                 const aggression = this.bot.config.priceAggressionOffset || 0.02; // Treated as % offset
                 const limitPriceNum = (side === 'buy' ? price * (1 + aggression/100) : price * (1 - aggression/100));
                 
-                // Add SL only on Limit Orders (Market orders usually fill instantly, manage SL manually or via separate call if needed)
-                // Note: Delta Exchange Market orders don't always support bracket params in same payload, 
-                // but if they do, you can uncomment below. For now, we apply Bracket to Limit only to be safe.
+                // Bracket SL attached to Limit Order
                 const slPriceNum = (side === 'buy' ? limitPriceNum * (1 - this.slPercent/100) : limitPriceNum * (1 + this.slPercent/100));
 
                 orderData.limit_price = limitPriceNum.toFixed(assetConfig.precision);
-                orderData.time_in_force = 'ioc';
+                orderData.time_in_force = 'ioc'; // Immediate-or-Cancel
                 orderData.bracket_stop_loss_price = slPriceNum.toFixed(assetConfig.precision);
                 orderData.bracket_stop_trigger_method = 'mark_price';
             }
@@ -266,8 +297,8 @@ class FastStrategy {
             this.lastErrorTime = Date.now();
             this.logger.warn(`[Execution Error] ${err.message}`);
             
-            // [Critical Fix] Reset position state if the API call failed!
-            // This prevents the "Zombie Position" bug where the bot thinks it has a trade open.
+            // [CRITICAL FIX] "Zombie Position" Prevention
+            // If the API call failed, we MUST clear the internal position state.
             const asset = this.assets[symbol];
             if (asset) {
                 asset.position = null;
@@ -282,4 +313,3 @@ class FastStrategy {
 }
 
 module.exports = FastStrategy;
-                    
