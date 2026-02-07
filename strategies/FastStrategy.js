@@ -28,8 +28,8 @@ class FastStrategy {
         
         // --- EXIT CONFIGURATION ---
         this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '0'); 
-        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '70'); 
-        this.TRAILING_DIP_TICKS = 100;   
+        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '75'); 
+        this.TRAILING_DIP_TICKS = 10;   
         this.slPercent = 0.15;         
 
         const MASTER_CONFIG = {
