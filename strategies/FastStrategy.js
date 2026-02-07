@@ -7,7 +7,7 @@ class FastStrategy {
         this.logger = bot.logger;
 
         // --- CORE STRATEGY CONFIG ---
-        this.OBI_WINDOW = parseInt(process.env.OBI_WINDOW || '500'); 
+        this.OBI_WINDOW = parseInt(process.env.OBI_WINDOW || '250'); 
         this.LOG_FREQ_MS = 5000;
         
         // --- TIERED ENTRY THRESHOLDS ---
