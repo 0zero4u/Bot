@@ -10,7 +10,7 @@ class FastStrategy {
         this.OBI_WINDOW = 100;
         this.Z_THRESHOLD = 1.1;
         this.SHIFT_THRESHOLD = 0.5;
-        this.MIN_CONF_FIRE = 0.40;
+        this.MIN_CONF_FIRE = 0.60;
         this.LOCK_DURATION_MS = 1500;
         this.LOG_HEARTBEAT_MS = 30000; 
         
