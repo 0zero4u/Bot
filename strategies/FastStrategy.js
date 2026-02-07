@@ -9,7 +9,7 @@ class FastStrategy {
         // --- CORE STRATEGY CONFIG ---
         this.OBI_WINDOW = 100;
         this.LOG_FREQ_MS = 5000;      
-        this.MIN_SCORE_FIRE = 75;     
+        this.MIN_SCORE_FIRE = 71;     
         this.LOCK_DURATION_MS = 2000; 
         
         // --- EXIT CONFIGURATION (Defaults provided) ---
