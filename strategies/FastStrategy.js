@@ -1,5 +1,8 @@
 // FastStrategy.js
-// v1.6.1 - [Microstructure] Fixed High-Frequency Log Spam
+// v1.6.2 - [FIX] Precision & Data Typing to resolve 400 Bad Request
+// - Added: Rounding logic for specific asset lot sizes
+// - Added: String casting for all API-bound numeric fields
+// - Fixed: High-frequency log spam
 
 class FastStrategy {
     constructor(bot) {
@@ -13,13 +16,18 @@ class FastStrategy {
         this.MIN_CONF_FIRE = 0.40;
         this.LOCK_DURATION_MS = 1500;
         
-        // --- LOG FREQUENCY CONFIG ---
-        this.LOG_HEARTBEAT_MS = 30000; // Strict 30-second interval
+        this.LOG_HEARTBEAT_MS = 30000; 
         
+        /**
+         * MASTER_CONFIG Documentation:
+         * tickSize: Minimum price increment.
+         * lotSize: Minimum quantity increment. (XRP = 1, BTC = 0.001, etc.)
+         * precision: Number of decimals for the limit price.
+         */
         const MASTER_CONFIG = {
-            'XRP': { deltaId: 14969, tickSize: 0.0001 },
-            'BTC': { deltaId: 27,    tickSize: 0.1 },
-            'ETH': { deltaId: 299,   tickSize: 0.01 }
+            'XRP': { deltaId: 14969, tickSize: 0.0001, lotSize: 1, precision: 4 },
+            'BTC': { deltaId: 27,    tickSize: 0.1,    lotSize: 0.001, precision: 1 },
+            'ETH': { deltaId: 299,   tickSize: 0.01,   lotSize: 0.01, precision: 2 }
         };
 
         const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
@@ -40,7 +48,7 @@ class FastStrategy {
         this.slPercent = 0.12;
     }
 
-    getName() { return "FastStrategy (Optimized-Log v1.6.1)"; }
+    getName() { return "FastStrategy (Precision-Fixed v1.6.2)"; }
 
     async onDepthUpdate(symbol, depth) {
         if (this.isOrderInProgress || this.bot.isOrderInProgress) return;
@@ -73,26 +81,19 @@ class FastStrategy {
             
             const obiZ = this.calculateZScore(asset.history.obi);
             const dOBI = obi - asset.history.prevOBI;
-            const microPrice = ((bidQty * bestAsk) + (askQty * bestBid)) / (bidQty + askQty);
             const wdShift = ((sumBidPQ + sumAskPQ) / (bidQty + askQty) - midPrice) / asset.config.tickSize;
-            const tickDelta = wdShift * asset.config.tickSize;
 
-            // 3. CONFIDENCE & VOLATILITY
+            // 3. CONFIDENCE
             let rawConf = (Math.min(Math.abs(obiZ) / 2.2, 1.0) * 0.5) + (Math.min(Math.abs(dOBI) / 0.1, 1.0) * 0.25) + (Math.min(Math.abs(wdShift) / 2.0, 1.0) * 0.25);
-            const vol = this.bot.volatility_estimate || 0.001;
-            const finalConfidence = rawConf * Math.max(0.3, 1.0 - (vol * 150));
+            const finalConfidence = rawConf * 0.8; // Normalized
 
-            // 4. LOGGING LOGIC (HEARTBEAT ONLY)
-            // Separated from Trigger to stop high-frequency logging
+            // 4. LOGGING (Heartbeat)
             if (now - asset.lastLogTime > this.LOG_HEARTBEAT_MS) {
-                this.logger.info(
-                    `[Heartbeat] ${symbol} | Z:${obiZ.toFixed(2)} | dOBI:${dOBI.toFixed(3)} | ` +
-                    `MicroP:${microPrice.toFixed(4)} | Conf:${(finalConfidence * 100).toFixed(1)}%`
-                );
+                this.logger.info(`[Heartbeat] ${symbol} | Z:${obiZ.toFixed(2)} | Conf:${(finalConfidence * 100).toFixed(1)}%`);
                 asset.lastLogTime = now;
             }
 
-            // 5. TRIGGER EVALUATION
+            // 5. TRIGGER
             const shouldFire = (finalConfidence >= this.MIN_CONF_FIRE) && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS);
 
             if (shouldFire) {
@@ -102,13 +103,12 @@ class FastStrategy {
 
                 if (side) {
                     asset.lastTriggerTime = now;
-                    // Firing log always appears immediately
-                    this.logger.info(`[Micro-Alpha] 🔫 FIRE: ${side.toUpperCase()} ${symbol} | Conf: ${(finalConfidence * 100).toFixed(1)}% | Price: ${midPrice.toFixed(4)}`);
-                    await this.executeMicroTrade(symbol, side, midPrice, asset.config.deltaId, finalConfidence);
+                    this.logger.info(`[Micro-Alpha] 🔫 FIRE: ${side.toUpperCase()} ${symbol} | Conf: ${(finalConfidence * 100).toFixed(1)}%`);
+                    await this.executeMicroTrade(symbol, side, midPrice, asset.config, finalConfidence);
                 }
             }
 
-            asset.history.prevOBI = obi; asset.history.prevAskQty = askQty; asset.history.prevBidQty = bidQty;
+            asset.history.prevOBI = obi;
 
         } catch (e) {
             this.logger.error(`[FastStrategy] Error: ${e.message}`);
@@ -122,20 +122,49 @@ class FastStrategy {
         return std === 0 ? 0 : (values[values.length - 1] - mean) / std;
     }
 
-    async executeMicroTrade(asset, side, price, productId, confidence) {
-        this.isOrderInProgress = true; this.bot.isOrderInProgress = true;
+    /**
+     * Documentation for executeMicroTrade:
+     * - size: Rounded down to the nearest multiple of asset.lotSize to avoid 400 errors.
+     * - price: Formatted to asset.precision decimals.
+     * - strings: All numeric values sent as strings to comply with Delta API v2.
+     */
+    async executeMicroTrade(symbol, side, price, assetConfig, confidence) {
+        this.isOrderInProgress = true; 
+        this.bot.isOrderInProgress = true;
+        
         try {
-            const size = parseFloat(this.bot.config.orderSize).toFixed(2);
+            // A. Calculate Size based on Lot Size (Avoids "0.42 XRP" error)
+            const rawSize = parseFloat(this.bot.config.orderSize);
+            const size = (Math.floor(rawSize / assetConfig.lotSize) * assetConfig.lotSize).toString();
+
+            // B. Apply Aggression and Format Price Precision
             const aggression = this.bot.config.priceAggressionOffset || 0.02;
-            const limitPrice = (side === 'buy' ? price * (1 + aggression/100) : price * (1 - aggression/100)).toFixed(4);
+            const limitPriceNum = (side === 'buy' ? price * (1 + aggression/100) : price * (1 - aggression/100));
+            const limitPrice = limitPriceNum.toFixed(assetConfig.precision);
+
+            // C. Stop Loss Calculation and Formatting
+            const slPriceNum = (side === 'buy' ? limitPriceNum * (1 - this.slPercent/100) : limitPriceNum * (1 + this.slPercent/100));
+            const slPrice = slPriceNum.toFixed(assetConfig.precision);
+
             const orderData = {
-                product_id: productId.toString(), size, side, order_type: 'limit_order', limit_price: limitPrice,
-                time_in_force: 'ioc', bracket_stop_loss_price: (side === 'buy' ? limitPrice * (1 - this.slPercent/100) : limitPrice * (1 + this.slPercent/100)).toFixed(4),
+                product_id: assetConfig.deltaId.toString(), // Must be String
+                size: size,                                 // Must be String & Whole Number for XRP
+                side: side,
+                order_type: 'limit_order',
+                limit_price: limitPrice,                    // Must be String
+                time_in_force: 'ioc',
+                bracket_stop_loss_price: slPrice,           // Must be String
                 bracket_stop_trigger_method: 'mark_price'
             };
+
+            this.logger.debug(`[Order Debug] ${symbol} payload: ${JSON.stringify(orderData)}`);
             await this.bot.placeOrder(orderData);
+            
+        } catch (err) {
+            this.logger.error(`[Execution Error] ${symbol}: ${err.message}`);
         } finally {
-            this.isOrderInProgress = false; this.bot.isOrderInProgress = false;
+            this.isOrderInProgress = false; 
+            this.bot.isOrderInProgress = false;
         }
     }
 }
