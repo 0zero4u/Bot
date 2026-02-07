@@ -10,7 +10,7 @@ class FastStrategy {
         // --- STRATEGY CONFIG ---
         this.OBI_WINDOW = 100;
         this.LOG_FREQ_MS = 5000;      // Heartbeat frequency (5s)
-        this.MIN_SCORE_FIRE = 75;     // Confidence threshold to enter (out of 100)
+        this.MIN_SCORE_FIRE = 60;     // Confidence threshold to enter (out of 100)
         this.LOCK_DURATION_MS = 2000; // Cooldown after trade attempt
         
         // Safety & Exit
