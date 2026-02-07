@@ -21,9 +21,9 @@ class FastStrategy {
         // --- PREDICTIVE SCORING WEIGHTS ---
         this.WEIGHTS = {
             GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '30'),   // Baseline Pressure
-            GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '10'), // Lagging Velocity
-            GATE3_SHIFT: parseInt(process.env.W_SHIFT || '25'),      // Reactive Gravity
-            GATE4_PULL: parseInt(process.env.W_PULL || '35')        // PREDICTIVE INTENT
+            GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '20'), // Lagging Velocity
+            GATE3_SHIFT: parseInt(process.env.W_SHIFT || '35'),      // Reactive Gravity
+            GATE4_PULL: parseInt(process.env.W_PULL || '15')        // PREDICTIVE INTENT
         };
         
         // --- EXIT CONFIGURATION ---
