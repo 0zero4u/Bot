@@ -1,5 +1,5 @@
 // FastStrategy.js
-// v4.2.0 - [FINAL] Weighted Confidence, Trailing Stop, & Reason-Based Exit Logging
+// v5.0.0 - [Dual-Tier Entry] Limit (74+) vs Market (85+) | Enhanced Logging & Safety
 
 class FastStrategy {
     constructor(bot) {
@@ -8,11 +8,15 @@ class FastStrategy {
 
         // --- CORE STRATEGY CONFIG ---
         this.OBI_WINDOW = 100;
-        this.LOG_FREQ_MS = 5000;      
-        this.MIN_SCORE_FIRE = 74;     
+        this.LOG_FREQ_MS = 5000;
+        
+        // --- TIERED ENTRY THRESHOLDS ---
+        this.MIN_SCORE_LIMIT = 74;    // Tier 1: Limit Order
+        this.MIN_SCORE_MARKET = 85;   // Tier 2: Market Order (Aggressive)
+        
         this.LOCK_DURATION_MS = 2000; 
         
-        // --- EXIT CONFIGURATION (Defaults provided) ---
+        // --- EXIT CONFIGURATION ---
         this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '0'); 
         this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '65'); 
         this.TRAILING_DIP_TICKS = 100;   
@@ -42,7 +46,7 @@ class FastStrategy {
         this.isOrderInProgress = false;
     }
 
-    getName() { return "FastStrategy (HFT-Log v4.2)"; }
+    getName() { return "FastStrategy (Dual-Tier v5.0)"; }
 
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
@@ -86,35 +90,51 @@ class FastStrategy {
             const sellScore = this.getScore(-rawZ, 2.5, 30) + this.getScore(-rawDOBI, 0.4, 20) + 
                               this.getScore(-rawShiftTicks, 2.0, 30) + this.getScore(-rawPull, asset.config.saturationQty, 20);
 
-            // 4. OPEN POSITION MANAGEMENT (EXIT REASONS)
+            // 4. OPEN POSITION MANAGEMENT
             if (this.bot.hasOpenPosition && asset.position) {
                 this.manageExits(symbol, currentPrice, buyScore, sellScore);
                 this.updateHistory(asset, obi, totalBidQty, totalAskQty);
                 return; 
             }
 
-            // 5. HEARTBEAT LOGGING (5s)
+            // 5. HEARTBEAT LOGGING (Enhanced with Direction)
             if (now - asset.lastLogTime > this.LOG_FREQ_MS) {
-                const score = Math.max(buyScore, sellScore).toFixed(1);
-                this.logger.info(`[H-Beat] ${symbol} Strength: ${score}% | Pos: ${this.bot.hasOpenPosition}`);
+                const isBuyStronger = buyScore >= sellScore;
+                const score = isBuyStronger ? buyScore : sellScore;
+                const sideTag = isBuyStronger ? '[BUY]' : '[SELL]';
+                
+                this.logger.info(`[H-Beat] ${symbol} Strength: ${score.toFixed(1)}% ${sideTag} | Pos: ${this.bot.hasOpenPosition}`);
                 asset.lastLogTime = now;
             }
 
-            // 6. ENTRY LOGIC
+            // 6. ENTRY LOGIC (DUAL-TIER)
             if (!this.bot.hasOpenPosition && !this.isOrderInProgress && !this.bot.isOrderInProgress) {
                 let side = null;
                 let finalScore = 0;
 
-                if (buyScore >= this.MIN_SCORE_FIRE) { side = 'buy'; finalScore = buyScore; }
-                else if (sellScore >= this.MIN_SCORE_FIRE) { side = 'sell'; finalScore = sellScore; }
+                // [Fix] Determine side based on which score is higher if both are active
+                if (buyScore >= this.MIN_SCORE_LIMIT && buyScore >= sellScore) { 
+                    side = 'buy'; finalScore = buyScore; 
+                }
+                else if (sellScore >= this.MIN_SCORE_LIMIT) { 
+                    side = 'sell'; finalScore = sellScore; 
+                }
 
                 if (side && (now - asset.lastTriggerTime > this.LOCK_DURATION_MS)) {
                     asset.lastTriggerTime = now;
-                    this.logger.info(`[🔥 TRIGGER] ${side.toUpperCase()} ${symbol} | CONF: ${finalScore.toFixed(1)}%`);
+
+                    // --- DETERMINE ORDER TYPE ---
+                    // 85+ = Market | 74-84 = Limit
+                    const orderType = finalScore >= this.MIN_SCORE_MARKET ? 'market_order' : 'limit_order';
+                    const typeTag = orderType === 'market_order' ? '🚀 MARKET' : 'LIMIT';
+
+                    this.logger.info(`[🔥 TRIGGER] ${side.toUpperCase()} ${symbol} | CONF: ${finalScore.toFixed(1)}% | TYPE: ${typeTag}`);
                     
+                    // Optimistic state set (will be cleared if order fails)
                     asset.position = { side: side, entryPrice: currentPrice, peakPrice: currentPrice };
+                    
                     const execPrice = side === 'buy' ? Math.min(vamp, standardMid) : Math.max(vamp, standardMid);
-                    await this.executeMicroTrade(symbol, side, execPrice, asset.config);
+                    await this.executeMicroTrade(symbol, side, execPrice, asset.config, orderType);
                 }
             }
 
@@ -126,6 +146,9 @@ class FastStrategy {
     }
 
     manageExits(symbol, currentPrice, buyScore, sellScore) {
+        // [Fix] Concurrency check
+        if (this.isOrderInProgress || this.bot.isOrderInProgress) return;
+
         const asset = this.assets[symbol];
         const pos = asset.position;
         if (!pos) return;
@@ -164,9 +187,10 @@ class FastStrategy {
         this.isOrderInProgress = true;
         this.bot.isOrderInProgress = true;
         const asset = this.assets[symbol];
+        
         try {
             const side = asset.position.side === 'buy' ? 'sell' : 'buy';
-            this.logger.warn(`[Position Closed] Trigger: ${reason}`); // <--- REASON LOG
+            this.logger.warn(`[Position Closed] Trigger: ${reason}`);
 
             const orderData = {
                 product_id: asset.config.deltaId.toString(),
@@ -203,33 +227,53 @@ class FastStrategy {
         return std === 0 ? 0 : (values[values.length - 1] - mean) / std;
     }
 
-    async executeMicroTrade(symbol, side, price, assetConfig) {
+    // [Refined] Now supports distinct Limit vs Market order types
+    async executeMicroTrade(symbol, side, price, assetConfig, orderType) {
         this.isOrderInProgress = true; 
         this.bot.isOrderInProgress = true;
+        
         try {
             const rawSize = parseFloat(this.bot.config.orderSize);
             const sizeStr = (Math.floor(rawSize / assetConfig.lotSize) * assetConfig.lotSize).toFixed(assetConfig.sizeDecimals);
             
-            const aggression = this.bot.config.priceAggressionOffset || 0.02;
-            const limitPriceNum = (side === 'buy' ? price * (1 + aggression/100) : price * (1 - aggression/100));
-            const slPriceNum = (side === 'buy' ? limitPriceNum * (1 - this.slPercent/100) : limitPriceNum * (1 + this.slPercent/100));
-
+            // Base Payload
             const orderData = {
                 product_id: assetConfig.deltaId.toString(),
                 size: sizeStr,
                 side: side,
-                order_type: 'limit_order',
-                limit_price: limitPriceNum.toFixed(assetConfig.precision),
-                time_in_force: 'ioc',
-                bracket_stop_loss_price: slPriceNum.toFixed(assetConfig.precision),
-                bracket_stop_trigger_method: 'mark_price'
+                order_type: orderType, // 'limit_order' or 'market_order'
             };
+
+            // Add Limit Order specific fields
+            if (orderType === 'limit_order') {
+                const aggression = this.bot.config.priceAggressionOffset || 0.02; // Treated as % offset
+                const limitPriceNum = (side === 'buy' ? price * (1 + aggression/100) : price * (1 - aggression/100));
+                
+                // Add SL only on Limit Orders (Market orders usually fill instantly, manage SL manually or via separate call if needed)
+                // Note: Delta Exchange Market orders don't always support bracket params in same payload, 
+                // but if they do, you can uncomment below. For now, we apply Bracket to Limit only to be safe.
+                const slPriceNum = (side === 'buy' ? limitPriceNum * (1 - this.slPercent/100) : limitPriceNum * (1 + this.slPercent/100));
+
+                orderData.limit_price = limitPriceNum.toFixed(assetConfig.precision);
+                orderData.time_in_force = 'ioc';
+                orderData.bracket_stop_loss_price = slPriceNum.toFixed(assetConfig.precision);
+                orderData.bracket_stop_trigger_method = 'mark_price';
+            }
 
             await this.bot.placeOrder(orderData);
             
         } catch (err) {
             this.lastErrorTime = Date.now();
             this.logger.warn(`[Execution Error] ${err.message}`);
+            
+            // [Critical Fix] Reset position state if the API call failed!
+            // This prevents the "Zombie Position" bug where the bot thinks it has a trade open.
+            const asset = this.assets[symbol];
+            if (asset) {
+                asset.position = null;
+                this.logger.info(`[State Recovery] Position reset for ${symbol} due to failed order.`);
+            }
+
         } finally {
             this.isOrderInProgress = false; 
             this.bot.isOrderInProgress = false;
@@ -238,4 +282,4 @@ class FastStrategy {
 }
 
 module.exports = FastStrategy;
-        
+                    
