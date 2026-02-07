@@ -9,12 +9,12 @@ class FastStrategy {
         // --- CORE STRATEGY CONFIG ---
         this.OBI_WINDOW = 100;
         this.LOG_FREQ_MS = 5000;      
-        this.MIN_SCORE_FIRE = 60;     
+        this.MIN_SCORE_FIRE = 65;     
         this.LOCK_DURATION_MS = 2000; 
         
         // --- EXIT CONFIGURATION (Defaults provided) ---
-        this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '80'); 
-        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '55'); 
+        this.ALPHA_DECAY_THRESHOLD = parseFloat(process.env.ALPHA_DECAY_THRESHOLD || '90'); 
+        this.MOMENTUM_FLIP_THRESHOLD = parseFloat(process.env.MOMENTUM_FLIP_THRESHOLD || '50'); 
         this.TRAILING_DIP_TICKS = 2;   
         this.slPercent = 0.15;         
 
