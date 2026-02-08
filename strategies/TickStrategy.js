@@ -1,11 +1,12 @@
 /**
  * TickStrategy.js - High-Frequency Trading (HFT) Bot
- * Final Complete Version v1.0.3
- * * [span_0](start_span)CORE THESIS[span_0](end_span):
- * 1. [span_1](start_span)[span_2](start_span)FILTRATION: MTF/PLFF removes "flickering" noise from Level 2 streams[span_1](end_span)[span_2](end_span).
- * 2. [span_3](start_span)[span_4](start_span)REGIMES: Discretizes OBI into 5 dynamic states to stabilize signal clarity[span_3](end_span)[span_4](end_span).
- * 3. HAWKES CAUSALITY: Uses an exponential decay kernel to measure Causal Coherence 
- * between realized trades and price movement.
+ * Optimized Version v1.0.4
+ * * CORE THESIS (Based on Research Paper 2507.22712v1):
+ * 1. FILTRATION: Uses a 50ms Price-Level Frequency Filter (PLFF) to mimic the 
+ * Modification-Time Filter (MTF) for noise reduction.
+ * 2. REGIMES: Discretizes OBI into 5 dynamic states to stabilize signal clarity.
+ * 3. HAWKES CAUSALITY: Prioritizes Trade-based OBI (OBI-T) for stronger causal 
+ * coherence with price movement.
  */
 
 class TickStrategy {
@@ -14,22 +15,22 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- RESEARCH-DRIVEN PARAMETERS ---
-        this.PLFF_THRESHOLD_MS = 100;     [span_5](start_span)[span_6](start_span)// Price-Level Frequency Filter[span_5](end_span)[span_6](end_span)
-        this.OBI_HISTORY_SIZE = 1000;    [span_7](start_span)[span_8](start_span)// Buffer for Dynamic Quantiles[span_7](end_span)[span_8](end_span)
-        this.HEARTBEAT_INTERVAL = 3000;  // Strict 3s logging
+        this.PLFF_THRESHOLD_MS = 50;      // Increased to 50ms to filter "fleeting" noise
+        this.OBI_HISTORY_SIZE = 1000;     // Buffer for Dynamic Quantiles
+        this.HEARTBEAT_INTERVAL = 3000;   // Strict 3s logging
         
         // --- HAWKES CAUSAL PARAMETERS ---
-        this.HAWKES_DECAY = 5.0;         [span_9](start_span)[span_10](start_span)// λ: Focuses on immediate micro-bursts[span_9](end_span)[span_10](end_span)
-        this.MIN_CAUSAL_SCORE = 0.5;     // Threshold for Causal Coherence Score
-        this.MIN_TRADE_OBI = 0.35;       [span_11](start_span)[span_12](start_span)// Directional conviction from OBI(T)[span_11](end_span)[span_12](end_span)
+        this.HAWKES_DECAY = 5.0;          // λ: Focuses on immediate micro-bursts
+        this.MIN_CAUSAL_SCORE = 0.5;      // Threshold for Causal Coherence Score
+        this.MIN_TRADE_OBI = 0.35;        // Directional conviction from OBI(T)
 
         this.assets = {};
-        const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
+        const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
         targets.forEach(asset => {
             this.assets[asset] = {
-                levelTimestamps: new Map(), // Track last update per price level (PLFF)
-                obiHistory: [],             // Historical buffer for regimes
-                recentTrades: [],           // Event stream for Hawkes Process
+                levelTimestamps: new Map(), 
+                obiHistory: [],             
+                recentTrades: [],           
                 lastHeartbeat: 0,
                 lastTriggerTime: 0,
                 currentRegime: 0,
@@ -49,7 +50,7 @@ class TickStrategy {
 
     /**
      * 1. ASSOCIATIVE SIGNAL (LOB DEPTH)
-     * Filters noise via PLFF and segmenting into 5 Regimes.
+     * Filters noise via PLFF and segments into 5 Regimes.
      */
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
@@ -58,17 +59,17 @@ class TickStrategy {
         const now = Date.now();
 
         // A. Price-Level Frequency Filter (PLFF)
-        [span_13](start_span)[span_14](start_span)// Adaptation of MTF for Level 2 data[span_13](end_span)[span_14](end_span)
         const validBids = this.applyPLFF(asset, depth.bids, now);
         const validAsks = this.applyPLFF(asset, depth.asks, now);
 
-        [span_15](start_span)[span_16](start_span)// B. Calculate Filtered OBI[span_15](end_span)[span_16](end_span)
+        // B. Calculate Filtered OBI
         const bVol = validBids.reduce((s, l) => s + parseFloat(l[1]), 0);
         const aVol = validAsks.reduce((s, l) => s + parseFloat(l[1]), 0);
+        
         if (bVol + aVol === 0) return;
         asset.filteredObi = (bVol - aVol) / (bVol + aVol);
 
-        [span_17](start_span)[span_18](start_span)// C. Update Dynamic Quantile Regimes[span_17](end_span)[span_18](end_span)
+        // C. Update Dynamic Quantile Regimes
         this.updateRegimeState(asset);
 
         // D. Heartbeat Logging (Strict 3s)
@@ -84,10 +85,6 @@ class TickStrategy {
         }
     }
 
-    /**
-     * 2. CAUSAL SIGNAL (TRADE FLOW)
-     * [span_19](start_span)[span_20](start_span)Realized conviction fuels the Hawkes Point Process[span_19](end_span)[span_20](end_span).
-     */
     onPriceUpdate(symbol, price, source) {
         const asset = this.assets[symbol];
         if (asset) {
@@ -100,14 +97,19 @@ class TickStrategy {
     /**
      * 3. FILTRATION & ANALYTICS
      */
-
     applyPLFF(asset, levels, now) {
+        // Corrected syntax for the filter function
         return levels.filter(level => {
             const price = level[0];
             const lastUpdate = asset.levelTimestamps.get(price) || 0;
             const diff = now - lastUpdate;
-            asset.levelTimestamps.set(price, now);
-            [span_21](start_span)[span_22](start_span)return diff > this.PLFF_THRESHOLD_MS; // Rejects flickering noise[span_21](end_span)[span_22](end_span)
+            
+            // Only update timestamp if the filter passes or it's been long enough
+            if (diff > this.PLFF_THRESHOLD_MS) {
+                asset.levelTimestamps.set(price, now);
+                return true;
+            }
+            return false; 
         });
     }
 
@@ -121,7 +123,7 @@ class TickStrategy {
         const rank = sorted.filter(v => v < asset.filteredObi).length;
         asset.currentPercentile = (rank / sorted.length) * 100;
 
-        [span_23](start_span)[span_24](start_span)// --- 5-REGIME DISCRETIZATION[span_23](end_span)[span_24](end_span) ---
+        // --- 5-REGIME DISCRETIZATION ---
         if (asset.currentPercentile >= 90) asset.currentRegime = 2;       // Strong Buy
         else if (asset.currentPercentile >= 75) asset.currentRegime = 1;  // Weak Buy
         else if (asset.currentPercentile <= 10) asset.currentRegime = -2; // Strong Sell
@@ -131,7 +133,7 @@ class TickStrategy {
 
     /**
      * HAWKES CAUSAL COHERENCE SCORE
-     * [span_25](start_span)[span_26](start_span)Models directional excitation norms under exponential kernels[span_25](end_span)[span_26](end_span).
+     * Models excitation using Trade-based OBI (OBI-T) for precision.
      */
     calculateHawkesCausality(asset, now) {
         let intensity = 0;
@@ -140,10 +142,10 @@ class TickStrategy {
 
         for (let i = 1; i < window.length; i++) {
             const deltaT = (now - window[i].t) / 1000;
-            [span_27](start_span)[span_28](start_span)// Hawkes Kernel: Σ exp(-λ * Δt)[span_27](end_span)[span_28](end_span)
+            // Hawkes Kernel: Σ exp(-λ * Δt)
             intensity += Math.exp(-this.HAWKES_DECAY * deltaT);
             
-            [span_29](start_span)[span_30](start_span)// Tick-Direction OBI(T)[span_29](end_span)[span_30](end_span)
+            // Tick-Direction OBI(T)
             if (window[i].p > window[i-1].p) up++;
             else if (window[i].p < window[i-1].p) down++;
         }
@@ -153,9 +155,6 @@ class TickStrategy {
         };
     }
 
-    /**
-     * 4. SNIPE EXECUTION
-     */
     async evaluateCausalSnipe(symbol, asset, now) {
         if (this.bot.hasOpenPosition || this.bot.isOrderInProgress) return;
         if (now - asset.lastTriggerTime < 2000) return;
@@ -163,7 +162,7 @@ class TickStrategy {
         const metrics = this.calculateHawkesCausality(asset, now);
 
         let side = null;
-        [span_31](start_span)[span_32](start_span)// The Multi-Signal Execution Trigger[span_31](end_span)[span_32](end_span)
+        // Multi-Signal Execution Trigger: Regime + Causal Strength + Realized Conviction
         if (asset.currentRegime === 2 && metrics.causalScore > this.MIN_CAUSAL_SCORE && metrics.tradeObi > this.MIN_TRADE_OBI) {
             side = 'buy';
         } else if (asset.currentRegime === -2 && metrics.causalScore > this.MIN_CAUSAL_SCORE && metrics.tradeObi < -this.MIN_TRADE_OBI) {
@@ -184,13 +183,13 @@ class TickStrategy {
             const lastPrice = asset.recentTrades[asset.recentTrades.length - 1]?.p;
             if (!lastPrice) return;
 
-            [span_33](start_span)[span_34](start_span)// Aggressive Limit IOC Sniping[span_33](end_span)[span_34](end_span)
+            // Aggressive Limit IOC Sniping
             const limit = side === 'buy' ? lastPrice * 1.0005 : lastPrice * 0.9995;
             const stop = side === 'buy' ? lastPrice * 0.998 : lastPrice * 1.002;
 
             await this.bot.placeOrder({
                 product_id: spec.deltaId.toString(),
-                size: this.bot.config.orderSize,
+                size: process.env.ORDER_SIZE || "1",
                 side,
                 order_type: 'limit_order',
                 time_in_force: 'ioc',
@@ -198,13 +197,13 @@ class TickStrategy {
                 bracket_stop_loss_limit_price: stop.toFixed(spec.precision),
                 bracket_stop_trigger_method: 'mark_price'
             });
-        } catch (e) { this.logger.error(`[EXEC_FAIL] ${e.message}`); }
-        finally { this.bot.isOrderInProgress = false; }
+        } catch (e) { 
+            this.logger.error(`[EXEC_FAIL] ${e.message}`); 
+        } finally { 
+            this.bot.isOrderInProgress = false; 
+        }
     }
 
-    /**
-     * 5. LOGGING (JSON PAYLOADS)
-     */
     logPayload(symbol, asset, type, now, side, metrics) {
         const payload = {
             timestamp: new Date(now).toISOString(),
@@ -212,7 +211,6 @@ class TickStrategy {
             asset: symbol,
             regime: `${asset.currentRegime} (p: ${asset.currentPercentile.toFixed(1)}%)`,
             filtered_obi: asset.filteredObi.toFixed(4),
-            [span_35](start_span)[span_36](start_span)// Causal Coherence Audit[span_35](end_span)[span_36](end_span)
             causal_coherence_score: metrics.causalScore.toFixed(2),
             trade_obi: metrics.tradeObi.toFixed(4)
         };
@@ -222,4 +220,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-          
+            
