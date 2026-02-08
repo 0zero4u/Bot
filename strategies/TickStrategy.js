@@ -19,8 +19,8 @@ class TickStrategy {
         
         // --- HAWKES CAUSAL PARAMETERS ---
         this.HAWKES_DECAY = 5.0;          
-        this.MIN_CAUSAL_SCORE = 10.0;      
-        this.MIN_TRADE_OBI = 0.55;        
+        this.MIN_CAUSAL_SCORE = 30.0;      
+        this.MIN_TRADE_OBI = 0.65;        
 
         this.assets = {};
         const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
