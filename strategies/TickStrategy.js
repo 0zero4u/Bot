@@ -14,7 +14,7 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- RESEARCH-DRIVEN PARAMETERS ---
-        this.PLFF_THRESHOLD_MS = 20;     [span_5](start_span)[span_6](start_span)// Price-Level Frequency Filter[span_5](end_span)[span_6](end_span)
+        this.PLFF_THRESHOLD_MS = 100;     [span_5](start_span)[span_6](start_span)// Price-Level Frequency Filter[span_5](end_span)[span_6](end_span)
         this.OBI_HISTORY_SIZE = 1000;    [span_7](start_span)[span_8](start_span)// Buffer for Dynamic Quantiles[span_7](end_span)[span_8](end_span)
         this.HEARTBEAT_INTERVAL = 3000;  // Strict 3s logging
         
