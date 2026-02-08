@@ -15,8 +15,8 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- RESEARCH-DRIVEN PARAMETERS ---
-        this.PLFF_THRESHOLD_MS = 50;      // Increased to 50ms to filter "fleeting" noise
-        this.OBI_HISTORY_SIZE = 1000;     // Buffer for Dynamic Quantiles
+        this.PLFF_THRESHOLD_MS = 25;      // Increased to 50ms to filter "fleeting" noise
+        this.OBI_HISTORY_SIZE = 10000;     // Buffer for Dynamic Quantiles
         this.HEARTBEAT_INTERVAL = 3000;   // Strict 3s logging
         
         // --- HAWKES CAUSAL PARAMETERS ---
