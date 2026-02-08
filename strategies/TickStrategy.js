@@ -20,7 +20,7 @@ class TickStrategy {
         
         // --- HAWKES CAUSAL PARAMETERS ---
         this.HAWKES_DECAY = 5.0;          // λ: Focuses on immediate micro-bursts
-        this.MIN_CAUSAL_SCORE = 2.5;      // Threshold for Causal Coherence Score
+        this.MIN_CAUSAL_SCORE = 10.;      // Threshold for Causal Coherence Score
         this.MIN_TRADE_OBI = 0.55;        // Directional conviction from OBI(T)
 
         this.assets = {};
