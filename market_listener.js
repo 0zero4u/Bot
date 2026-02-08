@@ -1,3 +1,4 @@
+
 const WebSocket = require('ws');
 const winston = require('winston');
 require('dotenv').config();
@@ -7,7 +8,8 @@ const config = {
     reconnectInterval: 5000,
     maxReconnectDelay: 60000,
     assets: (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(','),
-    strategy: process.env.STRATEGY || 'Advance' // Read Strategy from Env
+    // Force 'tick' logic if strategy implies it, or keep dynamic
+    strategy: process.env.STRATEGY || 'Tick' 
 };
 
 // --- LOGGING ---
@@ -20,24 +22,16 @@ const logger = winston.createLogger({
     transports: [new winston.transports.Console()]
 });
 
-// Connection references
 let internalWs = null;
 let binanceWs = null;
-
-// Reconnection tracking
-const reconnectAttempts = { BINANCE: 0 };
-
-// --- OPTIMIZATION STATE ---
-const lastPriceCache = new Map(); 
-const updateBuffer = new Map();   
-let isFlushScheduled = false;
+let reconnectAttempts = 0;
 
 // --- INTERNAL BOT CONNECTION ---
 function connectToInternal() {
     internalWs = new WebSocket(config.internalReceiverUrl);
     
     internalWs.on('open', () => {
-        logger.info(`✓ Connected to Internal Bot Receiver. Tracking: ${config.assets.join(', ')}`);
+        logger.info(`✓ Connected to Internal Bot Receiver.`);
     });
     
     internalWs.on('close', () => {
@@ -48,78 +42,34 @@ function connectToInternal() {
     internalWs.on('error', (e) => logger.error(`✗ Internal WS Error: ${e.message}`));
 }
 
-// --- CORE LOGIC (Deduplication & Coalescing) ---
 function sendToInternal(payload) {
     if (internalWs && internalWs.readyState === WebSocket.OPEN) {
         internalWs.send(JSON.stringify(payload));
     }
 }
 
-// Buffering specifically for Prices (Trades) to reduce noise
-function bufferPrice(asset, price, source) {
-    const key = `${asset}:${source}`;
-    const lastPrice = lastPriceCache.get(key);
-    
-    if (lastPrice === price) return; 
-
-    lastPriceCache.set(key, price);
-    const payload = { type: 'S', s: asset, p: price, x: source };
-    updateBuffer.set(key, payload);
-
-    if (!isFlushScheduled) {
-        isFlushScheduled = true;
-        setImmediate(flushBuffer);
-    }
-}
-
-function flushBuffer() {
-    if (internalWs && internalWs.readyState === WebSocket.OPEN) {
-        for (const payload of updateBuffer.values()) {
-            internalWs.send(JSON.stringify(payload));
-        }
-    }
-    updateBuffer.clear();
-    isFlushScheduled = false;
-}
-
-// --- RECONNECTION LOGIC ---
-function reconnectWithBackoff(exchange, connectFn) {
-    const attempts = reconnectAttempts[exchange];
-    const delay = Math.min(config.reconnectInterval * Math.pow(1.5, attempts), config.maxReconnectDelay);
-    
-    logger.warn(`[${exchange}] Reconnecting in ${(delay/1000).toFixed(1)}s (attempt ${attempts + 1})`);
-    reconnectAttempts[exchange]++;
-    
-    setTimeout(connectFn, delay);
-}
-
-function resetReconnectCounter(exchange) {
-    if (reconnectAttempts[exchange] > 0) {
-        logger.info(`[${exchange}] Reconnection successful after ${reconnectAttempts[exchange]} attempts`);
-        reconnectAttempts[exchange] = 0;
-    }
-}
-
 // ==========================================
-// BINANCE FUTURES LISTENER (Smart Switch)
+// BINANCE LISTENER (COMBINED STREAM)
 // ==========================================
 function connectBinance() {
-    const isFastStrategy = config.strategy.toLowerCase().includes('fast');
+    // We combine Streams: depth5@100ms AND trade
+    // URL Format: stream?streams=<symbol>@depth5@100ms/<symbol>@trade
     
-    // SWITCH: Depth5 for FastStrategy, Trade for Advance/others
-    const streamType = isFastStrategy ? 'depth5@100ms' : 'trade';
-    
-    const streams = config.assets.map(a => `${a.toLowerCase()}usdt@${streamType}`).join('/');
+    const streams = config.assets.map(asset => {
+        const s = asset.toLowerCase() + 'usdt';
+        return `${s}@depth5@100ms/${s}@trade`;
+    }).join('/');
+
     const url = `wss://fstream.binance.com/stream?streams=${streams}`;
     
-    logger.info(`[Binance] Mode: ${isFastStrategy ? '⚡ FAST (Depth)' : '📈 ADVANCE (Trade)'}`);
-    logger.info(`[Binance] Connecting to ${url}`);
+    logger.info(`[Binance] Connecting to Combined Stream (Depth+Trade)...`);
+    logger.info(`[Binance] URL: ${url}`);
     
     binanceWs = new WebSocket(url);
 
     binanceWs.on('open', () => {
         logger.info('[Binance] ✓ Connected.');
-        resetReconnectCounter('BINANCE');
+        reconnectAttempts = 0;
     });
     
     binanceWs.on('message', (data) => {
@@ -128,67 +78,49 @@ function connectBinance() {
             const msg = JSON.parse(data);
             if (!msg.data) return;
 
+            // msg.data.s is usually "BTCUSDT"
             const rawSymbol = msg.data.s; 
-            const asset = rawSymbol.replace('USDT', ''); 
+            const asset = rawSymbol ? rawSymbol.replace('USDT', '') : null;
+            if (!asset) return;
 
-            if (isFastStrategy) {
-                // --- HANDLING DEPTH5 ---
-                if (msg.data.e === 'depthUpdate') {
-                    // Direct Forwarding (No buffering for HFT Depth)
-                    sendToInternal({
-                        type: 'D',          // 'D' for Depth
-                        s: asset,
-                        b: msg.data.b,      // Bids [[price, qty], ...]
-                        a: msg.data.a       // Asks [[price, qty], ...]
-                    });
-                }
-            } else {
-                // --- HANDLING TRADES ---
-                if (msg.data.e === 'trade') {
-                    const price = parseFloat(msg.data.p);
-                    if (price > 0) bufferPrice(asset, price, 'BINANCE');
-                }
+            // 1. Handle DEPTH (For TickStrategy OBI)
+            if (msg.data.e === 'depthUpdate') {
+                sendToInternal({
+                    type: 'D',          
+                    s: asset,
+                    b: msg.data.b,      // Bids [[price, qty], ...]
+                    a: msg.data.a       // Asks [[price, qty], ...]
+                });
+            } 
+            // 2. Handle TRADES (For TickStrategy Causal Trigger)
+            // Note: We map this to 'S' (Signal) so standard trader.js passes it to onPriceUpdate
+            else if (msg.data.e === 'trade') {
+                sendToInternal({
+                    type: 'S',          // Standard 'Signal' type for trader.js
+                    s: asset,
+                    p: msg.data.p,      // Price
+                    x: 'BINANCE',       // Source
+                    // We append extra data (Volume/Maker) 
+                    // Note: Standard trader.js might ignore this, but TickStrategy can use it 
+                    // if we modify trader.js or if strategy taps into it.
+                    q: msg.data.q,      
+                    m: msg.data.m       
+                });
             }
         } catch(e) {}
     });
 
     binanceWs.on('close', () => {
         logger.warn('[Binance] ✗ Connection closed.');
-        reconnectWithBackoff('BINANCE', connectBinance);
+        const delay = Math.min(config.reconnectInterval * Math.pow(1.5, reconnectAttempts), config.maxReconnectDelay);
+        reconnectAttempts++;
+        setTimeout(connectBinance, delay);
     });
     
     binanceWs.on('error', (e) => logger.error(`[Binance] Error: ${e.message}`));
 }
 
-// ==========================================
-// HEALTH & SHUTDOWN
-// ==========================================
-function monitorConnections() {
-    setInterval(() => {
-        const status = {
-            internal: internalWs?.readyState === WebSocket.OPEN,
-            binance: binanceWs?.readyState === WebSocket.OPEN
-        };
-        const connected = Object.values(status).filter(v => v).length;
-        logger.info(`📊 Health: ${connected}/2 active | Buffer Size: ${updateBuffer.size}`);
-        
-        if (!status.internal) logger.error('🚨 Internal Bot WS DOWN');
-    }, 60000);
-}
-
-function gracefulShutdown() {
-    logger.info('🛑 Shutting down...');
-    [internalWs, binanceWs].forEach(ws => {
-        if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-    });
-    setTimeout(() => process.exit(0), 1000);
-}
-
-process.on('SIGINT', gracefulShutdown);
-process.on('SIGTERM', gracefulShutdown);
-process.on('uncaughtException', (err) => logger.error(`💥 Uncaught: ${err.message}`));
-
 // START
 connectToInternal();
 connectBinance();
-setTimeout(monitorConnections, 10000);
+                 
