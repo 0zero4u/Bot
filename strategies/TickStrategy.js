@@ -1,11 +1,10 @@
 /**
  * TickStrategy.js - High-Frequency Trading (HFT) Bot
- * Optimized Version v1.0.5
- * * CORE THESIS:
- * 1. FILTRATION: Uses a 20ms Price-Level Frequency Filter (PLFF) for noise reduction.
- * 2. REGIMES: Discretizes OBI into 5 dynamic states to stabilize signal clarity.
- * 3. HAWKES CAUSALITY: Prioritizes Trade-based OBI (OBI-T) for causal coherence.
- * 4. EXECUTION: Offloads 6-tick trailing stop-loss to the exchange via bracket_trail_amount.
+ * Optimized Version v1.0.6
+ * * * KEY UPDATES:
+ * 1. FIX: Directional trailing stop (Negative for Buy, Positive for Sell).
+ * 2. SL: 6-tick exchange-side trailing stop loss.
+ * 3. LOGIC: Hawkes Causal Coherence + Price-Level Frequency Filter (PLFF).
  */
 
 class TickStrategy {
@@ -14,14 +13,14 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- RESEARCH-DRIVEN PARAMETERS ---
-        this.PLFF_THRESHOLD_MS = 20;      // Filter "fleeting" noise
-        this.OBI_HISTORY_SIZE = 10000;    // Buffer for Dynamic Quantiles
-        this.HEARTBEAT_INTERVAL = 5000;   // Logging interval
+        this.PLFF_THRESHOLD_MS = 20;      
+        this.OBI_HISTORY_SIZE = 10000;    
+        this.HEARTBEAT_INTERVAL = 5000;   
         
         // --- HAWKES CAUSAL PARAMETERS ---
-        this.HAWKES_DECAY = 5.0;          // λ: Focuses on immediate micro-bursts
-        this.MIN_CAUSAL_SCORE = 10.;      // Threshold for Causal Coherence Score
-        this.MIN_TRADE_OBI = 0.55;        // Directional conviction from OBI(T)
+        this.HAWKES_DECAY = 5.0;          
+        this.MIN_CAUSAL_SCORE = 10.0;      
+        this.MIN_TRADE_OBI = 0.55;        
 
         this.assets = {};
         const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
@@ -45,7 +44,7 @@ class TickStrategy {
         };
     }
 
-    getName() { return "TickStrategy (Hawkes + Exchange Trail)"; }
+    getName() { return "TickStrategy (Hawkes + Fixed Trail)"; }
 
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
@@ -74,7 +73,7 @@ class TickStrategy {
             asset.lastHeartbeat = now;
         }
 
-        // E. Trigger Evaluation (Strong Regimes ±2 Only)
+        // E. Trigger Evaluation
         if (Math.abs(asset.currentRegime) >= 2) {
             await this.evaluateCausalSnipe(symbol, asset, now);
         }
@@ -84,7 +83,7 @@ class TickStrategy {
         const asset = this.assets[symbol];
         if (asset) {
             asset.recentTrades.push({ t: Date.now(), p: parseFloat(price) });
-            if (asset.recentTrades.length > 100) asset.recentTrades.shift(); //
+            if (asset.recentTrades.length > 100) asset.recentTrades.shift();
         }
     }
 
@@ -112,7 +111,6 @@ class TickStrategy {
         const rank = sorted.filter(v => v < asset.filteredObi).length;
         asset.currentPercentile = (rank / sorted.length) * 100;
 
-        // 5-REGIME DISCRETIZATION
         if (asset.currentPercentile >= 90) asset.currentRegime = 2;       
         else if (asset.currentPercentile >= 75) asset.currentRegime = 1;  
         else if (asset.currentPercentile <= 10) asset.currentRegime = -2; 
@@ -165,12 +163,18 @@ class TickStrategy {
             const lastPrice = asset.recentTrades[asset.recentTrades.length - 1]?.p;
             if (!lastPrice) return;
 
-            // Aggressive Limit IOC Sniping
-            const limit = side === 'buy' ? lastPrice * 1.0005 : lastPrice * 0.9995;
-            
-            // Calculate 6-tick trailing amount based on asset precision
+            // 1. Calculate 6-tick distance
             const tickSize = 1 / Math.pow(10, spec.precision);
-            const trailAmount = (6 * tickSize).toFixed(spec.precision);
+            let trailAmount = 6 * tickSize;
+
+            // 2. APPLY DIRECTIONAL SIGN
+            // Buy: Negative (must drop from peak to trigger)
+            // Sell: Positive (must rise from valley to trigger)
+            if (side === 'buy') {
+                trailAmount = -trailAmount;
+            }
+
+            const limit = side === 'buy' ? lastPrice * 1.0005 : lastPrice * 0.9995;
 
             await this.bot.placeOrder({
                 product_id: spec.deltaId.toString(),
@@ -179,8 +183,8 @@ class TickStrategy {
                 order_type: 'limit_order',
                 time_in_force: 'ioc',
                 limit_price: limit.toFixed(spec.precision),
-                // Exchange-side trailing stop loss
-                bracket_trail_amount: trailAmount,
+                // Fixed trail with correct directional sign
+                bracket_trail_amount: trailAmount.toFixed(spec.precision),
                 bracket_stop_trigger_method: 'mark_price'
             });
         } catch (e) { 
@@ -206,4 +210,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-    
+        
