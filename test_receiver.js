@@ -2,7 +2,7 @@
 const WebSocket = require('ws');
 require('dotenv').config();
 
-const PORT = process.env.INTERNAL_WS_PORT || 80;
+const PORT = process.env.INTERNAL_WS_PORT || 8082;
 const wss = new WebSocket.Server({ port: PORT });
 
 console.log(`\n📊 SMART RECEIVER listening on port ${PORT}...`);
