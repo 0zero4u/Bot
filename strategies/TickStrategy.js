@@ -17,12 +17,12 @@ class TickStrategy {
         // --- RESEARCH-DRIVEN PARAMETERS ---
         this.PLFF_THRESHOLD_MS = 20;      // Increased to 50ms to filter "fleeting" noise
         this.OBI_HISTORY_SIZE = 10000;     // Buffer for Dynamic Quantiles
-        this.HEARTBEAT_INTERVAL = 3000;   // Strict 3s logging
+        this.HEARTBEAT_INTERVAL = 5000;   // Strict 3s logging
         
         // --- HAWKES CAUSAL PARAMETERS ---
         this.HAWKES_DECAY = 5.0;          // λ: Focuses on immediate micro-bursts
-        this.MIN_CAUSAL_SCORE = 0.5;      // Threshold for Causal Coherence Score
-        this.MIN_TRADE_OBI = 0.35;        // Directional conviction from OBI(T)
+        this.MIN_CAUSAL_SCORE = 2.5;      // Threshold for Causal Coherence Score
+        this.MIN_TRADE_OBI = 0.55;        // Directional conviction from OBI(T)
 
         this.assets = {};
         const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
