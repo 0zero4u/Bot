@@ -1,7 +1,7 @@
 /**
  * market_listener.js
- * v2.1 - Gate.io Incremental Sync [STABLE]
- * Logic: First update = Snapshot | Sequence (U/u) is Law | Gap = Resync
+ * v2.3 - [FIXED] Gate.io Object Format Support
+ * Fixes: correctly parses {p: price, s: size} objects from Gate.io
  */
 
 const WebSocket = require('ws');
@@ -37,6 +37,7 @@ config.assets.forEach(asset => {
 });
 
 let botWs = null;
+let exchangeWs = null;
 
 function connectToInternal() {
     botWs = new WebSocket(config.internalReceiverUrl);
@@ -51,8 +52,47 @@ function sendToBot(payload) {
     }
 }
 
+// --- RESYNC LOGIC ---
+function triggerResync(symbol) {
+    if (!exchangeWs || exchangeWs.readyState !== WebSocket.OPEN) return;
+    
+    const pair = `${symbol}_USDT`;
+    logger.warn(`[Gate] Triggering Resync for ${symbol} (Unsub/Sub)...`);
+
+    const time = Math.floor(Date.now() / 1000);
+
+    // 1. Unsubscribe
+    exchangeWs.send(JSON.stringify({
+        time: time,
+        channel: "futures.order_book_update",
+        event: "unsubscribe",
+        payload: [pair, "20ms", "20"]
+    }));
+
+    // 2. Subscribe (Delay slightly to ensure clean state)
+    setTimeout(() => {
+        if (exchangeWs.readyState === WebSocket.OPEN) {
+            exchangeWs.send(JSON.stringify({
+                time: Math.floor(Date.now() / 1000),
+                channel: "futures.order_book_update",
+                event: "subscribe",
+                payload: [pair, "20ms", "20"]
+            }));
+        }
+    }, 500);
+
+    // Reset Local State
+    const book = orderBooks.get(symbol);
+    if (book) {
+        book.bids.clear();
+        book.asks.clear();
+        book.state = 'INITIALIZING';
+        book.lastUpdateId = 0;
+    }
+}
+
 function connectGate() {
-    const exchangeWs = new WebSocket(config.gateUrl);
+    exchangeWs = new WebSocket(config.gateUrl);
 
     exchangeWs.on('open', () => {
         logger.info('[Gate.io] Connected. Subscribing...');
@@ -80,49 +120,72 @@ function connectGate() {
         try {
             const msg = JSON.parse(raw);
             
-            // Filter non-data messages (heartbeats, sub-confirmations)
-            if (!msg.result || msg.event === 'subscribe' || msg.channel === 'futures.pong') return;
+            // Filter non-data messages
+            if (!msg.result || msg.event === 'subscribe' || msg.event === 'unsubscribe' || msg.channel === 'futures.pong') return;
 
             const channel = msg.channel;
             const data = msg.result;
 
-            // Safe Symbol Extraction
-            const rawSymbol = data.s || (Array.isArray(data) ? data[0].s : null);
-            if (!rawSymbol) return; 
+            // --- SAFETY: Robust Symbol Extraction ---
+            let rawSymbol = data.s;
+            if (!rawSymbol && Array.isArray(data) && data.length > 0) {
+                rawSymbol = data[0].s;
+            }
+
+            if (!rawSymbol || typeof rawSymbol !== 'string') return;
             const symbol = rawSymbol.replace('_USDT', '');
 
-            // --- 1. HANDLE ORDER BOOK (The "Law of Sequence") ---
+            // --- 1. HANDLE ORDER BOOK ---
             if (channel === 'futures.order_book_update') {
                 const book = orderBooks.get(symbol);
                 if (!book) return;
 
-                // RULE: First update or Sequence Gap = Resync (Wipe and Start over)
-                if (book.state === 'INITIALIZING' || data.U !== book.lastUpdateId + 1) {
-                    if (book.state === 'LIVE') {
-                        logger.warn(`[Gate] Sequence Gap on ${symbol}! Expected ${book.lastUpdateId + 1}, got ${data.U}. Resyncing...`);
+                // Sequence Gap Check
+                const isGap = (book.state === 'LIVE' && data.U !== book.lastUpdateId + 1);
+
+                if (book.state === 'INITIALIZING' || isGap) {
+                    if (isGap) {
+                        logger.warn(`[Gate] Gap ${symbol}: Prev=${book.lastUpdateId}, Next=${data.U}.`);
+                        triggerResync(symbol);
+                        return; 
                     }
                     book.bids.clear();
                     book.asks.clear();
                     book.state = 'LIVE';
                 }
 
-                // Apply Updates (Price is Key, Size 0 = Delete)
+                // --- CRITICAL FIX: Handle {p, s} Objects ---
+                const processLevel = (item, map) => {
+                    let p, s;
+                    
+                    // Handle Object format: { "p": "100", "s": 10 } (Seen in logs)
+                    if (typeof item === 'object' && item !== null && 'p' in item) {
+                        p = item.p;
+                        s = item.s;
+                    } 
+                    // Handle Array format: ["100", 10] (Alternative format)
+                    else if (Array.isArray(item) && item.length >= 2) {
+                        [p, s] = item;
+                    } 
+                    else {
+                        return; // Invalid format
+                    }
+
+                    if (parseFloat(s) === 0) map.delete(p);
+                    else map.set(p, s);
+                };
+
                 if (data.a && Array.isArray(data.a)) {
-                    data.a.forEach(([p, s]) => {
-                        if (parseFloat(s) === 0) book.asks.delete(p);
-                        else book.asks.set(p, s);
-                    });
+                    data.a.forEach(item => processLevel(item, book.asks));
                 }
+
                 if (data.b && Array.isArray(data.b)) {
-                    data.b.forEach(([p, s]) => {
-                        if (parseFloat(s) === 0) book.bids.delete(p);
-                        else book.bids.set(p, s);
-                    });
+                    data.b.forEach(item => processLevel(item, book.bids));
                 }
 
                 book.lastUpdateId = data.u;
 
-                // Sort and Send Top 20 to Bot
+                // Sort and Send Top 20
                 const sortedBids = Array.from(book.bids.entries())
                     .sort((a, b) => parseFloat(b[0]) - parseFloat(a[0]))
                     .slice(0, 20);
@@ -146,7 +209,8 @@ function connectGate() {
             else if (channel === 'futures.trades') {
                 const trades = Array.isArray(data) ? data : [data];
                 trades.forEach(t => {
-                    if (!t.s) return;
+                    if (!t || !t.s || typeof t.s !== 'string') return;
+                    
                     const asset = t.s.replace('_USDT', '');
                     sendToBot({
                         type: 'trade',
@@ -167,8 +231,10 @@ function connectGate() {
         logger.warn('[Gate.io] Connection Closed. Reconnecting...');
         config.assets.forEach(asset => {
             const book = orderBooks.get(asset);
-            book.state = 'INITIALIZING';
-            book.lastUpdateId = 0;
+            if(book) {
+                book.state = 'INITIALIZING';
+                book.lastUpdateId = 0;
+            }
         });
         setTimeout(connectGate, config.reconnectInterval);
     });
@@ -179,4 +245,3 @@ function connectGate() {
 // Entry Point
 connectToInternal();
 connectGate();
-                      
