@@ -1,6 +1,6 @@
 /**
  * TickStrategy.js
- * v3.2 – [PRODUCTION] 30s Warmup, Rolling Memory, Signed Hawkes
+ * v3.3 – [PRODUCTION] Fixed: Added execute() dispatcher for compatibility
  */
 
 class TickStrategy {
@@ -51,10 +51,22 @@ class TickStrategy {
             'SOL': { deltaId: 4654, precision: 2 }
         };
 
-        this.logger.info("TickStrategy v3.2 Initialized. Entering 30s Warmup Mode...");
+        this.logger.info("TickStrategy v3.3 Initialized. Entering 30s Warmup Mode...");
     }
 
-    getName() { return "TickStrategy v3.2 (Warmup + Rolling)"; }
+    getName() { return "TickStrategy v3.3 (Warmup + Rolling + Patch)"; }
+
+    // --- NEW METHOD: REQUIRED FOR TRADER.JS CONNECTION ---
+    async execute(data) {
+        // 1. Route Trade Updates
+        if (data.type === 'trade') {
+            await this.onTradeUpdate(data.s, data);
+        } 
+        // 2. Route Depth/OrderBook Updates
+        else if (data.type === 'depthUpdate' || data.type === 'bookTicker') {
+            await this.onDepthUpdate(data.s, data);
+        }
+    }
 
     async onTradeUpdate(symbol, trade) {
         const asset = this.assets[symbol];
@@ -127,6 +139,9 @@ class TickStrategy {
 
         if (asset.isOrderInProgress) return;
         if (now - asset.lastTriggerTime < 2000) return;
+        
+        // Note: If you are ONLY running a trade listener, this line will block execution.
+        // If your logs remain silent after warmup, comment out the next line:
         if (now - asset.lastDepthUpdate > 100) return; 
 
         const zScore = this.calculateHawkesZ(asset, now);
@@ -239,4 +254,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-                
+    
