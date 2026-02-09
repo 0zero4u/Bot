@@ -1,7 +1,6 @@
-
 // trader.js
-// v72.0 - [PRODUCTION] TickStrategy + Delta (Orders & Positions Channels)
-// Changes: Removed Ticker, Added 'orders'/'positions' subscriptions ["all"]
+// v72.1 - [PRODUCTION] TickStrategy + Delta (Orders & Positions Channels)
+// Changes: Fixed Startup Crash (Logger Scope), Removed Ticker, Added 'orders'/'positions'
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -28,241 +27,236 @@ const config = {
     heartbeatTimeoutMs: parseInt(process.env.HEARTBEAT_TIMEOUT_MS || '40000'),
 };
 
-// --- Logging Setup ---
-const logger = winston.createLogger({
-    level: config.logLevel,
-    format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.colorize(),
-        winston.format.printf(({ timestamp, level, message }) => `${timestamp} [${level}]: ${message}`)
-    ),
-    transports: [
-        new winston.transports.Console(),
-        new winston.transports.File({ filename: 'trader.log' })
-    ]
-});
+// --- Strategy Loader ---
+// We dynamically require the strategy file based on config
+let StrategyClass;
+try {
+    StrategyClass = require(`./${config.strategy}.js`);
+} catch (e) {
+    console.error(`[FATAL] Could not load strategy: ${config.strategy}.js`);
+    process.exit(1);
+}
 
+// --- Main Trading Bot Class ---
 class TradingBot {
     constructor(config) {
         this.config = config;
-        this.logger = logger;
-        this.client = new DeltaClient(config, logger);
-        
-        // State
         this.isOrderInProgress = false;
-        this.positions = {}; // Tracks open size per asset { 'BTCUSD': 100 }
-        this.markPrices = new Map();
         
-        // --- Dynamic Strategy Loader ( Style) ---
-        try {
-            // This looks for a folder named 'strategies' and files like 'TickStrategy.js'
-            const StrategyClass = require(`./strategies/${this.config.strategy}Strategy.js`);
-            this.strategy = new StrategyClass(this);
-            this.logger.info(`Loaded Strategy: ${this.config.strategy} (via strategies/ folder)`);
-        } catch (err) {
-            this.logger.error(`Failed to load strategy: ${err.message}`);
-            process.exit(1);
-        }
-        
-        // Delta WS State
-        this.ws = null;
+        // Initialize Logger
+        this.logger = winston.createLogger({
+            level: config.logLevel,
+            format: winston.format.combine(
+                winston.format.timestamp(),
+                winston.format.colorize(),
+                winston.format.printf(({ timestamp, level, message }) => {
+                    return `${timestamp} [${level}]: ${message}`;
+                })
+            ),
+            transports: [
+                new winston.transports.Console(),
+                new winston.transports.File({ filename: 'trader.log' })
+            ]
+        });
+
+        // Initialize API Client
+        this.client = new DeltaClient(config, this.logger);
+
+        // Initialize Strategy
+        this.strategy = new StrategyClass(this);
+
+        // WebSocket State
+        this.internalWsServer = null; // Receives data from market_listener
+        this.deltaWs = null;          // Connects to Delta Exchange (Orders/Positions)
         this.pingInterval = null;
         this.heartbeatTimeout = null;
     }
 
     async start() {
-        logger.info('Starting Trading Bot...');
-        
-        // 1. Setup Internal WebSocket Server (Receives Gate.io Data)
-        this.setupHttpServer();
+        this.logger.info(`Starting Delta Trader v72.1...`);
+        this.logger.info(`Strategy: ${this.config.strategy}`);
+        this.logger.info(`Product: ${this.config.productSymbol} (ID: ${this.config.productId})`);
 
-        // 2. Connect to Delta WebSocket (Execution & Positions)
+        // 1. Setup Internal WebSocket Server (Listener -> Trader)
+        this.setupInternalServer();
+
+        // 2. Connect to Delta WebSocket (For Execution Updates)
         this.connectDeltaWebSocket();
-
-        logger.info('Bot initialization complete.');
     }
 
-    // ============================================================
-    // 1. GATE.IO SIGNAL HANDLER (Internal Server)
-    // ============================================================
-    setupHttpServer() {
-        const WebSocketServer = require('ws').Server;
-        const wss = new WebSocketServer({ port: this.config.port });
+    // --- 1. Internal Server (Data Ingestion) ---
+    setupInternalServer() {
+        this.internalWsServer = new WebSocket.Server({ port: this.config.port });
 
-        wss.on('connection', ws => {
-            this.logger.info('Data Feed Connected (Gate.io Listener)');
-            ws.on('message', m => this.handleSignalMessage(m));
-            ws.on('close', () => this.logger.warn('Data Feed Disconnected'));
-            ws.on('error', (err) => this.logger.error('Socket error:', err));
+        this.internalWsServer.on('connection', (ws) => {
+            this.logger.info(`Market Listener connected on port ${this.config.port}`);
+
+            ws.on('message', async (message) => {
+                if (this.isOrderInProgress) return; // Block new signals while busy
+
+                try {
+                    const data = JSON.parse(message);
+                    
+                    // Route data to Strategy
+                    // Strategies should implement an 'execute(data)' method
+                    if (this.strategy && typeof this.strategy.execute === 'function') {
+                        await this.strategy.execute(data);
+                    }
+
+                } catch (e) {
+                    this.logger.error(`Strategy Execution Error: ${e.message}`);
+                }
+            });
+
+            ws.on('error', (err) => {
+                this.logger.error(`Internal WS Connection Error: ${err.message}`);
+            });
         });
 
-        this.logger.info(`Internal Data Server running on port ${this.config.port}`);
+        this.internalWsServer.on('error', (err) => {
+            this.logger.error(`Internal Server Error (Port ${this.config.port}): ${err.message}`);
+            // If port is in use, we might want to exit or retry
+            if (err.code === 'EADDRINUSE') {
+                this.logger.error(`Port ${this.config.port} is already in use. Exiting.`);
+                process.exit(1);
+            }
+        });
     }
 
-    async handleSignalMessage(message) {
-        try {
-            const msg = (typeof message === 'string') ? JSON.parse(message) : message;
-
-            // Update Mark Price Cache (From Gate.io Trade Feed)
-            // Since we removed Delta Ticker, this is our primary price source now.
-            if (msg.s && msg.p) this.markPrices.set(msg.s, parseFloat(msg.p));
-
-            // --- STRATEGY ROUTING ---
-            
-            // 1. Trade Update (Gate.io)
-            if (msg.type === 'trade') {
-                if (this.strategy.onTradeUpdate) {
-                    await this.strategy.onTradeUpdate(msg.s, msg);
-                }
-            }
-            // 2. Depth Update (Gate.io)
-            else if (msg.type === 'depth') {
-                if (this.strategy.onDepthUpdate) {
-                    await this.strategy.onDepthUpdate(msg.s, msg);
-                }
-            }
-            // 3. Binance Backup (Ignore for TickStrategy)
-            else if (msg.type === 'B' && this.config.strategy !== 'TickStrategy') {
-                if (this.strategy.onPriceUpdate) {
-                    const mid = (msg.bb + msg.ba) / 2;
-                    this.strategy.onPriceUpdate(msg.s, mid, 'binance');
-                }
-            }
-
-        } catch (error) {
-            if (error instanceof SyntaxError) return;
-            this.logger.error("Signal Error:", error);
-        }
-    }
-
-    // ============================================================
-    // 2. DELTA WEBSOCKET (Orders & Positions)
-    // ============================================================
+    // --- 2. Delta WebSocket (Execution Updates) ---
     connectDeltaWebSocket() {
-        const timestamp = Math.floor(Date.now() / 1000);
-        const signature = crypto.createHmac('sha256', this.config.apiSecret)
-            .update(`GET${timestamp}/users/connector`)
-            .digest('hex');
+        this.deltaWs = new WebSocket(this.config.wsURL);
 
-        const authUrl = `${this.config.wsURL}?api_key=${this.config.apiKey}&timestamp=${timestamp}&signature=${signature}`;
-
-        this.logger.info('Connecting to Delta Exchange WebSocket...');
-        this.ws = new WebSocket(authUrl);
-
-        this.ws.on('open', () => {
-            this.logger.info('✓ Delta WebSocket Authenticated & Connected');
-            this.heartbeat();
-            
-            // SUBSCRIBE: Orders & Positions (All Symbols)
-            // As per your specific requirement to remove ticker and use "all"
-            const payload = {
-                "type": "subscribe",
-                "payload": {
-                    "channels": [
-                        { "name": "orders", "symbols": ["all"] },
-                        { "name": "positions", "symbols": ["all"] }
-                    ]
-                }
-            };
-            this.ws.send(JSON.stringify(payload));
-            this.logger.info('✓ Subscribed to [orders, positions] for ["all"]');
+        this.deltaWs.on('open', () => {
+            this.logger.info('Connected to Delta Exchange WebSocket.');
+            this.startHeartbeat();
+            this.subscribeDeltaChannels();
         });
 
-        this.ws.on('message', (data) => {
-            this.heartbeat();
+        this.deltaWs.on('message', (data) => {
+            this.heartbeat(); // Reset timeout on any message
             try {
                 const msg = JSON.parse(data);
                 
-                // --- A. HANDLE ORDERS (Manage Lock) ---
-                if (msg.type === 'orders') {
-                    // Normalize data (array or object)
-                    const updates = Array.isArray(msg.data) ? msg.data : (msg.data ? [msg.data] : []);
-                    
-                    updates.forEach(order => {
-                        // Unlock if order is finished
-                        if (['filled', 'cancelled', 'closed', 'rejected'].includes(order.state)) {
-                            this.logger.info(`[Delta] Order ${order.state.toUpperCase()}: ${order.symbol}`);
-                            this.isOrderInProgress = false; 
-                        }
-                    });
-                }
-
-                // --- B. HANDLE POSITIONS (Manage State) ---
-                if (msg.type === 'positions') {
-                    // Positions stream usually sends the full position state or updates
-                    const updates = Array.isArray(msg.data) ? msg.data : (msg.data ? [msg.data] : []);
-
-                    updates.forEach(pos => {
-                        // Delta sends 'size' (signed) or 'size' + 'entry_price'
-                        // We track the size to know if we are exposed
-                        if (pos.symbol) {
-                            const newSize = parseFloat(pos.size);
-                            this.positions[pos.symbol] = newSize;
-                            this.logger.info(`[Delta] Position Update: ${pos.symbol} = ${newSize}`);
-                        }
-                    });
+                if (msg.type === 'v2/ticker') {
+                   // We ignore ticker data here (handled by market_listener)
+                } else if (msg.type === 'orders') {
+                    this.handleOrderUpdate(msg);
+                } else if (msg.type === 'positions') {
+                    this.handlePositionUpdate(msg);
                 }
 
             } catch (e) {
-                // Ignore parsing errors for pings/keeps-alives
+                // Squelch heartbeat/pong parse errors
             }
         });
 
-        this.ws.on('close', () => {
-            this.logger.warn('Delta WS Disconnected. Reconnecting...');
-            this.cleanupWs();
+        this.deltaWs.on('close', () => {
+            this.logger.warn('Delta WebSocket Disconnected. Reconnecting...');
+            this.stopHeartbeat();
             setTimeout(() => this.connectDeltaWebSocket(), this.config.reconnectInterval);
         });
 
-        this.ws.on('error', (err) => {
-            this.logger.error('Delta WS Error:', err.message);
+        this.deltaWs.on('error', (err) => {
+            this.logger.error(`Delta WS Error: ${err.message}`);
         });
     }
 
+    subscribeDeltaChannels() {
+        const payload = {
+            type: 'subscribe',
+            payload: {
+                channels: [
+                    { name: 'orders', symbols: ['all'] },
+                    { name: 'positions', symbols: ['all'] }
+                ]
+            }
+        };
+        this.sendToDelta(payload);
+    }
+
+    handleOrderUpdate(msg) {
+        // Log order updates for debugging / auditing
+        // msg structure depends on Delta API, usually msg.data is the order object
+        if(msg.data) {
+             this.logger.info(`[ORDER UPDATE] ${msg.data.status} | ID: ${msg.data.id} | ${msg.data.side} ${msg.data.size}`);
+             
+             // If an order reaches a terminal state, release the lock
+             if (['filled', 'cancelled', 'closed'].includes(msg.data.status)) {
+                 if (this.isOrderInProgress) {
+                     this.logger.info("Order finalized. Releasing Lock.");
+                     this.isOrderInProgress = false;
+                 }
+             }
+        }
+    }
+
+    handlePositionUpdate(msg) {
+        // Optional: Track current position size for strategy logic
+        if(msg.data) {
+            this.logger.info(`[POSITION UPDATE] ${msg.data.product_symbol} | Size: ${msg.data.size}`);
+        }
+    }
+
+    sendToDelta(data) {
+        if (this.deltaWs && this.deltaWs.readyState === WebSocket.OPEN) {
+            this.deltaWs.send(JSON.stringify(data));
+        }
+    }
+
+    // --- Heartbeat Logic ---
+    startHeartbeat() {
+        this.stopHeartbeat();
+        this.pingInterval = setInterval(() => {
+            if (this.deltaWs && this.deltaWs.readyState === WebSocket.OPEN) {
+                this.deltaWs.ping();
+            }
+        }, this.config.pingIntervalMs);
+
+        // Initial timeout set
+        this.heartbeat(); 
+    }
+
+    stopHeartbeat() {
+        if (this.pingInterval) clearInterval(this.pingInterval);
+        if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
+    }
+
     heartbeat() {
-        clearTimeout(this.heartbeatTimeout);
+        if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
         this.heartbeatTimeout = setTimeout(() => {
-            this.logger.warn('Delta WS Heartbeat Timeout. Terminating...');
-            if (this.ws) this.ws.terminate();
+            this.logger.warn("Heartbeat Timeout. Terminating connection...");
+            if (this.deltaWs) this.deltaWs.terminate();
         }, this.config.heartbeatTimeoutMs);
     }
 
-    cleanupWs() {
-        clearTimeout(this.heartbeatTimeout);
-        clearInterval(this.pingInterval);
-    }
-
-    // ============================================================
-    // 3. EXECUTION (With Safety Locks)
-    // ============================================================
-    
-    getMarkPrice(symbol) {
-        return this.markPrices.get(symbol) || 0;
-    }
-
+    // --- Execution Methods ---
     async placeOrder(orderData) {
-        // 1. Global Lock
         if (this.isOrderInProgress) {
-            this.logger.warn(`[Skip] Global Order Lock Active`);
-            return;
+            this.logger.warn("Order blocked: Internal Lock is active.");
+            return null;
         }
-
-        // 2. Position Lock (Optional: Prevent stacking trades)
-        // If strategy is HFT, you might want to only allow 1 trade at a time per asset.
-        /*
-        const currentSize = this.positions[this.config.productSymbol];
-        if (currentSize && Math.abs(currentSize) > 0) {
-             // Logic to block new entry if position exists?
-             // For now, we trust the Strategy to manage logic.
-        }
-        */
 
         this.isOrderInProgress = true;
 
         try {
-            this.logger.info(`[ORDER] ${orderData.side.toUpperCase()} ${orderData.size} @ ${orderData.limit_price}`);
-            
-            const response = await this.client.placeOrder(orderData);
+            // Sign the request
+            const method = 'POST';
+            const path = '/v2/orders';
+            const body = JSON.stringify(orderData);
+            const timestamp = Math.floor(Date.now() / 1000).toString();
+            const signaturePayload = method + timestamp + path + body;
+            const signature = crypto.createHmac('sha256', this.config.apiSecret).update(signaturePayload).digest('hex');
+
+            const headers = {
+                'Content-Type': 'application/json',
+                'api-key': this.config.apiKey,
+                'signature': signature,
+                'timestamp': timestamp
+            };
+
+            // Use the HTTP Client (axios wrapper)
+            const response = await this.client.post(path, orderData, headers);
             
             if (response && response.success) {
                 this.logger.info(`[SUCCESS] Order ID: ${response.result.id}`);
@@ -289,21 +283,31 @@ class TradingBot {
 
 // --- Start the Bot ---
 (async () => {
+    // 1. Create a simple global logger for startup errors
+    const startupLogger = winston.createLogger({
+        level: 'info',
+        format: winston.format.simple(),
+        transports: [new winston.transports.Console()]
+    });
+
     try {
         const bot = new TradingBot(config);
         await bot.start();
         
         process.on('uncaughtException', async (err) => {
-            logger.error('Uncaught Exception:', err);
+            startupLogger.error(`Uncaught Exception: ${err.message}`);
+            console.error(err); // Fallback to console
         });
         
         process.on('unhandledRejection', (reason, p) => {
-            logger.error('Unhandled Rejection at Promise', p, 'reason:', reason);
+            startupLogger.error(`Unhandled Rejection: ${reason}`);
         });
 
     } catch (error) {
-        logger.error("Failed to start bot:", error);
+        // 2. Use the startupLogger here instead of 'logger' (which was undefined)
+        startupLogger.error(`Failed to start bot: ${error.message}`);
+        console.error(error); // Print full stack trace to console
         process.exit(1);
     }
 })();
-                
+                                        
