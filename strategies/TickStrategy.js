@@ -1,6 +1,6 @@
 /**
  * TickStrategy.js
- * v3.3 – [PRODUCTION] Fixed: Added execute() dispatcher for compatibility
+ * v3.4 – [PRODUCTION] Fixed: execute() + Heartbeat Monitor
  */
 
 class TickStrategy {
@@ -19,6 +19,9 @@ class TickStrategy {
         this.MIN_CAUSAL_Z = 2.0;         // Snipe Sensitivity
         this.MEMORY_CAP = 10000;         // Rolling Window for OBI stats
         this.CLEANUP_INTERVAL_MS = 5000;
+
+        // Internal State
+        this.lastLog = 0; // For Heartbeat Throttle
 
         // --- ASSET STATE ---
         this.assets = {};
@@ -51,12 +54,12 @@ class TickStrategy {
             'SOL': { deltaId: 4654, precision: 2 }
         };
 
-        this.logger.info("TickStrategy v3.3 Initialized. Entering 30s Warmup Mode...");
+        this.logger.info("TickStrategy v3.4 Initialized. Entering 30s Warmup Mode...");
     }
 
-    getName() { return "TickStrategy v3.3 (Warmup + Rolling + Patch)"; }
+    getName() { return "TickStrategy v3.4 (Heartbeat)"; }
 
-    // --- NEW METHOD: REQUIRED FOR TRADER.JS CONNECTION ---
+    // --- DISPATCHER: REQUIRED FOR TRADER.JS ---
     async execute(data) {
         // 1. Route Trade Updates
         if (data.type === 'trade') {
@@ -137,11 +140,17 @@ class TickStrategy {
             }
         }
 
+        // --- HEARTBEAT MONITOR (Prints every 5s) ---
+        if (now - (this.lastLog || 0) > 5000) {
+             const currentZ = this.calculateHawkesZ(asset, now);
+             this.logger.info(`[HEARTBEAT] ${symbol} | Z=${currentZ.toFixed(2)} | TradeObi=${asset.tradeObi.toFixed(2)} | Regime=${asset.currentRegime}`);
+             this.lastLog = now;
+        }
+
         if (asset.isOrderInProgress) return;
         if (now - asset.lastTriggerTime < 2000) return;
         
-        // Note: If you are ONLY running a trade listener, this line will block execution.
-        // If your logs remain silent after warmup, comment out the next line:
+        // Safety: If market_listener is failing to send depth, this prevents stale execution.
         if (now - asset.lastDepthUpdate > 100) return; 
 
         const zScore = this.calculateHawkesZ(asset, now);
@@ -165,7 +174,7 @@ class TickStrategy {
         
         // Rolling Memory Tuning: Keeps the Mean/Variance fresh
         if (asset.obiCount > this.MEMORY_CAP) {
-            const decay = 0.999; // Slowly "forget" the oldest samples
+            const decay = 0.999; 
             asset.obiCount *= decay;
             asset.obiM2 *= decay;
         }
@@ -254,4 +263,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-    
+                    
