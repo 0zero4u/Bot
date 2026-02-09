@@ -31,7 +31,7 @@ class MicroStrategy {
         this.COOLDOWN_MS = 2000;
 
         // --- VELOCITY GATE CONFIG ---
-        this.SPIKE_PERCENT = 0.0002;   // 0.02% Price Move required
+        this.SPIKE_PERCENT = 0.0006;   // 0.02% Price Move required
         this.SPIKE_WINDOW_MS = 30;     // 30ms Time Window
 
         this.assets = {};
