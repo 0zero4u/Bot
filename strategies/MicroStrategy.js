@@ -35,7 +35,7 @@ class MicroStrategy {
 
         // --- VELOCITY GATE CONFIG ---
         // Prevents trading in chopping/stagnant markets.
-        this.SPIKE_PERCENT = 0.0003;   // 0.03% Price Move required
+        this.SPIKE_PERCENT = 0.0002;   // 0.03% Price Move required
         this.SPIKE_WINDOW_MS = 30;     // 30ms Time Window
 
         this.assets = {};
