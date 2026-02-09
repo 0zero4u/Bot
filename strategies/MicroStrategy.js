@@ -20,7 +20,7 @@ class MicroStrategy {
 
         // Signal Strength Threshold
         // 0.65 means Microprice has moved 65% across the spread toward the other side.
-        this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.60');
+        this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.90');
 
         // Liquidity Filter: Minimum TOTAL value on L1 (Bid + Ask) in USDT.
         // We sum them to allow for heavy imbalances (e.g., huge Buy wall, empty Sell side).
@@ -35,7 +35,7 @@ class MicroStrategy {
 
         // --- VELOCITY GATE CONFIG ---
         // Prevents trading in chopping/stagnant markets.
-        this.SPIKE_PERCENT = 0.0004;   // 0.03% Price Move required
+        this.SPIKE_PERCENT = 0.0003;   // 0.03% Price Move required
         this.SPIKE_WINDOW_MS = 30;     // 30ms Time Window
 
         this.assets = {};
