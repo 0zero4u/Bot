@@ -1,23 +1,24 @@
 // trader.js
-// v64.0 - [INTEGRATION] MicroStrategy with Binance Low-Latency Feed
+// v65.0 - [PRODUCTION] MicroStrategy Integrated
+// Features: Per-Asset Position Tracking, Binance Feed Adapter, Delta Execution
 
 const WebSocket = require('ws');
 const winston = require('winston');
-const crypto = require('crypto'); 
+const crypto = require('crypto');
 require('dotenv').config();
 
 const DeltaClient = require('./client.js');
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Micro', 
+    strategy: process.env.STRATEGY || 'Micro',
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
     apiSecret: process.env.DELTA_API_SECRET,
     productId: parseInt(process.env.DELTA_PRODUCT_ID),
-    productSymbol: process.env.DELTA_PRODUCT_SYMBOL, 
+    productSymbol: process.env.DELTA_PRODUCT_SYMBOL,
     orderSize: parseInt(process.env.ORDER_SIZE || '1'),
     leverage: process.env.DELTA_LEVERAGE || '50',
     logLevel: process.env.LOG_LEVEL || 'info',
@@ -30,7 +31,7 @@ const config = {
 const logger = winston.createLogger({
     level: config.logLevel,
     format: winston.format.combine(
-        winston.format.timestamp(), 
+        winston.format.timestamp(),
         winston.format.printf(({ timestamp, level, message }) => {
             return `${timestamp} [${level.toUpperCase()}]: ${message}`;
         })
@@ -38,11 +39,11 @@ const logger = winston.createLogger({
     transports: [
         new winston.transports.File({ filename: 'error.log', level: 'error' }),
         new winston.transports.File({ filename: 'combined.log' }),
-        new winston.transports.Console({ 
+        new winston.transports.Console({
             format: winston.format.combine(
-                winston.format.colorize(), 
+                winston.format.colorize(),
                 winston.format.simple()
-            ) 
+            )
         })
     ]
 });
@@ -63,14 +64,21 @@ class TradingBot {
         this.config = { ...botConfig };
         this.logger = logger;
         this.client = new DeltaClient(this.config.apiKey, this.config.apiSecret, this.config.baseURL, this.logger);
-        
-        this.ws = null; this.authenticated = false;
-        this.isOrderInProgress = false; 
-        
-        this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
-        this.logger.info(`Trading Targets (USDT): ${this.targetAssets.join(', ')}`);
 
-        this.hasOpenPosition = false;
+        this.ws = null; this.authenticated = false;
+        this.isOrderInProgress = false;
+
+        // [CRITICAL] Per-Asset Position Tracking
+        // Format: { 'BTC': true, 'XRP': false }
+        this.activePositions = {};
+
+        this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
+        
+        // Initialize State
+        this.targetAssets.forEach(asset => {
+            this.activePositions[asset] = false;
+        });
+
         this.isStateSynced = false;
         this.pingInterval = null; this.heartbeatTimeout = null;
         this.restKeepAliveInterval = null;
@@ -86,7 +94,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v64.0 - Binance Feed Integrated) ---`);
+        this.logger.info(`--- Bot Initializing (v65.0 - Micro Production) ---`);
         await this.syncPositionState();
         await this.initWebSocket();
         this.setupHttpServer();
@@ -101,9 +109,9 @@ class TradingBot {
             } catch (error) {
                 this.logger.warn(`[Keep-Alive] Check Failed: ${error.message}`);
             }
-        }, 25000); 
+        }, 25000);
     }
-    
+
     // --- WebSocket Heartbeat ---
     startHeartbeat() {
         this.resetHeartbeatTimeout();
@@ -128,10 +136,10 @@ class TradingBot {
     }
 
     // --- WebSocket Connection ---
-    async initWebSocket() { 
+    async initWebSocket() {
         this.logger.info(`Connecting to: ${this.config.wsURL}`);
         this.ws = new WebSocket(this.config.wsURL);
-        
+
         this.ws.on('open', () => this.authenticateWebSocket());
         this.ws.on('message', (data) => this.handleWebSocketMessage(JSON.parse(data.toString())));
         this.ws.on('error', (error) => this.logger.error('WebSocket error:', error.message));
@@ -144,21 +152,21 @@ class TradingBot {
     }
 
     authenticateWebSocket() {
-        const timestampNum = Math.floor(Date.now() / 1000); 
-        const timestampStr = timestampNum.toString(); 
-        
+        const timestampNum = Math.floor(Date.now() / 1000);
+        const timestampStr = timestampNum.toString();
+
         const signatureData = 'GET' + timestampStr + '/live';
         const signature = crypto
             .createHmac('sha256', this.config.apiSecret)
             .update(signatureData)
             .digest('hex');
 
-        const payload = { 
-            type: 'key-auth', 
-            payload: { 
-                'api-key': this.config.apiKey, 
-                timestamp: timestampStr, 
-                signature: signature 
+        const payload = {
+            type: 'key-auth',
+            payload: {
+                'api-key': this.config.apiKey,
+                timestamp: timestampStr,
+                signature: signature
             }
         };
 
@@ -167,31 +175,33 @@ class TradingBot {
 
     subscribeToChannels() {
         const symbols = this.targetAssets.map(asset => `${asset}USD`);
-        this.logger.info(`Subscribing to Delta Execution Channels: ${symbols.join(', ')}`);
-        
+        this.logger.info(`Subscribing to Execution Channels: ${symbols.join(', ')}`);
+
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
+            // Track Orders (Fills)
             { name: 'orders', symbols: ['all'] },
+            // Track Positions (Open/Close State)
             { name: 'positions', symbols: ['all'] },
+            // Track Public Trades (Optional)
             { name: 'all_trades', symbols: symbols }
-            // Note: We removed Delta 'ticker' here because MicroStrategy 
-            // will rely on the faster Binance feed from handleSignalMessage
         ]}}));
     }
 
     handleWebSocketMessage(message) {
+        // 1. Auth Handling
         if (
-            (message.type === 'success' && message.message === 'Authenticated') || 
+            (message.type === 'success' && message.message === 'Authenticated') ||
             (message.type === 'key-auth' && message.status === 'authenticated') ||
             (message.success === true && message.status === 'authenticated')
         ) {
             this.logger.info('✅ WebSocket AUTHENTICATED Successfully.');
-            this.authenticated = true; 
+            this.authenticated = true;
             this.subscribeToChannels();
             this.startHeartbeat();
-            this.syncPositionState(); 
+            this.syncPositionState();
             return;
         }
-        
+
         if (message.type === 'error' && !this.authenticated) {
             this.logger.error(`❌ AUTH FAILED. Error Code: ${message.error ? message.error.code : 'Unknown'}`);
         }
@@ -201,74 +211,109 @@ class TradingBot {
             return;
         }
 
+        // 2. Data Handling
         switch (message.type) {
             case 'orders':
                 if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
                 break;
+                
             case 'positions':
+                // Handle Position Updates (Array or Single Object)
                 if (Array.isArray(message.data)) {
                     message.data.forEach(pos => this.handlePositionUpdate(pos));
                 } else if (message.size !== undefined) {
                     this.handlePositionUpdate(message);
                 }
                 break;
-            case 'all_trades':
-                // Optional: Pass trade execution data to strategy if needed
-                if (this.strategy.onTradeUpdate && message.price) {
-                     this.strategy.onTradeUpdate(message.symbol, parseFloat(message.price));
-                }
-                break;
         }
     }
 
+    // --- State Management ---
+
     handlePositionUpdate(pos) {
-        if (pos.size !== undefined && pos.size !== null) {
-            this.hasOpenPosition = parseFloat(pos.size) !== 0;
-            if (this.strategy.onPositionUpdate) {
-                this.strategy.onPositionUpdate(pos);
+        if (!pos.product_symbol) return;
+        
+        // Find which asset this update belongs to (e.g. BTCUSD -> BTC)
+        const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
+        
+        if (asset) {
+            const size = parseFloat(pos.size);
+            const isOpen = size !== 0;
+
+            // Update State Map
+            if (this.activePositions[asset] !== isOpen) {
+                this.activePositions[asset] = isOpen;
+                this.logger.info(`[POS UPDATE] ${asset} is now ${isOpen ? 'OPEN' : 'CLOSED'} (Size: ${size})`);
             }
         }
     }
 
-    // --- CRITICAL: EXTERNAL FEED HANDLER (BINANCE) ---
-    async handleSignalMessage(message) {
-        // Authenticated check is optional for localhost, but good for safety
-        if (!this.authenticated) {
-             // You can comment this out if you want the bot to "warm up" data before auth
-             return;
+    async syncPositionState() {
+        try {
+            const response = await this.client.getPositions();
+            const positions = response.result || [];
+            
+            // 1. Reset all to Closed
+            this.targetAssets.forEach(a => this.activePositions[a] = false);
+
+            // 2. Mark Open ones
+            positions.forEach(pos => {
+                const size = parseFloat(pos.size);
+                if (size !== 0) {
+                    const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
+                    if (asset) {
+                        this.activePositions[asset] = true;
+                        this.logger.info(`[SYNC] Found OPEN position for ${asset}: ${size}`);
+                    }
+                }
+            });
+            
+            this.isStateSynced = true;
+            this.logger.info(`Position State Synced: ${JSON.stringify(this.activePositions)}`);
+        } catch (error) {
+            this.logger.error('Failed to sync position state:', error.message);
         }
+    }
+
+    /**
+     * Helper: Checks if we have an open position for a specific asset.
+     */
+    hasOpenPosition(symbol) {
+        if (symbol) {
+            return this.activePositions[symbol] === true;
+        }
+        // Fallback: Check if ANY position is open
+        return Object.values(this.activePositions).some(status => status === true);
+    }
+
+    // --- External Feed Handler (Binance) ---
+    async handleSignalMessage(message) {
+        if (!this.authenticated) return;
 
         try {
             const data = JSON.parse(message.toString());
             
             // [PAYLOAD ADAPTER] BINANCE LOW-LATENCY FEED
-            // Type 'B' comes from market_listener.js
+            // Comes from market_listener.js (Type 'B')
             if (data.type === 'B') {
-                const asset = data.s; // e.g., 'BTC'
+                const asset = data.s; // e.g. 'BTC'
                 
-                // 1. FILTER: Only process assets we are trading
+                // 1. Check if this is a target asset
                 if (!this.targetAssets.includes(asset)) return;
 
-                // 2. CONSTRUCT PAYLOAD
-                // MicroStrategy expects: { bids: [[Price, Vol]], asks: [[Price, Vol]] }
+                // 2. Format for MicroStrategy
+                // { bids: [[Price, Vol]], asks: [[Price, Vol]] }
                 const depthPayload = {
-                    bids: [[ data.bb, data.bq ]], // Best Bid Price, Best Bid Qty
-                    asks: [[ data.ba, data.aq ]]  // Best Ask Price, Best Ask Qty
+                    bids: [[ data.bb, data.bq ]], 
+                    asks: [[ data.ba, data.aq ]]  
                 };
 
-                // 3. INJECT INTO STRATEGY
+                // 3. Inject into Strategy
                 if (this.strategy.onDepthUpdate) {
                     await this.strategy.onDepthUpdate(asset, depthPayload);
                 }
             }
             
-            // Legacy Signal Support (if you use other scanners)
-            else if (data.type === 'S' && data.p) {
-                 if (this.strategy.onPriceUpdate) {
-                     await this.strategy.onPriceUpdate(data.s, parseFloat(data.p), data.x);
-                 }
-            }
-
         } catch (error) {
             this.logger.error("Error handling signal message:", error);
         }
@@ -277,9 +322,9 @@ class TradingBot {
     setupHttpServer() {
         const httpServer = new WebSocket.Server({ port: this.config.port });
         httpServer.on('connection', ws => {
-            this.logger.info('External Data Feed Connected (Binance Listener)');
+            this.logger.info('External Data Feed Connected (Binance)');
             ws.on('message', m => this.handleSignalMessage(m));
-            ws.on('close', () => this.logger.warn('External Data Feed Disconnected'));
+            ws.on('close', () => this.logger.warn('External Feed Disconnected'));
             ws.on('error', (err) => this.logger.error('Signal listener error:', err));
         });
         this.logger.info(`Internal Data Server running on port ${this.config.port}`);
@@ -288,31 +333,10 @@ class TradingBot {
     async placeOrder(orderData) {
         return this.client.placeOrder(orderData);
     }
-
-    async syncPositionState() {
-        try {
-            const response = await this.client.getPositions();
-            const positions = response.result || [];
-            
-            const myPosition = positions.find(p => p.product_id == this.config.productId);
-            const currentSize = myPosition ? parseFloat(myPosition.size) : 0;
-            
-            this.hasOpenPosition = currentSize !== 0;
-            this.isStateSynced = true;
-
-            if (this.strategy.onPositionUpdate) {
-                this.strategy.onPositionUpdate(myPosition || { size: 0 });
-            }
-
-            this.logger.info(`Position State Synced. Open Position: ${this.hasOpenPosition}`);
-        } catch (error) {
-            this.logger.error('Failed to sync position state:', error.message);
-        }
-    }
     
     handleOrderUpdate(orderUpdate) {
         if (orderUpdate.state === 'filled') {
-            this.logger.info(`[Trader] Order ${orderUpdate.id} FILLED on Delta.`);
+            this.logger.info(`[Trader] Order ${orderUpdate.id} FILLED.`);
         }
     }
 }
@@ -330,4 +354,3 @@ class TradingBot {
         process.exit(1);
     }
 })();
-        
