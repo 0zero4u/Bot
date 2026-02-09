@@ -1,6 +1,6 @@
 // trader.js
-// v72.4 - [PRODUCTION] Smart Import Fix + Constructor Checkpoints
-// Changes: Handles named exports vs default exports automatically.
+// v72.5 - [PRODUCTION] Global Logger (v69 Logic) + Smart Loader
+// Fix: Reverted Logger to Global Scope to fix Client crash.
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -9,14 +9,14 @@ const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
 
-// Check for client.js existence
+// Check for client.js
 if (!fs.existsSync('./client.js')) {
-    console.error("[FATAL] 'client.js' not found in the same directory as trader.js");
+    console.error("[FATAL] 'client.js' not found.");
     process.exit(1);
 }
 const DeltaClient = require('./client.js');
 
-// --- Configuration ---
+// --- CONFIGURATION ---
 const config = {
     strategy: process.env.STRATEGY || 'TickStrategy',
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
@@ -34,9 +34,25 @@ const config = {
     heartbeatTimeoutMs: parseInt(process.env.HEARTBEAT_TIMEOUT_MS || '40000'),
 };
 
-// --- Super-Smart Strategy Loader ---
-let StrategyClass;
+// --- GLOBAL LOGGER (Matches v69 Logic) ---
+// Defined globally so it is ALWAYS available, never undefined.
+const logger = winston.createLogger({
+    level: config.logLevel,
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.colorize(),
+        winston.format.printf(({ timestamp, level, message }) => {
+            return `${timestamp} [${level}]: ${message}`;
+        })
+    ),
+    transports: [
+        new winston.transports.Console(),
+        new winston.transports.File({ filename: 'trader.log' })
+    ]
+});
 
+// --- SMART STRATEGY LOADER ---
+let StrategyClass;
 function loadStrategy(strategyName) {
     const candidates = [
         `./${strategyName}.js`,
@@ -50,31 +66,21 @@ function loadStrategy(strategyName) {
         try {
             const absolutePath = path.resolve(__dirname, relativePath);
             if (fs.existsSync(absolutePath)) {
-                console.log(`[Loader] Found strategy file at: ${absolutePath}`);
+                logger.info(`[Loader] Found strategy at: ${absolutePath}`);
                 const loadedModule = require(absolutePath);
                 
-                // --- SMART IMPORT FIX ---
-                // If the module is { TickStrategy: [Class] }, extract it.
-                // If the module is [Class], use it directly.
-                if (typeof loadedModule === 'function') {
-                    return loadedModule;
-                } else if (loadedModule[strategyName]) {
-                    return loadedModule[strategyName];
-                } else if (loadedModule.default) {
-                    return loadedModule.default;
-                } else {
-                    // Try to find ANY class in the export
-                    const keys = Object.keys(loadedModule);
-                    if (keys.length > 0 && typeof loadedModule[keys[0]] === 'function') {
-                        console.log(`[Loader] Guessing strategy class is '${keys[0]}'`);
-                        return loadedModule[keys[0]];
-                    }
+                // Handle different export styles
+                if (typeof loadedModule === 'function') return loadedModule;
+                if (loadedModule[strategyName]) return loadedModule[strategyName];
+                if (loadedModule.default) return loadedModule.default;
+                
+                // Guess first export
+                const keys = Object.keys(loadedModule);
+                if (keys.length > 0 && typeof loadedModule[keys[0]] === 'function') {
+                    return loadedModule[keys[0]];
                 }
-                throw new Error(`File found but could not identify a Class export.`);
             }
-        } catch (e) {
-            // Ignore and continue searching
-        }
+        } catch (e) { /* continue */ }
     }
     throw new Error(`Could not find '${strategyName}' in any standard directory.`);
 }
@@ -82,54 +88,35 @@ function loadStrategy(strategyName) {
 try {
     StrategyClass = loadStrategy(config.strategy);
 } catch (e) {
-    console.error(`\n[FATAL] STRATEGY LOAD ERROR`);
-    console.error(e.message);
+    logger.error(`[FATAL] STRATEGY LOAD ERROR: ${e.message}`);
     process.exit(1);
 }
 
-// --- Main Trading Bot Class ---
+// --- MAIN TRADING BOT ---
 class TradingBot {
     constructor(config) {
-        console.log("[Init] Initializing TradingBot..."); // Checkpoint 1
         this.config = config;
         this.isOrderInProgress = false;
         
-        // Initialize Logger
-        this.logger = winston.createLogger({
-            level: config.logLevel,
-            format: winston.format.combine(
-                winston.format.timestamp(),
-                winston.format.colorize(),
-                winston.format.printf(({ timestamp, level, message }) => {
-                    return `${timestamp} [${level}]: ${message}`;
-                })
-            ),
-            transports: [
-                new winston.transports.Console(),
-                new winston.transports.File({ filename: 'trader.log' })
-            ]
-        });
+        // Use the Global Logger
+        this.logger = logger; 
 
         // Initialize API Client
-        console.log("[Init] Loading DeltaClient..."); // Checkpoint 2
+        // Passing the Global Logger ensures it is NOT undefined
         try {
-            this.client = new DeltaClient(config, this.logger);
+            this.client = new DeltaClient(config, logger); 
         } catch (err) {
-            console.error("[FATAL] Failed to initialize DeltaClient:", err.message);
-            throw err;
+            logger.error(`[FATAL] Client Init Failed: ${err.message}`);
+            process.exit(1);
         }
 
         // Initialize Strategy
-        console.log("[Init] Loading Strategy Instance..."); // Checkpoint 3
         try {
             this.strategy = new StrategyClass(this);
         } catch (err) {
-            console.error("[FATAL] Failed to initialize Strategy:", err.message);
-            console.error("Make sure your Strategy class constructor does not crash.");
-            throw err;
+            logger.error(`[FATAL] Strategy Init Failed: ${err.message}`);
+            process.exit(1);
         }
-        
-        console.log("[Init] Bot Ready."); // Checkpoint 4
 
         // WebSocket State
         this.internalWsServer = null; 
@@ -139,8 +126,8 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`Starting Delta Trader v72.4...`);
-        this.logger.info(`Strategy Active: ${this.config.strategy}`);
+        this.logger.info(`Starting Delta Trader v72.5...`);
+        this.logger.info(`Strategy: ${this.config.strategy}`);
         
         this.setupInternalServer();
         this.connectDeltaWebSocket();
@@ -319,31 +306,25 @@ class TradingBot {
     }
 }
 
-// --- Start the Bot ---
+// --- STARTUP LOGIC ---
 (async () => {
-    const startupLogger = winston.createLogger({
-        level: 'info',
-        format: winston.format.simple(),
-        transports: [new winston.transports.Console()]
-    });
-
     try {
         const bot = new TradingBot(config);
         await bot.start();
         
         process.on('uncaughtException', async (err) => {
-            startupLogger.error(`Uncaught Exception: ${err.message}`);
+            logger.error(`Uncaught Exception: ${err.message}`);
             console.error(err); 
         });
         
         process.on('unhandledRejection', (reason, p) => {
-            startupLogger.error(`Unhandled Rejection: ${reason}`);
+            logger.error(`Unhandled Rejection: ${reason}`);
         });
 
     } catch (error) {
-        startupLogger.error(`Failed to start bot: ${error.message}`);
+        logger.error(`Failed to start bot: ${error.message}`);
         console.error(error); 
         process.exit(1);
     }
 })();
-                
+            
