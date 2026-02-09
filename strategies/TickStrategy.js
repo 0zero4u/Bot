@@ -14,12 +14,12 @@ class TickStrategy {
 
         // --- RESEARCH-DRIVEN PARAMETERS ---
         this.PLFF_THRESHOLD_MS = 20;      
-        this.OBI_HISTORY_SIZE = 10000;    
+        this.OBI_HISTORY_SIZE = 20000;    
         this.HEARTBEAT_INTERVAL = 5000;   
         
         // --- HAWKES CAUSAL PARAMETERS ---
         this.HAWKES_DECAY = 5.0;          
-        this.MIN_CAUSAL_SCORE = 30.0;      
+        this.MIN_CAUSAL_SCORE = 50.0;      
         this.MIN_TRADE_OBI = 0.85;        
 
         this.assets = {};
