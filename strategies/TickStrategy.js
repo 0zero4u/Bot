@@ -12,14 +12,14 @@ class TickStrategy {
 
         // --- TIMING & WARMUP ---
         this.startTime = Date.now();
-        this.WARMUP_PERIOD_MS = 30000;   
+        this.WARMUP_PERIOD_MS = 40000;   
         this.isWarm = false;
 
         // --- PARAMETERS ---
         this.PLFF_THRESHOLD_MS = 20;     
         this.HAWKES_DECAY = 5.0;         
         this.MIN_CAUSAL_Z = 2.0;         
-        this.MEMORY_CAP = 10000;         
+        this.MEMORY_CAP = 30000;         
         this.CLEANUP_INTERVAL_MS = 5000;
 
         // Internal State
