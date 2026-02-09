@@ -1,7 +1,8 @@
 /**
  * trader.js
- * v72.8 - [PRODUCTION] Position State Management
- * Fixes: Tracks open positions to prevent 'bracket_order_position_exists' errors.
+ * v72.9 - [PRODUCTION] Position Snapshot Fix
+ * Fixes: Correctly parses Delta 'snapshot' arrays on startup so the bot knows
+ * it has open positions immediately.
  */
 
 const WebSocket = require('ws');
@@ -84,7 +85,7 @@ class TradingBot {
         this.isOrderInProgress = false;
         this.logger = logger; 
         
-        // [FIX] Store Positions Memory
+        // Store Positions Memory
         this.positions = {}; 
 
         try {
@@ -107,18 +108,18 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`Starting Delta Trader v72.8...`);
+        this.logger.info(`Starting Delta Trader v72.9...`);
         this.setupInternalServer();
         this.connectDeltaWebSocket();
     }
 
-    // [FIX] Helper for Strategy to check Position
+    // Helper for Strategy to check Position
     // Returns the size (e.g., 100 or -100). Returns 0 if no position.
     getPosition(symbol) {
         return this.positions[symbol] || 0.0;
     }
     
-    // [FIX] Helper to check if ANY position exists for specific symbol
+    // Helper to check if ANY position exists for specific symbol
     hasOpenPosition(symbol) {
         const size = this.positions[symbol];
         return size && parseFloat(size) !== 0;
@@ -157,8 +158,11 @@ class TradingBot {
             this.heartbeat(); 
             try {
                 const msg = JSON.parse(data);
-                if (msg.type === 'orders') this.handleOrderUpdate(msg);
-                else if (msg.type === 'positions') this.handlePositionUpdate(msg);
+                if (msg.type === 'orders') {
+                    this.handleOrderUpdate(msg);
+                } else if (msg.type === 'positions') {
+                    this.handlePositionUpdate(msg);
+                }
             } catch (e) {}
         });
 
@@ -196,16 +200,37 @@ class TradingBot {
         }
     }
 
-    // [FIX] Actually store the position size
+    // [CRITICAL FIX] Correctly handles Initial Snapshot AND Real-time Updates
     handlePositionUpdate(msg) {
-        if(msg.data) {
-            const sym = msg.data.product_symbol;
-            const size = parseFloat(msg.data.size);
+        // Case 1: Initial Snapshot (Array of all positions)
+        // Delta sends: { type: 'positions', action: 'snapshot', result: [ ... ] }
+        if (msg.action === 'snapshot' && Array.isArray(msg.result)) {
+            msg.result.forEach(pos => {
+                const sym = pos.symbol || pos.product_symbol;
+                const size = parseFloat(pos.size);
+                
+                // Always set, even if 0, to initialize state
+                this.positions[sym] = size;
+                
+                if (size !== 0) {
+                    this.logger.info(`[POS SNAPSHOT] ${sym} | Size: ${size} (Existing Position Loaded)`);
+                }
+            });
+            return;
+        }
+
+        // Case 2: Real-time Update (Single position change)
+        // Delta sometimes sends updates in 'data', sometimes at root depending on channel version
+        const data = msg.data || msg; 
+        
+        if (data && (data.symbol || data.product_symbol) && data.size !== undefined) {
+            const sym = data.symbol || data.product_symbol;
+            const size = parseFloat(data.size);
             
-            // Only log if size actually changes
+            // Only log if size actually changes to reduce noise
             if (this.positions[sym] !== size) {
                 this.positions[sym] = size;
-                this.logger.info(`[POS UPDATE] ${sym} | Size: ${size}`);
+                this.logger.info(`[POS UPDATE] ${sym} | New Size: ${size}`);
             } else {
                 this.positions[sym] = size;
             }
@@ -272,4 +297,3 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                                           
