@@ -1,8 +1,9 @@
 // trader.js
-// v72.6 - [PRODUCTION] Global Logger + Smart Loader + Client Fixes
+// v72.7 - [FIXED] WebSocket Heartbeat & Connection Stability
 // Fixes: 
-// 1. Corrected DeltaClient instantiation arguments to prevent crash.
-// 2. Updated placeOrder to use client's native method.
+// 1. Implemented "enable_heartbeat" to receive server-side keep-alives.
+// 2. Removed raw pings that failed to trigger message handlers.
+// 3. Updated connection logic to prevent 40s timeouts.
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -102,7 +103,7 @@ class TradingBot {
         // Use the Global Logger
         this.logger = logger; 
 
-        // Initialize API Client - FIXED ARGS
+        // Initialize API Client
         try {
             this.client = new DeltaClient(
                 config.apiKey, 
@@ -131,7 +132,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`Starting Delta Trader v72.6...`);
+        this.logger.info(`Starting Delta Trader v72.7...`);
         this.logger.info(`Strategy: ${this.config.strategy}`);
         
         this.setupInternalServer();
@@ -178,14 +179,29 @@ class TradingBot {
 
         this.deltaWs.on('open', () => {
             this.logger.info('Connected to Delta Exchange WebSocket.');
+            
+            // [FIX] Enable Heartbeat immediately upon connection
+            // This is required for the server to send periodic updates
+            this.sendToDelta({ type: "enable_heartbeat" });
+
             this.startHeartbeat();
             this.subscribeDeltaChannels();
         });
 
         this.deltaWs.on('message', (data) => {
+            // [FIX] Reset the watchdog timer on ANY message (including heartbeats)
             this.heartbeat(); 
+            
             try {
                 const msg = JSON.parse(data);
+                
+                // Handle Heartbeat specifically (optional logging)
+                if (msg.type === 'heartbeat') {
+                    // Timer is already reset above. 
+                    // We can log this on debug level if needed, but usually we stay silent.
+                    return;
+                }
+
                 if (msg.type === 'orders') {
                     this.handleOrderUpdate(msg);
                 } else if (msg.type === 'positions') {
@@ -244,11 +260,11 @@ class TradingBot {
 
     startHeartbeat() {
         this.stopHeartbeat();
-        this.pingInterval = setInterval(() => {
-            if (this.deltaWs && this.deltaWs.readyState === WebSocket.OPEN) {
-                this.deltaWs.ping();
-            }
-        }, this.config.pingIntervalMs);
+        
+        // [FIX] Removed client-side ping interval. 
+        // We now rely on the server sending us 'heartbeat' messages every 30s.
+        // We just set a "Watchdog" timer. If we don't hear ANYTHING for 40s (buffer), we reconnect.
+        
         this.heartbeat(); 
     }
 
@@ -259,8 +275,11 @@ class TradingBot {
 
     heartbeat() {
         if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
+        
+        // If this timer fires, it means the server hasn't spoken to us (no heartbeat, no order update)
+        // for the duration of heartbeatTimeoutMs (40s).
         this.heartbeatTimeout = setTimeout(() => {
-            this.logger.warn("Heartbeat Timeout. Terminating connection...");
+            this.logger.warn("Heartbeat Timeout (No data from server). Terminating connection...");
             if (this.deltaWs) this.deltaWs.terminate();
         }, this.config.heartbeatTimeoutMs);
     }
@@ -274,14 +293,11 @@ class TradingBot {
         this.isOrderInProgress = true;
 
         try {
-            // Updated to use Client's built-in method
             const response = await this.client.placeOrder(orderData);
             
-            // Client.js returns the body object on success
             if (response && response.result) {
                 this.logger.info(`[SUCCESS] Order ID: ${response.result.id}`);
                 
-                // Auto-release lock after short delay (safety net)
                 setTimeout(() => { 
                     if(this.isOrderInProgress) {
                         this.logger.warn("Auto-releasing Order Lock (Safety Timeout)");
@@ -295,7 +311,6 @@ class TradingBot {
             return response;
 
         } catch (error) {
-            // Log full error details
             const errMsg = error.response ? JSON.stringify(error.response.body) : error.message;
             this.logger.error(`[EXCEPTION] Order Failed: ${errMsg}`);
             this.isOrderInProgress = false;
@@ -325,4 +340,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-
+        
