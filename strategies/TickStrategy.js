@@ -1,6 +1,7 @@
 /**
  * TickStrategy.js
- * v3.4 – [PRODUCTION] Fixed: execute() + Heartbeat Monitor
+ * v3.6 – [PRODUCTION] Position Aware & Validated
+ * Fixes: Checks bot.getPosition() before trading to avoid API errors.
  */
 
 class TickStrategy {
@@ -10,18 +11,18 @@ class TickStrategy {
 
         // --- TIMING & WARMUP ---
         this.startTime = Date.now();
-        this.WARMUP_PERIOD_MS = 30000;   // 30-Second Minimum Memory Build
+        this.WARMUP_PERIOD_MS = 30000;   
         this.isWarm = false;
 
         // --- PARAMETERS ---
-        this.PLFF_THRESHOLD_MS = 20;     // Modification Time Filter
-        this.HAWKES_DECAY = 5.0;         // 1s Effective Memory for Trades
-        this.MIN_CAUSAL_Z = 2.0;         // Snipe Sensitivity
-        this.MEMORY_CAP = 10000;         // Rolling Window for OBI stats
+        this.PLFF_THRESHOLD_MS = 20;     
+        this.HAWKES_DECAY = 5.0;         
+        this.MIN_CAUSAL_Z = 2.0;         
+        this.MEMORY_CAP = 10000;         
         this.CLEANUP_INTERVAL_MS = 5000;
 
         // Internal State
-        this.lastLog = 0; // For Heartbeat Throttle
+        this.lastLog = 0; 
 
         // --- ASSET STATE ---
         this.assets = {};
@@ -38,12 +39,13 @@ class TickStrategy {
                 lastDepthUpdate: 0,
                 buyIntensity: 0,
                 sellIntensity: 0,
-                lastTradeUpdate: 0,
+                lastTradeUpdate: Date.now(), 
                 tradeObi: 0.5,
                 lastPrice: 0,
                 lastTriggerTime: 0,
                 lastCleanupTime: 0,
-                isOrderInProgress: false
+                isOrderInProgress: false,
+                tradeCount: 0 
             };
         });
 
@@ -54,18 +56,15 @@ class TickStrategy {
             'SOL': { deltaId: 4654, precision: 2 }
         };
 
-        this.logger.info("TickStrategy v3.4 Initialized. Entering 30s Warmup Mode...");
+        this.logger.info("TickStrategy v3.6 Initialized. Waiting for Data...");
     }
 
-    getName() { return "TickStrategy v3.4 (Heartbeat)"; }
+    getName() { return "TickStrategy v3.6 (Position Aware)"; }
 
-    // --- DISPATCHER: REQUIRED FOR TRADER.JS ---
     async execute(data) {
-        // 1. Route Trade Updates
         if (data.type === 'trade') {
             await this.onTradeUpdate(data.s, data);
         } 
-        // 2. Route Depth/OrderBook Updates
         else if (data.type === 'depthUpdate' || data.type === 'bookTicker') {
             await this.onDepthUpdate(data.s, data);
         }
@@ -75,8 +74,11 @@ class TickStrategy {
         const asset = this.assets[symbol];
         if (!asset) return;
 
+        asset.tradeCount++;
         const now = Date.now();
         const dt = (now - asset.lastTradeUpdate) / 1000;
+        
+        // Decay Intensity
         if (dt > 0) {
             const decay = Math.exp(-this.HAWKES_DECAY * dt);
             asset.buyIntensity *= decay;
@@ -86,7 +88,11 @@ class TickStrategy {
         asset.lastTradeUpdate = now;
         asset.lastPrice = parseFloat(trade.p);
 
-        const impact = Math.log(1 + parseFloat(trade.q)); 
+        // Validation: Prevent NaN
+        const quantity = parseFloat(trade.q);
+        if (isNaN(quantity) || quantity <= 0) return; 
+
+        const impact = Math.log(1 + quantity); 
         const weight = trade.is_taker ? 1.0 : 0.5;
 
         if (trade.side === 'buy') asset.buyIntensity += impact * weight;
@@ -109,8 +115,8 @@ class TickStrategy {
         const validAsks = this.applyPLFF(asset, depth.asks, now);
 
         let bVol = 0, aVol = 0;
-        if (validBids) for (const x of validBids) bVol += parseFloat(x[1]);
-        if (validAsks) for (const x of validAsks) aVol += parseFloat(x[1]);
+        if (validBids) for (const x of validBids) bVol += parseFloat(x[1] || 0);
+        if (validAsks) for (const x of validAsks) aVol += parseFloat(x[1] || 0);
 
         if (bVol + aVol > 0) {
             asset.filteredObi = (bVol - aVol) / (bVol + aVol);
@@ -125,33 +131,31 @@ class TickStrategy {
         await this.checkTrigger(symbol, asset, now);
     }
 
-    // --------------------------------------------------
-    // WARMUP & TRIGGER LOGIC
-    // --------------------------------------------------
     async checkTrigger(symbol, asset, now) {
-        // 1. HARD WARMUP CHECK
         if (!this.isWarm) {
-            const elapsed = now - this.startTime;
-            if (elapsed < this.WARMUP_PERIOD_MS) {
-                return; // Silent buildup
-            } else {
-                this.isWarm = true;
-                this.logger.info("✓ Warmup Complete. Snipe Logic Active.");
-            }
+            if (now - this.startTime < this.WARMUP_PERIOD_MS) return;
+            this.isWarm = true;
+            this.logger.info("✓ Warmup Complete. Snipe Logic Active.");
         }
 
-        // --- HEARTBEAT MONITOR (Prints every 5s) ---
+        // Heartbeat Log
         if (now - (this.lastLog || 0) > 5000) {
              const currentZ = this.calculateHawkesZ(asset, now);
-             this.logger.info(`[HEARTBEAT] ${symbol} | Z=${currentZ.toFixed(2)} | TradeObi=${asset.tradeObi.toFixed(2)} | Regime=${asset.currentRegime}`);
+             this.logger.info(`[HEARTBEAT] ${symbol} | Z=${currentZ.toFixed(2)} | Regime=${asset.currentRegime} | Trades=${asset.tradeCount}`);
              this.lastLog = now;
         }
 
         if (asset.isOrderInProgress) return;
         if (now - asset.lastTriggerTime < 2000) return;
         
-        // Safety: If market_listener is failing to send depth, this prevents stale execution.
+        // Safety: If data is stale (>100ms), don't trade
         if (now - asset.lastDepthUpdate > 100) return; 
+
+        // [CRITICAL FIX] Check if Position Exists
+        // If we have any position (size != 0), STOP here.
+        if (this.bot.hasOpenPosition && this.bot.hasOpenPosition(symbol)) {
+            return; 
+        }
 
         const zScore = this.calculateHawkesZ(asset, now);
         if (zScore < this.MIN_CAUSAL_Z) return;
@@ -166,13 +170,8 @@ class TickStrategy {
         }
     }
 
-    // --------------------------------------------------
-    // ROLLING MEMORY (WELFORD)
-    // --------------------------------------------------
     updateRegime(asset) {
         const x = asset.filteredObi;
-        
-        // Rolling Memory Tuning: Keeps the Mean/Variance fresh
         if (asset.obiCount > this.MEMORY_CAP) {
             const decay = 0.999; 
             asset.obiCount *= decay;
@@ -201,6 +200,7 @@ class TickStrategy {
     }
 
     calculateHawkesZ(asset, now) {
+        if (asset.tradeCount === 0) return 0.0;
         const dt = (now - asset.lastTradeUpdate) / 1000;
         const decay = Math.exp(-this.HAWKES_DECAY * dt);
         const currBuy = asset.buyIntensity * decay;
@@ -211,8 +211,10 @@ class TickStrategy {
     }
 
     applyPLFF(asset, levels, now) {
-        if (!levels) return [];
-        return levels.filter(([priceStr]) => {
+        if (!levels || !Array.isArray(levels)) return [];
+        return levels.filter((item) => {
+            const priceStr = Array.isArray(item) ? item[0] : item.p;
+            if (!priceStr) return false;
             const price = parseFloat(priceStr);
             const last = asset.levelTimestamps.get(price) || 0;
             if (now - last > this.PLFF_THRESHOLD_MS) {
@@ -236,7 +238,11 @@ class TickStrategy {
         try {
             const spec = this.specs[symbol];
             const price = asset.lastPrice > 0 ? asset.lastPrice : 0;
-            if (!price) throw new Error("No Price");
+            
+            if (!price) {
+                this.logger.warn(`[EXEC_FAIL] No Price for ${symbol}`);
+                return;
+            }
 
             const limit = side === 'buy' ? price * 1.0005 : price * 0.9995;
             let trail = price * 0.0005;
@@ -263,4 +269,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-                    
+                
