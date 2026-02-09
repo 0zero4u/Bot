@@ -16,8 +16,8 @@ class TickStrategy {
         this.isWarm = false;
 
         // --- PARAMETERS ---
-        this.PLFF_THRESHOLD_MS = 20;     
-        this.HAWKES_DECAY = 1.0;         
+        this.PLFF_THRESHOLD_MS = 100;     
+        this.HAWKES_DECAY = 2.0;         
         this.MIN_CAUSAL_Z = 3.0;         
         this.MEMORY_CAP = 50000;         
         this.CLEANUP_INTERVAL_MS = 5000;
