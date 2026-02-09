@@ -159,7 +159,7 @@ class MicroStrategy {
             // Aggressive IOC: Buy at Ask, Sell at Bid to ensure fill on velocity spike
             const entryPrice = side === 'buy' ? bestAsk : bestBid;
 
-            // B. Calculate Trailing Amount (Distance)
+            // B. Calculate Trailing Amount (Absolute Distance)
             // Formula: EntryPrice * (Percent / 100)
             let trailDistance = entryPrice * (this.TRAILING_PERCENT / 100);
 
@@ -169,6 +169,15 @@ class MicroStrategy {
             if (trailDistance < tickSize) {
                 trailDistance = tickSize;
             }
+
+            // --- FIX START: Apply Negative Sign for Buy Orders ---
+            // Delta Exchange API requires negative trail amount for Buy orders 
+            // (Stop Price = Mark Price + Amount). Since we want Stop < Mark for Buys, Amount must be negative.
+            let signedTrailAmount = trailDistance;
+            if (side === 'buy') {
+                signedTrailAmount = -trailDistance;
+            }
+            // --- FIX END ---
 
             const size = process.env.ORDER_SIZE || "1";
 
@@ -184,16 +193,16 @@ class MicroStrategy {
                 limit_price: entryPrice.toFixed(spec.precision),
                 
                 // --- SERVER-SIDE TRAILING STOP ---
-                // "bracket_trail_amount": The absolute distance (e.g., 0.05) from peak/trough.
+                // "bracket_trail_amount": The signed distance (e.g., -0.05 for buy, 0.05 for sell).
                 // The exchange engine automatically adjusts the stop price.
-                bracket_trail_amount: trailDistance.toFixed(spec.precision),
+                bracket_trail_amount: signedTrailAmount.toFixed(spec.precision),
                 bracket_stop_trigger_method: 'mark_price'
             };
 
             // E. Send Order
             await this.bot.placeOrder(payload);
 
-            this.logger.info(`[EXEC] ${symbol} ${side} @ ${entryPrice} | ServerTrail: ${trailDistance.toFixed(spec.precision)} (${this.TRAILING_PERCENT}%)`);
+            this.logger.info(`[EXEC] ${symbol} ${side} @ ${entryPrice} | ServerTrail: ${signedTrailAmount.toFixed(spec.precision)} (${this.TRAILING_PERCENT}%)`);
 
         } catch (e) {
             this.logger.error(`[EXEC_FAIL] ${e.message}`);
@@ -204,4 +213,3 @@ class MicroStrategy {
 }
 
 module.exports = MicroStrategy;
-            
