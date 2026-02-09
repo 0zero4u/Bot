@@ -1,6 +1,8 @@
 // trader.js
-// v72.5 - [PRODUCTION] Global Logger (v69 Logic) + Smart Loader
-// Fix: Reverted Logger to Global Scope to fix Client crash.
+// v72.6 - [PRODUCTION] Global Logger + Smart Loader + Client Fixes
+// Fixes: 
+// 1. Corrected DeltaClient instantiation arguments to prevent crash.
+// 2. Updated placeOrder to use client's native method.
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -34,8 +36,7 @@ const config = {
     heartbeatTimeoutMs: parseInt(process.env.HEARTBEAT_TIMEOUT_MS || '40000'),
 };
 
-// --- GLOBAL LOGGER (Matches v69 Logic) ---
-// Defined globally so it is ALWAYS available, never undefined.
+// --- GLOBAL LOGGER ---
 const logger = winston.createLogger({
     level: config.logLevel,
     format: winston.format.combine(
@@ -101,10 +102,14 @@ class TradingBot {
         // Use the Global Logger
         this.logger = logger; 
 
-        // Initialize API Client
-        // Passing the Global Logger ensures it is NOT undefined
+        // Initialize API Client - FIXED ARGS
         try {
-            this.client = new DeltaClient(config, logger); 
+            this.client = new DeltaClient(
+                config.apiKey, 
+                config.apiSecret, 
+                config.baseURL, 
+                logger
+            ); 
         } catch (err) {
             logger.error(`[FATAL] Client Init Failed: ${err.message}`);
             process.exit(1);
@@ -126,7 +131,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`Starting Delta Trader v72.5...`);
+        this.logger.info(`Starting Delta Trader v72.6...`);
         this.logger.info(`Strategy: ${this.config.strategy}`);
         
         this.setupInternalServer();
@@ -269,27 +274,17 @@ class TradingBot {
         this.isOrderInProgress = true;
 
         try {
-            const method = 'POST';
-            const path = '/v2/orders';
-            const body = JSON.stringify(orderData);
-            const timestamp = Math.floor(Date.now() / 1000).toString();
-            const signaturePayload = method + timestamp + path + body;
-            const signature = crypto.createHmac('sha256', this.config.apiSecret).update(signaturePayload).digest('hex');
-
-            const headers = {
-                'Content-Type': 'application/json',
-                'api-key': this.config.apiKey,
-                'signature': signature,
-                'timestamp': timestamp
-            };
-
-            const response = await this.client.post(path, orderData, headers);
+            // Updated to use Client's built-in method
+            const response = await this.client.placeOrder(orderData);
             
-            if (response && response.success) {
+            // Client.js returns the body object on success
+            if (response && response.result) {
                 this.logger.info(`[SUCCESS] Order ID: ${response.result.id}`);
+                
+                // Auto-release lock after short delay (safety net)
                 setTimeout(() => { 
                     if(this.isOrderInProgress) {
-                        this.logger.warn("Auto-releasing Order Lock (Timeout)");
+                        this.logger.warn("Auto-releasing Order Lock (Safety Timeout)");
                         this.isOrderInProgress = false; 
                     }
                 }, 5000);
@@ -300,8 +295,11 @@ class TradingBot {
             return response;
 
         } catch (error) {
-            this.logger.error(`[EXCEPTION] ${error.message}`);
+            // Log full error details
+            const errMsg = error.response ? JSON.stringify(error.response.body) : error.message;
+            this.logger.error(`[EXCEPTION] Order Failed: ${errMsg}`);
             this.isOrderInProgress = false;
+            return null;
         }
     }
 }
@@ -327,4 +325,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-            
+
