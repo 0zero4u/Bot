@@ -21,7 +21,7 @@ class MicroStrategy {
 
         // Signal Strength Threshold
         // 0.6 means Microprice has moved 60% across the spread toward the other side.
-        this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.8');
+        this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.65');
 
         // Liquidity Filter: Minimum TOTAL value on L1 (Bid + Ask) in USDT.
         // We sum them to allow for heavy imbalances (e.g., huge Buy wall, empty Sell side).
