@@ -1,10 +1,6 @@
 /**
  * market_listener.js
- * v3.1 [OPTIMIZED] - Lean Order Book & No Trades
- * * CHANGES:
- * 1. Removed Trade Stream (Bandwidth save).
- * 2. Added Map Pruning (Prevents sorting lag over time).
- */
+ *  */
 
 const WebSocket = require('ws');
 const winston = require('winston');
