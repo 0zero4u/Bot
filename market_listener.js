@@ -1,7 +1,7 @@
 /**
  * market_listener.js
- * v2.0 - Gate.io Incremental Sync Implementation
- * Rules: First update = Snapshot | Sequence (U/u) is Law | Gap = Resync
+ * v2.1 - Gate.io Incremental Sync [STABLE]
+ * Logic: First update = Snapshot | Sequence (U/u) is Law | Gap = Resync
  */
 
 const WebSocket = require('ws');
@@ -32,7 +32,7 @@ config.assets.forEach(asset => {
         bids: new Map(),
         asks: new Map(),
         lastUpdateId: 0,
-        state: 'INITIALIZING' // INITIALIZING -> LIVE
+        state: 'INITIALIZING' 
     });
 });
 
@@ -40,7 +40,7 @@ let botWs = null;
 
 function connectToInternal() {
     botWs = new WebSocket(config.internalReceiverUrl);
-    botWs.on('open', () => logger.info('✓ Connected to Trader Bot.'));
+    botWs.on('open', () => logger.info('✓ Connected to Trader Bot. Ready to forward data.'));
     botWs.on('close', () => setTimeout(connectToInternal, 2000));
     botWs.on('error', () => {});
 }
@@ -55,10 +55,11 @@ function connectGate() {
     const exchangeWs = new WebSocket(config.gateUrl);
 
     exchangeWs.on('open', () => {
-        logger.info('[Gate.io] Connected. Subscribing to Book and Trades...');
+        logger.info('[Gate.io] Connected. Subscribing...');
         
-        // Subscribe to Order Book Updates (Rule 1)
         const assetPairs = config.assets.map(a => `${a}_USDT`);
+        
+        // 1. Subscribe to Incremental Order Book
         exchangeWs.send(JSON.stringify({
             time: Math.floor(Date.now() / 1000),
             channel: "futures.order_book_update",
@@ -66,7 +67,7 @@ function connectGate() {
             payload: [...assetPairs, "20ms", "20"]
         }));
 
-        // Subscribe to Trades
+        // 2. Subscribe to Trades
         exchangeWs.send(JSON.stringify({
             time: Math.floor(Date.now() / 1000),
             channel: "futures.trades",
@@ -78,18 +79,24 @@ function connectGate() {
     exchangeWs.on('message', (raw) => {
         try {
             const msg = JSON.parse(raw);
-            if (!msg.result || msg.event === 'subscribe') return;
+            
+            // Filter non-data messages (heartbeats, sub-confirmations)
+            if (!msg.result || msg.event === 'subscribe' || msg.channel === 'futures.pong') return;
 
             const channel = msg.channel;
             const data = msg.result;
-            const symbol = (data.s || "").replace('_USDT', '');
 
-            // --- 1. HANDLE ORDER BOOK (INCREMENTAL) ---
+            // Safe Symbol Extraction
+            const rawSymbol = data.s || (Array.isArray(data) ? data[0].s : null);
+            if (!rawSymbol) return; 
+            const symbol = rawSymbol.replace('_USDT', '');
+
+            // --- 1. HANDLE ORDER BOOK (The "Law of Sequence") ---
             if (channel === 'futures.order_book_update') {
                 const book = orderBooks.get(symbol);
                 if (!book) return;
 
-                // RULE 2 & 4: First update = Snapshot OR Resync on Gap
+                // RULE: First update or Sequence Gap = Resync (Wipe and Start over)
                 if (book.state === 'INITIALIZING' || data.U !== book.lastUpdateId + 1) {
                     if (book.state === 'LIVE') {
                         logger.warn(`[Gate] Sequence Gap on ${symbol}! Expected ${book.lastUpdateId + 1}, got ${data.U}. Resyncing...`);
@@ -99,27 +106,23 @@ function connectGate() {
                     book.state = 'LIVE';
                 }
 
-                // RULE 3: Apply Updates (a = asks, b = bids)
-                if (data.a) {
+                // Apply Updates (Price is Key, Size 0 = Delete)
+                if (data.a && Array.isArray(data.a)) {
                     data.a.forEach(([p, s]) => {
-                        const price = p; // String price as key
-                        const size = parseFloat(s);
-                        if (size === 0) book.asks.delete(price);
-                        else book.asks.set(price, size);
+                        if (parseFloat(s) === 0) book.asks.delete(p);
+                        else book.asks.set(p, s);
                     });
                 }
-                if (data.b) {
+                if (data.b && Array.isArray(data.b)) {
                     data.b.forEach(([p, s]) => {
-                        const price = p;
-                        const size = parseFloat(s);
-                        if (size === 0) book.bids.delete(price);
-                        else book.bids.set(price, size);
+                        if (parseFloat(s) === 0) book.bids.delete(p);
+                        else book.bids.set(p, s);
                     });
                 }
 
                 book.lastUpdateId = data.u;
 
-                // Sort and Prepare Top 20 for Strategy
+                // Sort and Send Top 20 to Bot
                 const sortedBids = Array.from(book.bids.entries())
                     .sort((a, b) => parseFloat(b[0]) - parseFloat(a[0]))
                     .slice(0, 20);
@@ -127,20 +130,23 @@ function connectGate() {
                     .sort((a, b) => parseFloat(a[0]) - parseFloat(b[0]))
                     .slice(0, 20);
 
-                sendToBot({
-                    type: 'depthUpdate',
-                    s: symbol,
-                    bids: sortedBids,
-                    asks: sortedAsks,
-                    u: data.u,
-                    ts: Date.now()
-                });
+                if (sortedBids.length > 0 || sortedAsks.length > 0) {
+                    sendToBot({
+                        type: 'depthUpdate',
+                        s: symbol,
+                        bids: sortedBids,
+                        asks: sortedAsks,
+                        u: data.u,
+                        ts: Date.now()
+                    });
+                }
             }
 
             // --- 2. HANDLE TRADES ---
             else if (channel === 'futures.trades') {
                 const trades = Array.isArray(data) ? data : [data];
                 trades.forEach(t => {
+                    if (!t.s) return;
                     const asset = t.s.replace('_USDT', '');
                     sendToBot({
                         type: 'trade',
@@ -153,12 +159,12 @@ function connectGate() {
                 });
             }
         } catch (e) {
-            logger.error(`[Gate.io] Error: ${e.message}`);
+            logger.error(`[Gate.io] Handler Error: ${e.message}`);
         }
     });
 
     exchangeWs.on('close', () => {
-        logger.warn('[Gate.io] Disconnected. Resetting books and reconnecting...');
+        logger.warn('[Gate.io] Connection Closed. Reconnecting...');
         config.assets.forEach(asset => {
             const book = orderBooks.get(asset);
             book.state = 'INITIALIZING';
@@ -166,9 +172,11 @@ function connectGate() {
         });
         setTimeout(connectGate, config.reconnectInterval);
     });
+
+    exchangeWs.on('error', (e) => logger.error(`[Gate.io] WS Error: ${e.message}`));
 }
 
-// Start
+// Entry Point
 connectToInternal();
 connectGate();
-        
+                      
