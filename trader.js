@@ -1,5 +1,5 @@
 // trader.js
-// v63.0 - [INTEGRATION] MicroStrategy Payload Support (Native Ticker + Binance BookTicker)
+// v64.0 - [INTEGRATION] MicroStrategy with Binance Low-Latency Feed
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -10,7 +10,7 @@ const DeltaClient = require('./client.js');
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Micro', // Default to Micro
+    strategy: process.env.STRATEGY || 'Micro', 
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
@@ -86,7 +86,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v63.0 - Micro Payload Support) ---`);
+        this.logger.info(`--- Bot Initializing (v64.0 - Binance Feed Integrated) ---`);
         await this.syncPositionState();
         await this.initWebSocket();
         this.setupHttpServer();
@@ -153,8 +153,6 @@ class TradingBot {
             .update(signatureData)
             .digest('hex');
 
-        this.logger.info(`[Auth Debug] Timestamp: ${timestampStr}`);
-
         const payload = { 
             type: 'key-auth', 
             payload: { 
@@ -169,16 +167,14 @@ class TradingBot {
 
     subscribeToChannels() {
         const symbols = this.targetAssets.map(asset => `${asset}USD`);
-        this.logger.info(`Subscribing to Ticker & Trades: ${symbols.join(', ')}`);
+        this.logger.info(`Subscribing to Delta Execution Channels: ${symbols.join(', ')}`);
         
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
-            { name: 'all_trades', symbols: symbols },
-            
-            // [PAYLOAD SOURCE A] Native Delta Ticker
-            // This provides Bid/Ask data directly to MicroStrategy
-            { name: 'ticker', symbols: symbols }
+            { name: 'all_trades', symbols: symbols }
+            // Note: We removed Delta 'ticker' here because MicroStrategy 
+            // will rely on the faster Binance feed from handleSignalMessage
         ]}}));
     }
 
@@ -217,32 +213,9 @@ class TradingBot {
                 }
                 break;
             case 'all_trades':
-                const tradeAsset = this.targetAssets.find(a => message.symbol.startsWith(a));
-                if (tradeAsset && this.strategy.onTradeUpdate) {
-                    const dataPoints = message.data || (Array.isArray(message) ? message : [message]);
-                    if (Array.isArray(dataPoints)) {
-                        const lastTrade = dataPoints[dataPoints.length - 1];
-                        if (lastTrade && lastTrade.price) {
-                            this.strategy.onTradeUpdate(message.symbol, parseFloat(lastTrade.price));
-                        }
-                    } else if (message.price) {
-                        this.strategy.onTradeUpdate(message.symbol, parseFloat(message.price));
-                    }
-                }
-                break;
-                
-            // [PAYLOAD ADAPTER A] NATIVE DELTA TICKER
-            // Converts Delta "Ticker" format -> MicroStrategy "Depth" format
-            case 'ticker':
-                const tickerAsset = this.targetAssets.find(a => message.symbol.startsWith(a));
-                
-                // MicroStrategy needs { bids: [[p,v]], asks: [[p,v]] }
-                if (tickerAsset && this.strategy.onDepthUpdate && message.bid && message.ask) {
-                    const depthPayload = {
-                        bids: [[ message.bid, message.bid_size || '0' ]],
-                        asks: [[ message.ask, message.ask_size || '0' ]]
-                    };
-                    this.strategy.onDepthUpdate(tickerAsset, depthPayload);
+                // Optional: Pass trade execution data to strategy if needed
+                if (this.strategy.onTradeUpdate && message.price) {
+                     this.strategy.onTradeUpdate(message.symbol, parseFloat(message.price));
                 }
                 break;
         }
@@ -257,54 +230,45 @@ class TradingBot {
         }
     }
 
+    // --- CRITICAL: EXTERNAL FEED HANDLER (BINANCE) ---
     async handleSignalMessage(message) {
+        // Authenticated check is optional for localhost, but good for safety
         if (!this.authenticated) {
-             const now = Date.now();
-             if (!this._lastAuthWarn || now - this._lastAuthWarn > 10000) {
-                 this.logger.warn('⚠️ Signal received but Bot is NOT Authenticated yet.');
-                 this._lastAuthWarn = now;
-             }
+             // You can comment this out if you want the bot to "warm up" data before auth
              return;
         }
 
         try {
             const data = JSON.parse(message.toString());
             
-            // TYPE 'S': Standard Price Signal
-            if (data.type === 'S' && data.p) {
-                const asset = data.s || 'BTC'; 
-                const price = parseFloat(data.p);
-                const source = data.x || 'UNKNOWN';
-                if (this.targetAssets.includes(asset) && this.strategy.onPriceUpdate) {
-                    await this.strategy.onPriceUpdate(asset, price, source);
-                }
-            }
-            // TYPE 'D': Manual Depth Update
-            else if (data.type === 'D' && data.b && data.a) {
-                const asset = data.s || 'BTC';
-                const depth = { bids: data.b, asks: data.a };
-                if (this.targetAssets.includes(asset) && this.strategy.onDepthUpdate) {
-                    await this.strategy.onDepthUpdate(asset, depth);
-                }
-            }
-            // [PAYLOAD ADAPTER B] BINANCE BOOK TICKER
-            // Handled from market_listener.js (Type 'B')
-            else if (data.type === 'B') {
-                const asset = data.s; // e.g. 'BTC'
+            // [PAYLOAD ADAPTER] BINANCE LOW-LATENCY FEED
+            // Type 'B' comes from market_listener.js
+            if (data.type === 'B') {
+                const asset = data.s; // e.g., 'BTC'
                 
-                // Construct the payload MicroStrategy expects
-                // data.bb = Best Bid, data.bq = Bid Qty
-                // data.ba = Best Ask, data.aq = Ask Qty
+                // 1. FILTER: Only process assets we are trading
+                if (!this.targetAssets.includes(asset)) return;
+
+                // 2. CONSTRUCT PAYLOAD
+                // MicroStrategy expects: { bids: [[Price, Vol]], asks: [[Price, Vol]] }
                 const depthPayload = {
-                    bids: [[ data.bb, data.bq ]],
-                    asks: [[ data.ba, data.aq ]]
+                    bids: [[ data.bb, data.bq ]], // Best Bid Price, Best Bid Qty
+                    asks: [[ data.ba, data.aq ]]  // Best Ask Price, Best Ask Qty
                 };
 
-                if (this.targetAssets.includes(asset) && this.strategy.onDepthUpdate) {
+                // 3. INJECT INTO STRATEGY
+                if (this.strategy.onDepthUpdate) {
                     await this.strategy.onDepthUpdate(asset, depthPayload);
                 }
             }
             
+            // Legacy Signal Support (if you use other scanners)
+            else if (data.type === 'S' && data.p) {
+                 if (this.strategy.onPriceUpdate) {
+                     await this.strategy.onPriceUpdate(data.s, parseFloat(data.p), data.x);
+                 }
+            }
+
         } catch (error) {
             this.logger.error("Error handling signal message:", error);
         }
@@ -313,12 +277,12 @@ class TradingBot {
     setupHttpServer() {
         const httpServer = new WebSocket.Server({ port: this.config.port });
         httpServer.on('connection', ws => {
-            this.logger.info('Signal listener connected');
+            this.logger.info('External Data Feed Connected (Binance Listener)');
             ws.on('message', m => this.handleSignalMessage(m));
-            ws.on('close', () => this.logger.warn('Signal listener disconnected'));
+            ws.on('close', () => this.logger.warn('External Data Feed Disconnected'));
             ws.on('error', (err) => this.logger.error('Signal listener error:', err));
         });
-        this.logger.info(`Signal server started on port ${this.config.port}`);
+        this.logger.info(`Internal Data Server running on port ${this.config.port}`);
     }
     
     async placeOrder(orderData) {
@@ -366,4 +330,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-    
+        
