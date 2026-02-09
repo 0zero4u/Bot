@@ -16,7 +16,7 @@ require('dotenv').config();
 // --- CONFIGURATION ---
 const config = {
     // 0 = Binance, 1 = Gate.io
-    marketSource: process.env.MARKET_SOURCE || '0', 
+    marketSource: process.env.MARKET_SOURCE || '1', 
     
     // Connects to the trader.js websocket server
     internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
