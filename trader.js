@@ -1,5 +1,5 @@
 // trader.js
-// v62.1 - [INTEGRATION] Depth5 Support & Signal Routing
+// v63.0 - [INTEGRATION] MicroStrategy Payload Support (Native Ticker + Binance BookTicker)
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -10,7 +10,7 @@ const DeltaClient = require('./client.js');
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Advance', 
+    strategy: process.env.STRATEGY || 'Micro', // Default to Micro
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
@@ -24,7 +24,6 @@ const config = {
     reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
     pingIntervalMs: parseInt(process.env.PING_INTERVAL_MS || '30000'),
     heartbeatTimeoutMs: parseInt(process.env.HEARTBEAT_TIMEOUT_MS || '40000'),
-    priceAggressionOffset: parseFloat(process.env.PRICE_AGGRESSION_OFFSET || '0.01'),
 };
 
 // --- Logging Setup ---
@@ -68,7 +67,7 @@ class TradingBot {
         this.ws = null; this.authenticated = false;
         this.isOrderInProgress = false; 
         
-        this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
+        this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         this.logger.info(`Trading Targets (USDT): ${this.targetAssets.join(', ')}`);
 
         this.hasOpenPosition = false;
@@ -87,7 +86,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v62.1 - Depth Support) ---`);
+        this.logger.info(`--- Bot Initializing (v63.0 - Micro Payload Support) ---`);
         await this.syncPositionState();
         await this.initWebSocket();
         this.setupHttpServer();
@@ -170,12 +169,16 @@ class TradingBot {
 
     subscribeToChannels() {
         const symbols = this.targetAssets.map(asset => `${asset}USD`);
-        this.logger.info(`Subscribing to All Trades: ${symbols.join(', ')}`);
+        this.logger.info(`Subscribing to Ticker & Trades: ${symbols.join(', ')}`);
         
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
-            { name: 'all_trades', symbols: symbols }
+            { name: 'all_trades', symbols: symbols },
+            
+            // [PAYLOAD SOURCE A] Native Delta Ticker
+            // This provides Bid/Ask data directly to MicroStrategy
+            { name: 'ticker', symbols: symbols }
         ]}}));
     }
 
@@ -214,21 +217,32 @@ class TradingBot {
                 }
                 break;
             case 'all_trades':
-                const asset = this.targetAssets.find(a => message.symbol.startsWith(a));
-                if (asset) {
+                const tradeAsset = this.targetAssets.find(a => message.symbol.startsWith(a));
+                if (tradeAsset && this.strategy.onTradeUpdate) {
                     const dataPoints = message.data || (Array.isArray(message) ? message : [message]);
                     if (Array.isArray(dataPoints)) {
                         const lastTrade = dataPoints[dataPoints.length - 1];
                         if (lastTrade && lastTrade.price) {
-                             if (this.strategy.onTradeUpdate) {
-                                this.strategy.onTradeUpdate(message.symbol, parseFloat(lastTrade.price));
-                            }
+                            this.strategy.onTradeUpdate(message.symbol, parseFloat(lastTrade.price));
                         }
                     } else if (message.price) {
-                        if (this.strategy.onTradeUpdate) {
-                            this.strategy.onTradeUpdate(message.symbol, parseFloat(message.price));
-                        }
+                        this.strategy.onTradeUpdate(message.symbol, parseFloat(message.price));
                     }
+                }
+                break;
+                
+            // [PAYLOAD ADAPTER A] NATIVE DELTA TICKER
+            // Converts Delta "Ticker" format -> MicroStrategy "Depth" format
+            case 'ticker':
+                const tickerAsset = this.targetAssets.find(a => message.symbol.startsWith(a));
+                
+                // MicroStrategy needs { bids: [[p,v]], asks: [[p,v]] }
+                if (tickerAsset && this.strategy.onDepthUpdate && message.bid && message.ask) {
+                    const depthPayload = {
+                        bids: [[ message.bid, message.bid_size || '0' ]],
+                        asks: [[ message.ask, message.ask_size || '0' ]]
+                    };
+                    this.strategy.onDepthUpdate(tickerAsset, depthPayload);
                 }
                 break;
         }
@@ -256,27 +270,41 @@ class TradingBot {
         try {
             const data = JSON.parse(message.toString());
             
-            // TYPE 'S': Standard Price Signal (AdvanceStrategy)
+            // TYPE 'S': Standard Price Signal
             if (data.type === 'S' && data.p) {
                 const asset = data.s || 'BTC'; 
                 const price = parseFloat(data.p);
                 const source = data.x || 'UNKNOWN';
-                if (this.targetAssets.includes(asset)) {
-                    if (this.strategy.onPriceUpdate) {
-                        await this.strategy.onPriceUpdate(asset, price, source);
-                    }
+                if (this.targetAssets.includes(asset) && this.strategy.onPriceUpdate) {
+                    await this.strategy.onPriceUpdate(asset, price, source);
                 }
             }
-            // TYPE 'D': Depth Update (FastStrategy)
+            // TYPE 'D': Manual Depth Update
             else if (data.type === 'D' && data.b && data.a) {
                 const asset = data.s || 'BTC';
                 const depth = { bids: data.b, asks: data.a };
-                if (this.targetAssets.includes(asset)) {
-                    if (this.strategy.onDepthUpdate) {
-                        await this.strategy.onDepthUpdate(asset, depth);
-                    }
+                if (this.targetAssets.includes(asset) && this.strategy.onDepthUpdate) {
+                    await this.strategy.onDepthUpdate(asset, depth);
                 }
             }
+            // [PAYLOAD ADAPTER B] BINANCE BOOK TICKER
+            // Handled from market_listener.js (Type 'B')
+            else if (data.type === 'B') {
+                const asset = data.s; // e.g. 'BTC'
+                
+                // Construct the payload MicroStrategy expects
+                // data.bb = Best Bid, data.bq = Bid Qty
+                // data.ba = Best Ask, data.aq = Ask Qty
+                const depthPayload = {
+                    bids: [[ data.bb, data.bq ]],
+                    asks: [[ data.ba, data.aq ]]
+                };
+
+                if (this.targetAssets.includes(asset) && this.strategy.onDepthUpdate) {
+                    await this.strategy.onDepthUpdate(asset, depthPayload);
+                }
+            }
+            
         } catch (error) {
             this.logger.error("Error handling signal message:", error);
         }
@@ -338,4 +366,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-            
+    
