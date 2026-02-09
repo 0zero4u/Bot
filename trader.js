@@ -1,13 +1,11 @@
-// trader.js
-// v72.7 - [FIXED] WebSocket Heartbeat & Connection Stability
-// Fixes: 
-// 1. Implemented "enable_heartbeat" to receive server-side keep-alives.
-// 2. Removed raw pings that failed to trigger message handlers.
-// 3. Updated connection logic to prevent 40s timeouts.
+/**
+ * trader.js
+ * v72.8 - [PRODUCTION] Position State Management
+ * Fixes: Tracks open positions to prevent 'bracket_order_position_exists' errors.
+ */
 
 const WebSocket = require('ws');
 const winston = require('winston');
-const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
@@ -33,7 +31,6 @@ const config = {
     leverage: process.env.DELTA_LEVERAGE || '50',
     logLevel: process.env.LOG_LEVEL || 'info',
     reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
-    pingIntervalMs: parseInt(process.env.PING_INTERVAL_MS || '30000'),
     heartbeatTimeoutMs: parseInt(process.env.HEARTBEAT_TIMEOUT_MS || '40000'),
 };
 
@@ -59,30 +56,16 @@ function loadStrategy(strategyName) {
     const candidates = [
         `./${strategyName}.js`,
         `../strategies/${strategyName}.js`,
-        `./strategies/${strategyName}.js`,
-        `./${strategyName}Strategy.js`,
-        `../strategies/${strategyName}Strategy.js`
+        `./strategies/${strategyName}.js`
     ];
-
     for (const relativePath of candidates) {
         try {
             const absolutePath = path.resolve(__dirname, relativePath);
             if (fs.existsSync(absolutePath)) {
                 logger.info(`[Loader] Found strategy at: ${absolutePath}`);
-                const loadedModule = require(absolutePath);
-                
-                // Handle different export styles
-                if (typeof loadedModule === 'function') return loadedModule;
-                if (loadedModule[strategyName]) return loadedModule[strategyName];
-                if (loadedModule.default) return loadedModule.default;
-                
-                // Guess first export
-                const keys = Object.keys(loadedModule);
-                if (keys.length > 0 && typeof loadedModule[keys[0]] === 'function') {
-                    return loadedModule[keys[0]];
-                }
+                return require(absolutePath);
             }
-        } catch (e) { /* continue */ }
+        } catch (e) {}
     }
     throw new Error(`Could not find '${strategyName}' in any standard directory.`);
 }
@@ -99,24 +82,18 @@ class TradingBot {
     constructor(config) {
         this.config = config;
         this.isOrderInProgress = false;
-        
-        // Use the Global Logger
         this.logger = logger; 
+        
+        // [FIX] Store Positions Memory
+        this.positions = {}; 
 
-        // Initialize API Client
         try {
-            this.client = new DeltaClient(
-                config.apiKey, 
-                config.apiSecret, 
-                config.baseURL, 
-                logger
-            ); 
+            this.client = new DeltaClient(config.apiKey, config.apiSecret, config.baseURL, logger); 
         } catch (err) {
             logger.error(`[FATAL] Client Init Failed: ${err.message}`);
             process.exit(1);
         }
 
-        // Initialize Strategy
         try {
             this.strategy = new StrategyClass(this);
         } catch (err) {
@@ -124,31 +101,35 @@ class TradingBot {
             process.exit(1);
         }
 
-        // WebSocket State
         this.internalWsServer = null; 
         this.deltaWs = null;          
-        this.pingInterval = null;
         this.heartbeatTimeout = null;
     }
 
     async start() {
-        this.logger.info(`Starting Delta Trader v72.7...`);
-        this.logger.info(`Strategy: ${this.config.strategy}`);
-        
+        this.logger.info(`Starting Delta Trader v72.8...`);
         this.setupInternalServer();
         this.connectDeltaWebSocket();
     }
 
-    // --- 1. Internal Server (Data Ingestion) ---
+    // [FIX] Helper for Strategy to check Position
+    // Returns the size (e.g., 100 or -100). Returns 0 if no position.
+    getPosition(symbol) {
+        return this.positions[symbol] || 0.0;
+    }
+    
+    // [FIX] Helper to check if ANY position exists for specific symbol
+    hasOpenPosition(symbol) {
+        const size = this.positions[symbol];
+        return size && parseFloat(size) !== 0;
+    }
+
     setupInternalServer() {
         this.internalWsServer = new WebSocket.Server({ port: this.config.port });
-
         this.internalWsServer.on('connection', (ws) => {
             this.logger.info(`Market Listener connected on port ${this.config.port}`);
-
             ws.on('message', async (message) => {
                 if (this.isOrderInProgress) return; 
-
                 try {
                     const data = JSON.parse(message);
                     if (this.strategy && typeof this.strategy.execute === 'function') {
@@ -158,55 +139,26 @@ class TradingBot {
                     this.logger.error(`Strategy Execution Error: ${e.message}`);
                 }
             });
-
-            ws.on('error', (err) => {
-                this.logger.error(`Internal WS Connection Error: ${err.message}`);
-            });
-        });
-
-        this.internalWsServer.on('error', (err) => {
-            this.logger.error(`Internal Server Error (Port ${this.config.port}): ${err.message}`);
-            if (err.code === 'EADDRINUSE') {
-                this.logger.error(`Port ${this.config.port} is already in use. Exiting.`);
-                process.exit(1);
-            }
         });
     }
 
-    // --- 2. Delta WebSocket (Execution Updates) ---
     connectDeltaWebSocket() {
         this.deltaWs = new WebSocket(this.config.wsURL);
 
         this.deltaWs.on('open', () => {
             this.logger.info('Connected to Delta Exchange WebSocket.');
-            
-            // [FIX] Enable Heartbeat immediately upon connection
-            // This is required for the server to send periodic updates
+            // Enable server-side heartbeats
             this.sendToDelta({ type: "enable_heartbeat" });
-
             this.startHeartbeat();
             this.subscribeDeltaChannels();
         });
 
         this.deltaWs.on('message', (data) => {
-            // [FIX] Reset the watchdog timer on ANY message (including heartbeats)
             this.heartbeat(); 
-            
             try {
                 const msg = JSON.parse(data);
-                
-                // Handle Heartbeat specifically (optional logging)
-                if (msg.type === 'heartbeat') {
-                    // Timer is already reset above. 
-                    // We can log this on debug level if needed, but usually we stay silent.
-                    return;
-                }
-
-                if (msg.type === 'orders') {
-                    this.handleOrderUpdate(msg);
-                } else if (msg.type === 'positions') {
-                    this.handlePositionUpdate(msg);
-                }
+                if (msg.type === 'orders') this.handleOrderUpdate(msg);
+                else if (msg.type === 'positions') this.handlePositionUpdate(msg);
             } catch (e) {}
         });
 
@@ -222,7 +174,7 @@ class TradingBot {
     }
 
     subscribeDeltaChannels() {
-        const payload = {
+        this.sendToDelta({
             type: 'subscribe',
             payload: {
                 channels: [
@@ -230,25 +182,33 @@ class TradingBot {
                     { name: 'positions', symbols: ['all'] }
                 ]
             }
-        };
-        this.sendToDelta(payload);
+        });
     }
 
     handleOrderUpdate(msg) {
         if(msg.data) {
-             this.logger.info(`[ORDER UPDATE] ${msg.data.status} | ID: ${msg.data.id} | ${msg.data.side} ${msg.data.size}`);
+             this.logger.info(`[ORDER] ${msg.data.status} | ${msg.data.side} ${msg.data.size}`);
              if (['filled', 'cancelled', 'closed'].includes(msg.data.status)) {
                  if (this.isOrderInProgress) {
-                     this.logger.info("Order finalized. Releasing Lock.");
                      this.isOrderInProgress = false;
                  }
              }
         }
     }
 
+    // [FIX] Actually store the position size
     handlePositionUpdate(msg) {
         if(msg.data) {
-            this.logger.info(`[POSITION UPDATE] ${msg.data.product_symbol} | Size: ${msg.data.size}`);
+            const sym = msg.data.product_symbol;
+            const size = parseFloat(msg.data.size);
+            
+            // Only log if size actually changes
+            if (this.positions[sym] !== size) {
+                this.positions[sym] = size;
+                this.logger.info(`[POS UPDATE] ${sym} | Size: ${size}`);
+            } else {
+                this.positions[sym] = size;
+            }
         }
     }
 
@@ -260,56 +220,39 @@ class TradingBot {
 
     startHeartbeat() {
         this.stopHeartbeat();
-        
-        // [FIX] Removed client-side ping interval. 
-        // We now rely on the server sending us 'heartbeat' messages every 30s.
-        // We just set a "Watchdog" timer. If we don't hear ANYTHING for 40s (buffer), we reconnect.
-        
         this.heartbeat(); 
     }
 
     stopHeartbeat() {
-        if (this.pingInterval) clearInterval(this.pingInterval);
         if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
     }
 
     heartbeat() {
         if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
-        
-        // If this timer fires, it means the server hasn't spoken to us (no heartbeat, no order update)
-        // for the duration of heartbeatTimeoutMs (40s).
         this.heartbeatTimeout = setTimeout(() => {
-            this.logger.warn("Heartbeat Timeout (No data from server). Terminating connection...");
+            this.logger.warn("Heartbeat Timeout (No Data). Reconnecting...");
             if (this.deltaWs) this.deltaWs.terminate();
         }, this.config.heartbeatTimeoutMs);
     }
 
     async placeOrder(orderData) {
         if (this.isOrderInProgress) {
-            this.logger.warn("Order blocked: Internal Lock is active.");
+            this.logger.warn("Order Blocked: Internal Lock Active.");
             return null;
         }
-
         this.isOrderInProgress = true;
 
         try {
             const response = await this.client.placeOrder(orderData);
-            
             if (response && response.result) {
                 this.logger.info(`[SUCCESS] Order ID: ${response.result.id}`);
-                
-                setTimeout(() => { 
-                    if(this.isOrderInProgress) {
-                        this.logger.warn("Auto-releasing Order Lock (Safety Timeout)");
-                        this.isOrderInProgress = false; 
-                    }
-                }, 5000);
+                // Safety release if socket update misses
+                setTimeout(() => { if(this.isOrderInProgress) this.isOrderInProgress = false; }, 5000);
             } else {
                 this.logger.error(`[FAIL] ${JSON.stringify(response)}`);
                 this.isOrderInProgress = false; 
             }
             return response;
-
         } catch (error) {
             const errMsg = error.response ? JSON.stringify(error.response.body) : error.message;
             this.logger.error(`[EXCEPTION] Order Failed: ${errMsg}`);
@@ -319,25 +262,14 @@ class TradingBot {
     }
 }
 
-// --- STARTUP LOGIC ---
+// Start
 (async () => {
     try {
         const bot = new TradingBot(config);
         await bot.start();
-        
-        process.on('uncaughtException', async (err) => {
-            logger.error(`Uncaught Exception: ${err.message}`);
-            console.error(err); 
-        });
-        
-        process.on('unhandledRejection', (reason, p) => {
-            logger.error(`Unhandled Rejection: ${reason}`);
-        });
-
     } catch (error) {
         logger.error(`Failed to start bot: ${error.message}`);
-        console.error(error); 
         process.exit(1);
     }
 })();
-        
+                                           
