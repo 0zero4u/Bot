@@ -2,14 +2,13 @@
  * MicroStrategy.js
  *
  * Strategy: Volume-Weighted Microprice (VWM)
- * with Directional Velocity Gating & Dynamic Trailing Stop.
- *
- * CORE LOGIC:
+ * with Directional Velocity Gating & Server-Side Trailing Stop.
+ * * CORE LOGIC:
  * 1. Normalized Liquidity: Filters out "dust" (requires ~$2000 USDT on L1).
  * 2. Velocity Gate: Requires price to move > 0.02% in ~30ms to wake up.
  * 3. Microprice Imbalance: Calculates weighted pressure of the order book.
  * 4. Directional Confluence: Trades ONLY if Microprice & Velocity agree.
- * 5. Execution: Limit IOC with a Dynamic 10-Tick Trailing Stop.
+ * 5. Execution: Limit IOC with a Server-Side Percentage Trailing Stop.
  */
 
 class MicroStrategy {
@@ -20,25 +19,30 @@ class MicroStrategy {
         // --- CONFIGURATION ---
 
         // Signal Strength Threshold
-        // 0.6 means Microprice has moved 60% across the spread toward the other side.
-        this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.65');
+        // 0.65 means Microprice has moved 65% across the spread toward the other side.
+        this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.75');
 
         // Liquidity Filter: Minimum TOTAL value on L1 (Bid + Ask) in USDT.
         // We sum them to allow for heavy imbalances (e.g., huge Buy wall, empty Sell side).
-        // Default: $2000 USDT visible on L1 required to trade.
         this.MIN_NOTIONAL_VALUE = parseFloat(process.env.MIN_NOTIONAL || '2000');
+
+        // Trailing Stop Configuration (Percentage Based)
+        // 0.005% = The price only needs to dip 0.005% from its peak to trigger the exit.
+        // This is calculated dynamically based on Entry Price at the moment of the trade.
+        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.01');
 
         this.COOLDOWN_MS = 2000;
 
         // --- VELOCITY GATE CONFIG ---
-        this.SPIKE_PERCENT = 0.0003;   // 0.02% Price Move required
+        // Prevents trading in chopping/stagnant markets.
+        this.SPIKE_PERCENT = 0.0003;   // 0.03% Price Move required
         this.SPIKE_WINDOW_MS = 30;     // 30ms Time Window
 
         this.assets = {};
 
         // Asset Specs (Delta Exchange Standard)
-        // Precision: Decimal places for price.
-        // DeltaId: Product ID for order placement.
+        // precision: Decimals for price
+        // deltaId: Product ID for API
         this.specs = {
             'BTC': { deltaId: 27,    precision: 1, lot: 0.001 },
             'ETH': { deltaId: 299,   precision: 2, lot: 0.01 },
@@ -51,137 +55,90 @@ class MicroStrategy {
             this.assets[symbol] = {
                 lastTriggerTime: 0,
                 lastLogTime: 0,
-                /**
-                 * Rolling tick buffer for Velocity calculation.
-                 * Stores: { price: Number, time: Number }
-                 */
-                priceHistory: []
+                priceHistory: [] // Buffer for velocity calculation
             };
         });
     }
 
     getName() {
-        return "MicroStrategy (VWM + Velocity + 10-Tick Trail)";
+        return `MicroStrategy (VWM + Vel + ${this.TRAILING_PERCENT}% Server-Trail)`;
     }
 
     /**
-     * Main Tick Handler
-     * Expects depth payload: { bids: [[price, vol]], asks: [[price, vol]] }
+     * Main Signal Loop
+     * Runs on every Order Book update (approx 5-20ms).
      */
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
         if (!asset) return;
-
-        // 1. Data Integrity Check
+        
+        // Safety: Ensure book has data
         if (!depth.bids[0] || !depth.asks[0]) return;
 
         const now = Date.now();
-        const Pb = parseFloat(depth.bids[0][0]); // Bid Price
-        const Vb = parseFloat(depth.bids[0][1]); // Bid Vol
-        const Pa = parseFloat(depth.asks[0][0]); // Ask Price
-        const Va = parseFloat(depth.asks[0][1]); // Ask Vol
+        
+        // Parse L1 Data
+        const Pb = parseFloat(depth.bids[0][0]); // Best Bid Price
+        const Vb = parseFloat(depth.bids[0][1]); // Best Bid Volume
+        const Pa = parseFloat(depth.asks[0][0]); // Best Ask Price
+        const Va = parseFloat(depth.asks[0][1]); // Best Ask Volume
 
         const midPrice = (Pa + Pb) / 2;
-
-        // ============================================================
-        // STEP 1: NORMALIZED LIQUIDITY CHECK (USDT)
-        // ============================================================
-
-        // Calculate Total Value on L1 (Price * Volume)
         const totalNotional = (Vb * Pb) + (Va * Pa);
 
-        // If total liquidity is too low (dust/spoofing), ignore.
-        if (totalNotional < this.MIN_NOTIONAL_VALUE) {
-            return;
-        }
+        // 1. Liquidity Filter
+        if (totalNotional < this.MIN_NOTIONAL_VALUE) return;
 
-        // ============================================================
-        // STEP 2: SMART VELOCITY BUFFER
-        // ============================================================
-
+        // 2. Velocity Buffer Management
         asset.priceHistory.push({ price: midPrice, time: now });
-
-        // Prune history:
-        // Remove ticks older than Window (30ms) + Buffer (200ms).
-        // CRITICAL: We ensure we keep at least 2 ticks (length > 2).
-        // This prevents the buffer from emptying on slow data feeds/stale markets.
+        // Keep only recent ticks within window + buffer
         while (asset.priceHistory.length > 2 &&
                (now - asset.priceHistory[0].time > this.SPIKE_WINDOW_MS + 200)) {
             asset.priceHistory.shift();
         }
 
-        // Baseline Selection:
-        // We use the oldest available tick in our buffer to compare against.
-        // Even if the feed is slow (e.g. last tick was 100ms ago), we use it as the baseline.
         const baselineTick = asset.priceHistory[0];
-
-        // Calculate Velocity (Percentage Change)
-        // Formula: (Current - Old) / Old
         const signedChange = (midPrice - baselineTick.price) / baselineTick.price;
         const absChange = Math.abs(signedChange);
 
-        // ============================================================
-        // STEP 3: VELOCITY GATE (The Filter)
-        // ============================================================
+        // 3. Velocity Gate Check
+        if (absChange < this.SPIKE_PERCENT) return;
 
-        // If price hasn't moved 0.02%, stop immediately.
-        // This saves CPU and filters out "creeping" trends.
-        if (absChange < this.SPIKE_PERCENT) {
-            return;
-        }
-
-        // Determine Direction of Movement
         const isVelocityUp = signedChange > 0;
         const isVelocityDown = signedChange < 0;
 
-        // ============================================================
-        // STEP 4: MICROPRICE CALCULATION
-        // ============================================================
-
-        // Formula: Volume-Weighted Microprice
+        // 4. Microprice Calculation
+        // VWM = (BidVol * AskPx + AskVol * BidPx) / (BidVol + AskVol)
         const microPrice = ((Vb * Pa) + (Va * Pb)) / (Vb + Va);
-
         const halfSpread = (Pa - Pb) / 2;
-        if (halfSpread <= 1e-8) return; // Prevent div/0
+        
+        // Avoid division by zero in tight spreads
+        if (halfSpread <= 1e-8) return; 
 
-        // Signal Strength: Normalized deviation from Midprice
-        // Range: -1.0 (Bid Pressure) to +1.0 (Ask Pressure)
+        // Signal Strength = (Microprice - Midprice) / HalfSpread
+        // Range: -1.0 to 1.0 (approximated)
         const signalStrength = (microPrice - midPrice) / halfSpread;
-
-        // ============================================================
-        // STEP 5: CONFLUENCE CHECK & TRIGGER
-        // ============================================================
 
         let side = null;
 
-        // BUY SIGNAL:
-        // 1. Microprice Imbalance > 0.6 (Strong Bid Support pushing up)
-        // 2. Velocity is UP (Price actually moving Up)
+        // 5. Confluence Check (Signal + Velocity Direction)
         if (signalStrength > this.TRIGGER_THRESHOLD && isVelocityUp) {
             side = 'buy';
-        }
-        // SELL SIGNAL:
-        // 1. Microprice Imbalance < -0.6 (Strong Ask Resistance pushing down)
-        // 2. Velocity is DOWN (Price actually moving Down)
-        else if (signalStrength < -this.TRIGGER_THRESHOLD && isVelocityDown) {
+        } else if (signalStrength < -this.TRIGGER_THRESHOLD && isVelocityDown) {
             side = 'sell';
         }
 
-        // Logging (Heartbeat) - Only logs if we pass the velocity gate
+        // Heartbeat Logging (every 5s)
         if (now - asset.lastLogTime > 5000) {
-            this.logger.info(`[MICRO] ${symbol} | Vel:${(signedChange*100).toFixed(4)}% | Sig:${signalStrength.toFixed(2)} | Val:$${totalNotional.toFixed(0)}`);
+            this.logger.info(`[MICRO] ${symbol} | Vel:${(signedChange*100).toFixed(4)}% | Sig:${signalStrength.toFixed(2)}`);
             asset.lastLogTime = now;
         }
 
-        // Execute Logic
-        // We check:
-        // 1. Valid Side
-        // 2. No open position FOR THIS SPECIFIC ASSET
-        // 3. No order currently being placed
+        // 6. Trigger Logic
         if (side && !this.bot.hasOpenPosition(symbol) && !this.bot.isOrderInProgress) {
-            
+            // Cooldown Check
             if (now - asset.lastTriggerTime < this.COOLDOWN_MS) return;
-
+            
             this.logger.info(`[TRIGGER] ${symbol} ${side.toUpperCase()} | Vel:${(signedChange*100).toFixed(4)}% | Sig:${signalStrength.toFixed(3)}`);
             asset.lastTriggerTime = now;
 
@@ -189,42 +146,54 @@ class MicroStrategy {
         }
     }
 
+    /**
+     * Execution Logic
+     * Places an IOC Limit Order with a Server-Side Trailing Stop.
+     */
     async executeTrade(symbol, side, bestAsk, bestBid) {
         this.bot.isOrderInProgress = true;
         try {
             const spec = this.specs[symbol];
 
-            // 1. Determine Entry Price (Aggressive IOC)
-            // Buy = Ask Price | Sell = Bid Price
+            // A. Determine Entry Price
+            // Aggressive IOC: Buy at Ask, Sell at Bid to ensure fill on velocity spike
             const entryPrice = side === 'buy' ? bestAsk : bestBid;
 
-            // 2. Calculate Dynamic 10-Tick Trail
-            // BTC (Prec:1) -> Tick 0.1 -> Trail 1.0
-            // XRP (Prec:4) -> Tick 0.0001 -> Trail 0.0010
-            const tickSize = 1 / Math.pow(10, spec.precision);
-            let trailAmount = 10 * tickSize;
+            // B. Calculate Trailing Amount (Distance)
+            // Formula: EntryPrice * (Percent / 100)
+            let trailDistance = entryPrice * (this.TRAILING_PERCENT / 100);
 
-            // 3. Apply Directional Sign
-            // Buy: Stop is BELOW price (Negative)
-            // Sell: Stop is ABOVE price (Positive)
-            if (side === 'buy') {
-                trailAmount = -trailAmount;
+            // C. Minimum Tick Safety
+            // Ensure the trail distance is at least 1 tick, otherwise API rejects it.
+            const tickSize = 1 / Math.pow(10, spec.precision);
+            if (trailDistance < tickSize) {
+                trailDistance = tickSize;
             }
 
-            await this.bot.placeOrder({
+            const size = process.env.ORDER_SIZE || "1";
+
+            // D. Construct Payload
+            // Using 'bracket_trail_amount' delegates management to the exchange.
+            // We DO NOT send 'bracket_stop_loss_price'.
+            const payload = {
                 product_id: spec.deltaId.toString(),
-                size: process.env.ORDER_SIZE || "1",
+                size: size,
                 side: side,
                 order_type: 'limit_order',
-                time_in_force: 'ioc',
+                time_in_force: 'ioc', // Immediate or Cancel
                 limit_price: entryPrice.toFixed(spec.precision),
-
-                // --- 10-TICK TRAILING STOP ---
-                // This activates immediately. If price moves in favor, it trails.
-                // If price moves against by 10 ticks, it exits.
-                bracket_trail_amount: trailAmount.toFixed(spec.precision),
+                
+                // --- SERVER-SIDE TRAILING STOP ---
+                // "bracket_trail_amount": The absolute distance (e.g., 0.05) from peak/trough.
+                // The exchange engine automatically adjusts the stop price.
+                bracket_trail_amount: trailDistance.toFixed(spec.precision),
                 bracket_stop_trigger_method: 'mark_price'
-            });
+            };
+
+            // E. Send Order
+            await this.bot.placeOrder(payload);
+
+            this.logger.info(`[EXEC] ${symbol} ${side} @ ${entryPrice} | ServerTrail: ${trailDistance.toFixed(spec.precision)} (${this.TRAILING_PERCENT}%)`);
 
         } catch (e) {
             this.logger.error(`[EXEC_FAIL] ${e.message}`);
@@ -235,4 +204,4 @@ class MicroStrategy {
 }
 
 module.exports = MicroStrategy;
-        
+            
