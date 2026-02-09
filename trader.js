@@ -1,6 +1,6 @@
 // trader.js
-// v72.3 - [PRODUCTION] Smart Path Resolution + Smart Naming + Delta Connection
-// Changes: Auto-finds strategy in '../strategies/' or './strategies/' or './'
+// v72.4 - [PRODUCTION] Smart Import Fix + Constructor Checkpoints
+// Changes: Handles named exports vs default exports automatically.
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -9,6 +9,11 @@ const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
 
+// Check for client.js existence
+if (!fs.existsSync('./client.js')) {
+    console.error("[FATAL] 'client.js' not found in the same directory as trader.js");
+    process.exit(1);
+}
 const DeltaClient = require('./client.js');
 
 // --- Configuration ---
@@ -33,25 +38,42 @@ const config = {
 let StrategyClass;
 
 function loadStrategy(strategyName) {
-    // Possible paths to check (Relative to this file)
     const candidates = [
-        `./${strategyName}.js`,                       // 1. Same folder (Bot/TickStrategy.js)
-        `../strategies/${strategyName}.js`,           // 2. Parent sibling (strategies/TickStrategy.js)
-        `./strategies/${strategyName}.js`,            // 3. Child folder (Bot/strategies/TickStrategy.js)
-        `./${strategyName}Strategy.js`,               // 4. Name variant (Bot/Tick.js -> TickStrategy.js)
-        `../strategies/${strategyName}Strategy.js`    // 5. Parent variant
+        `./${strategyName}.js`,
+        `../strategies/${strategyName}.js`,
+        `./strategies/${strategyName}.js`,
+        `./${strategyName}Strategy.js`,
+        `../strategies/${strategyName}Strategy.js`
     ];
 
     for (const relativePath of candidates) {
         try {
-            // Resolve absolute path to be sure
             const absolutePath = path.resolve(__dirname, relativePath);
             if (fs.existsSync(absolutePath)) {
-                console.log(`[Loader] Found strategy at: ${absolutePath}`);
-                return require(absolutePath);
+                console.log(`[Loader] Found strategy file at: ${absolutePath}`);
+                const loadedModule = require(absolutePath);
+                
+                // --- SMART IMPORT FIX ---
+                // If the module is { TickStrategy: [Class] }, extract it.
+                // If the module is [Class], use it directly.
+                if (typeof loadedModule === 'function') {
+                    return loadedModule;
+                } else if (loadedModule[strategyName]) {
+                    return loadedModule[strategyName];
+                } else if (loadedModule.default) {
+                    return loadedModule.default;
+                } else {
+                    // Try to find ANY class in the export
+                    const keys = Object.keys(loadedModule);
+                    if (keys.length > 0 && typeof loadedModule[keys[0]] === 'function') {
+                        console.log(`[Loader] Guessing strategy class is '${keys[0]}'`);
+                        return loadedModule[keys[0]];
+                    }
+                }
+                throw new Error(`File found but could not identify a Class export.`);
             }
         } catch (e) {
-            // Continue checking
+            // Ignore and continue searching
         }
     }
     throw new Error(`Could not find '${strategyName}' in any standard directory.`);
@@ -60,18 +82,15 @@ function loadStrategy(strategyName) {
 try {
     StrategyClass = loadStrategy(config.strategy);
 } catch (e) {
-    console.error(`\n[FATAL] STRATEGY NOT FOUND`);
-    console.error(`Searched for '${config.strategy}' in:`);
-    console.error(`- ./`);
-    console.error(`- ../strategies/`);
-    console.error(`- ./strategies/`);
-    console.error(`\nPlease check your folder structure or .env STRATEGY name.\n`);
+    console.error(`\n[FATAL] STRATEGY LOAD ERROR`);
+    console.error(e.message);
     process.exit(1);
 }
 
 // --- Main Trading Bot Class ---
 class TradingBot {
     constructor(config) {
+        console.log("[Init] Initializing TradingBot..."); // Checkpoint 1
         this.config = config;
         this.isOrderInProgress = false;
         
@@ -92,10 +111,25 @@ class TradingBot {
         });
 
         // Initialize API Client
-        this.client = new DeltaClient(config, this.logger);
+        console.log("[Init] Loading DeltaClient..."); // Checkpoint 2
+        try {
+            this.client = new DeltaClient(config, this.logger);
+        } catch (err) {
+            console.error("[FATAL] Failed to initialize DeltaClient:", err.message);
+            throw err;
+        }
 
         // Initialize Strategy
-        this.strategy = new StrategyClass(this);
+        console.log("[Init] Loading Strategy Instance..."); // Checkpoint 3
+        try {
+            this.strategy = new StrategyClass(this);
+        } catch (err) {
+            console.error("[FATAL] Failed to initialize Strategy:", err.message);
+            console.error("Make sure your Strategy class constructor does not crash.");
+            throw err;
+        }
+        
+        console.log("[Init] Bot Ready."); // Checkpoint 4
 
         // WebSocket State
         this.internalWsServer = null; 
@@ -105,10 +139,9 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`Starting Delta Trader v72.3...`);
+        this.logger.info(`Starting Delta Trader v72.4...`);
         this.logger.info(`Strategy Active: ${this.config.strategy}`);
-        this.logger.info(`Product: ${this.config.productSymbol} (ID: ${this.config.productId})`);
-
+        
         this.setupInternalServer();
         this.connectDeltaWebSocket();
     }
@@ -313,4 +346,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-    
+                
