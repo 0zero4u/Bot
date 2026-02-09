@@ -1,13 +1,17 @@
 /**
  * market_listener.js
- * v2.3 - [FIXED] Gate.io Object Format Support
- * Fixes: correctly parses {p: price, s: size} objects from Gate.io
+ * v3.0 [FINAL PRODUCTION] - Robust Gate.io Futures Sync
+ * * CRITICAL FIXES:
+ * 1. Order Book: Handles {p, s} Objects (prevents crash).
+ * 2. Trades: Maps 'contract'/'price' correctly (fixes Z=0).
+ * 3. Sequence: Auto-Resyncs on gap detection.
  */
 
 const WebSocket = require('ws');
 const winston = require('winston');
 require('dotenv').config();
 
+// --- CONFIGURATION ---
 const config = {
     marketSource: process.env.MARKET_SOURCE || '1', 
     internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
@@ -16,6 +20,7 @@ const config = {
     reconnectInterval: 5000
 };
 
+// --- LOGGER ---
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
@@ -25,7 +30,7 @@ const logger = winston.createLogger({
     transports: [new winston.transports.Console()]
 });
 
-// --- LOCAL BOOK STORAGE ---
+// --- LOCAL STATE ---
 const orderBooks = new Map();
 config.assets.forEach(asset => {
     orderBooks.set(asset, {
@@ -39,6 +44,7 @@ config.assets.forEach(asset => {
 let botWs = null;
 let exchangeWs = null;
 
+// --- 1. INTERNAL BOT CONNECTION ---
 function connectToInternal() {
     botWs = new WebSocket(config.internalReceiverUrl);
     botWs.on('open', () => logger.info('✓ Connected to Trader Bot. Ready to forward data.'));
@@ -52,16 +58,16 @@ function sendToBot(payload) {
     }
 }
 
-// --- RESYNC LOGIC ---
+// --- 2. GATE.IO RESYNC LOGIC ---
 function triggerResync(symbol) {
     if (!exchangeWs || exchangeWs.readyState !== WebSocket.OPEN) return;
     
     const pair = `${symbol}_USDT`;
-    logger.warn(`[Gate] Triggering Resync for ${symbol} (Unsub/Sub)...`);
+    logger.warn(`[Gate] Sequence Gap Detected for ${symbol}. Triggering Resync...`);
 
     const time = Math.floor(Date.now() / 1000);
 
-    // 1. Unsubscribe
+    // Unsubscribe
     exchangeWs.send(JSON.stringify({
         time: time,
         channel: "futures.order_book_update",
@@ -69,7 +75,7 @@ function triggerResync(symbol) {
         payload: [pair, "20ms", "20"]
     }));
 
-    // 2. Subscribe (Delay slightly to ensure clean state)
+    // Re-Subscribe after 500ms
     setTimeout(() => {
         if (exchangeWs.readyState === WebSocket.OPEN) {
             exchangeWs.send(JSON.stringify({
@@ -81,7 +87,7 @@ function triggerResync(symbol) {
         }
     }, 500);
 
-    // Reset Local State
+    // Reset Local Memory
     const book = orderBooks.get(symbol);
     if (book) {
         book.bids.clear();
@@ -91,15 +97,16 @@ function triggerResync(symbol) {
     }
 }
 
+// --- 3. GATE.IO CONNECTION & HANDLER ---
 function connectGate() {
     exchangeWs = new WebSocket(config.gateUrl);
 
     exchangeWs.on('open', () => {
-        logger.info('[Gate.io] Connected. Subscribing...');
+        logger.info('[Gate.io] Connected. Subscribing to Futures Feed...');
         
         const assetPairs = config.assets.map(a => `${a}_USDT`);
         
-        // 1. Subscribe to Incremental Order Book
+        // Subscribe to Order Book
         exchangeWs.send(JSON.stringify({
             time: Math.floor(Date.now() / 1000),
             channel: "futures.order_book_update",
@@ -107,7 +114,7 @@ function connectGate() {
             payload: [...assetPairs, "20ms", "20"]
         }));
 
-        // 2. Subscribe to Trades
+        // Subscribe to Trades
         exchangeWs.send(JSON.stringify({
             time: Math.floor(Date.now() / 1000),
             channel: "futures.trades",
@@ -120,72 +127,67 @@ function connectGate() {
         try {
             const msg = JSON.parse(raw);
             
-            // Filter non-data messages
+            // Filter heartbeats and ack messages
             if (!msg.result || msg.event === 'subscribe' || msg.event === 'unsubscribe' || msg.channel === 'futures.pong') return;
 
             const channel = msg.channel;
             const data = msg.result;
 
-            // --- SAFETY: Robust Symbol Extraction ---
-            let rawSymbol = data.s;
-            if (!rawSymbol && Array.isArray(data) && data.length > 0) {
-                rawSymbol = data[0].s;
-            }
-
-            if (!rawSymbol || typeof rawSymbol !== 'string') return;
-            const symbol = rawSymbol.replace('_USDT', '');
-
-            // --- 1. HANDLE ORDER BOOK ---
+            // ============================================================
+            // HANDLER A: ORDER BOOK UPDATES
+            // ============================================================
             if (channel === 'futures.order_book_update') {
+                // Robust Symbol Extraction
+                let rawSymbol = data.s;
+                if (!rawSymbol && Array.isArray(data) && data.length > 0) rawSymbol = data[0].s;
+                
+                if (!rawSymbol) return;
+                const symbol = rawSymbol.replace('_USDT', '');
+                
                 const book = orderBooks.get(symbol);
                 if (!book) return;
 
-                // Sequence Gap Check
+                // Sequence Integrity Check
                 const isGap = (book.state === 'LIVE' && data.U !== book.lastUpdateId + 1);
-
+                
                 if (book.state === 'INITIALIZING' || isGap) {
                     if (isGap) {
-                        logger.warn(`[Gate] Gap ${symbol}: Prev=${book.lastUpdateId}, Next=${data.U}.`);
+                        logger.warn(`[Gate] Gap ${symbol}: Expected ${book.lastUpdateId + 1}, Got ${data.U}.`);
                         triggerResync(symbol);
-                        return; 
+                        return; // Halt processing
                     }
+                    // Snapshot Mode
                     book.bids.clear();
                     book.asks.clear();
                     book.state = 'LIVE';
                 }
 
-                // --- CRITICAL FIX: Handle {p, s} Objects ---
+                // Helper: Normalize {p, s} Object vs [p, s] Array
                 const processLevel = (item, map) => {
                     let p, s;
-                    
-                    // Handle Object format: { "p": "100", "s": 10 } (Seen in logs)
+                    // Format 1: Object (Seen in your logs)
                     if (typeof item === 'object' && item !== null && 'p' in item) {
                         p = item.p;
                         s = item.s;
                     } 
-                    // Handle Array format: ["100", 10] (Alternative format)
+                    // Format 2: Array (Standard API docs)
                     else if (Array.isArray(item) && item.length >= 2) {
                         [p, s] = item;
-                    } 
-                    else {
-                        return; // Invalid format
+                    } else {
+                        return;
                     }
 
                     if (parseFloat(s) === 0) map.delete(p);
                     else map.set(p, s);
                 };
 
-                if (data.a && Array.isArray(data.a)) {
-                    data.a.forEach(item => processLevel(item, book.asks));
-                }
-
-                if (data.b && Array.isArray(data.b)) {
-                    data.b.forEach(item => processLevel(item, book.bids));
-                }
+                // Apply Updates
+                if (data.a && Array.isArray(data.a)) data.a.forEach(item => processLevel(item, book.asks));
+                if (data.b && Array.isArray(data.b)) data.b.forEach(item => processLevel(item, book.bids));
 
                 book.lastUpdateId = data.u;
 
-                // Sort and Send Top 20
+                // Sort & Broadcast
                 const sortedBids = Array.from(book.bids.entries())
                     .sort((a, b) => parseFloat(b[0]) - parseFloat(a[0]))
                     .slice(0, 20);
@@ -205,20 +207,30 @@ function connectGate() {
                 }
             }
 
-            // --- 2. HANDLE TRADES ---
+            // ============================================================
+            // HANDLER B: TRADE UPDATES
+            // ============================================================
             else if (channel === 'futures.trades') {
                 const trades = Array.isArray(data) ? data : [data];
+                
                 trades.forEach(t => {
-                    if (!t || !t.s || typeof t.s !== 'string') return;
+                    // MAPPING FIX: Handle 'contract' vs 's' and 'price' vs 'p'
+                    const rawSymbol = t.contract || t.s;
+                    const rawPrice = t.price || t.p;
+                    const rawSize = t.size; // Futures uses 'size'
+
+                    if (!rawSymbol || typeof rawSymbol !== 'string') return;
                     
-                    const asset = t.s.replace('_USDT', '');
+                    const asset = rawSymbol.replace('_USDT', '');
+                    const sizeFloat = parseFloat(rawSize);
+
                     sendToBot({
                         type: 'trade',
                         s: asset,
-                        p: t.p,
-                        q: Math.abs(parseFloat(t.size)),
-                        side: parseFloat(t.size) > 0 ? 'buy' : 'sell',
-                        ts: Date.now()
+                        p: rawPrice,
+                        q: Math.abs(sizeFloat),
+                        side: sizeFloat > 0 ? 'buy' : 'sell', // Gate.io Futures: +Buy, -Sell
+                        ts: t.create_time_ms || Date.now()
                     });
                 });
             }
@@ -242,6 +254,7 @@ function connectGate() {
     exchangeWs.on('error', (e) => logger.error(`[Gate.io] WS Error: ${e.message}`));
 }
 
-// Entry Point
+// Start
 connectToInternal();
 connectGate();
+                      
