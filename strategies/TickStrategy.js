@@ -1,8 +1,6 @@
-
 /**
  * TickStrategy.js
- * v3.6 – [PRODUCTION] Position Aware & Validated
- * Fixes: Checks bot.getPosition() before trading to avoid API errors.
+ * v4.0 [PRODUCTION] - Deep Fusion & Depth-Weighted Stability
  */
 
 class TickStrategy {
@@ -10,261 +8,150 @@ class TickStrategy {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- TIMING & WARMUP ---
-        this.startTime = Date.now();
-        this.WARMUP_PERIOD_MS = 40000;   
-        this.isWarm = false;
-
         // --- PARAMETERS ---
-        this.PLFF_THRESHOLD_MS = 40;     
-        this.HAWKES_DECAY = 2.0;         
-        this.MIN_CAUSAL_Z = 6.0;         
-        this.MEMORY_CAP = 50000;         
-        this.CLEANUP_INTERVAL_MS = 5000;
-
-        // Internal State
-        this.lastLog = 0; 
-
+        this.DECAY_RATE = 0.5;      // Higher = Focus on top of book (0.5 = aggressive)
+        this.ENTRY_Z = 4.0;         // Z-score to enter Active Regime
+        this.EXIT_Z = 2.0;          // Z-score to return to Idle (Hysteresis)
+        this.MIN_NOISE_FLOOR = 0.05; // Prevents Z-score explosion in flat markets
+        this.WARMUP_TICKS = 100;    // Minimum samples before trading
+        
         // --- ASSET STATE ---
         this.assets = {};
+        this.specs = {}; // Set by trader.js on init
+        
         const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
-
         targets.forEach(symbol => {
             this.assets[symbol] = {
-                levelTimestamps: new Map(),
-                filteredObi: 0,
+                // Welford State
                 obiMean: 0,
-                obiM2: 0, 
+                obiM2: 0,
                 obiCount: 0,
-                currentRegime: 0,
-                lastDepthUpdate: 0,
-                buyIntensity: 0,
-                sellIntensity: 0,
-                lastTradeUpdate: Date.now(), 
-                tradeObi: 0.5,
+                
+                // Regime State
+                currentRegime: 0, 
                 lastPrice: 0,
-                lastTriggerTime: 0,
-                lastCleanupTime: 0,
-                isOrderInProgress: false,
-                tradeCount: 0 
+                isOrderInProgress: false
             };
         });
-
-        this.specs = {
-            'BTC': { deltaId: 27, precision: 1 },
-            'ETH': { deltaId: 299, precision: 2 },
-            'XRP': { deltaId: 14969, precision: 4 },
-            'SOL': { deltaId: 4654, precision: 2 }
-        };
-
-        this.logger.info("TickStrategy v3.6 Initialized. Waiting for Data...");
     }
 
-    getName() { return "TickStrategy v3.6 (Position Aware)"; }
+    /**
+     * Exponentially weights volume by depth level.
+     * Level 0 = 100%, Level 1 = 60%, Level 2 = 36%...
+     */
+    calcWeightedVol(levels) {
+        let weightedTotal = 0;
+        const limit = Math.min(levels.length, 10); // Process top 10 levels
 
-    async execute(data) {
-        if (data.type === 'trade') {
-            await this.onTradeUpdate(data.s, data);
-        } 
-        else if (data.type === 'depthUpdate' || data.type === 'bookTicker') {
-            await this.onDepthUpdate(data.s, data);
+        for (let i = 0; i < limit; i++) {
+            const item = levels[i];
+            const size = parseFloat(Array.isArray(item) ? item[1] : item.s);
+            if (isNaN(size)) continue;
+
+            const weight = Math.exp(-this.DECAY_RATE * i);
+            weightedTotal += size * weight;
         }
-    }
-
-    async onTradeUpdate(symbol, trade) {
-        const asset = this.assets[symbol];
-        if (!asset) return;
-
-        asset.tradeCount++;
-        const now = Date.now();
-        const dt = (now - asset.lastTradeUpdate) / 1000;
-        
-        // Decay Intensity
-        if (dt > 0) {
-            const decay = Math.exp(-this.HAWKES_DECAY * dt);
-            asset.buyIntensity *= decay;
-            asset.sellIntensity *= decay;
-        }
-        
-        asset.lastTradeUpdate = now;
-        asset.lastPrice = parseFloat(trade.p);
-
-        // Validation: Prevent NaN
-        const quantity = parseFloat(trade.q);
-        if (isNaN(quantity) || quantity <= 0) return; 
-
-        const impact = Math.log(1 + quantity); 
-        const weight = trade.is_taker ? 1.0 : 0.5;
-
-        if (trade.side === 'buy') asset.buyIntensity += impact * weight;
-        else asset.sellIntensity += impact * weight;
-
-        const total = asset.buyIntensity + asset.sellIntensity;
-        asset.tradeObi = total > 1e-6 ? (asset.buyIntensity / total) : 0.5;
-
-        await this.checkTrigger(symbol, asset, now);
+        return weightedTotal;
     }
 
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
         if (!asset) return;
 
-        const now = Date.now();
-        asset.lastDepthUpdate = now;
+        // 1. Calculate Weighted Volumes (The Fusion)
+        const wBidVol = this.calcWeightedVol(depth.bids);
+        const wAskVol = this.calcWeightedVol(depth.asks);
 
-        const validBids = this.applyPLFF(asset, depth.bids, now);
-        const validAsks = this.applyPLFF(asset, depth.asks, now);
+        if (wBidVol + wAskVol === 0) return;
 
-        let bVol = 0, aVol = 0;
-        if (validBids) for (const x of validBids) bVol += parseFloat(x[1] || 0);
-        if (validAsks) for (const x of validAsks) aVol += parseFloat(x[1] || 0);
+        // 2. Deep OBI Calculation (Directional Signal)
+        const currentDeepOBI = (wBidVol - wAskVol) / (wBidVol + wAskVol);
 
-        if (bVol + aVol > 0) {
-            asset.filteredObi = (bVol - aVol) / (bVol + aVol);
-        }
-
-        this.updateRegime(asset);
-
-        if (now - asset.lastCleanupTime > this.CLEANUP_INTERVAL_MS) {
-            this.pruneMap(asset, now);
-        }
-
-        await this.checkTrigger(symbol, asset, now);
-    }
-
-    async checkTrigger(symbol, asset, now) {
-        if (!this.isWarm) {
-            if (now - this.startTime < this.WARMUP_PERIOD_MS) return;
-            this.isWarm = true;
-            this.logger.info("✓ Warmup Complete. Snipe Logic Active.");
-        }
-
-        // Heartbeat Log
-        if (now - (this.lastLog || 0) > 5000) {
-             const currentZ = this.calculateHawkesZ(asset, now);
-             this.logger.info(`[HEARTBEAT] ${symbol} | Z=${currentZ.toFixed(2)} | Regime=${asset.currentRegime} | Trades=${asset.tradeCount}`);
-             this.lastLog = now;
-        }
-
-        if (asset.isOrderInProgress) return;
-        if (now - asset.lastTriggerTime < 2000) return;
-        
-        // Safety: If data is stale (>100ms), don't trade
-        if (now - asset.lastDepthUpdate > 100) return; 
-
-        // [CRITICAL FIX] Check if Position Exists
-        // If we have any position (size != 0), STOP here.
-        if (this.bot.hasOpenPosition && this.bot.hasOpenPosition(symbol)) {
-            return; 
-        }
-
-        const zScore = this.calculateHawkesZ(asset, now);
-        if (zScore < this.MIN_CAUSAL_Z) return;
-
-        let side = null;
-        if (asset.currentRegime >= 1 && asset.tradeObi > 0.6) side = 'buy';
-        else if (asset.currentRegime <= -1 && asset.tradeObi < 0.4) side = 'sell';
-
-        if (side) {
-            await this.executeTrade(symbol, side, zScore);
-            asset.lastTriggerTime = now;
-        }
-    }
-
-    updateRegime(asset) {
-        const x = asset.filteredObi;
-        if (asset.obiCount > this.MEMORY_CAP) {
-            const decay = 0.999; 
-            asset.obiCount *= decay;
-            asset.obiM2 *= decay;
-        }
-
+        // 3. Update Welford's Algorithm (Moving Stats)
         asset.obiCount++;
-        const delta = x - asset.obiMean;
+        const delta = currentDeepOBI - asset.obiMean;
         asset.obiMean += delta / asset.obiCount;
-        const delta2 = x - asset.obiMean; 
+        const delta2 = currentDeepOBI - asset.obiMean;
         asset.obiM2 += delta * delta2;
 
-        if (asset.obiCount < 50) return; 
+        // 4. Warmup Check
+        if (asset.obiCount < this.WARMUP_TICKS) return;
 
+        // 5. Calculate Standardized Signal (Z-Score)
         const variance = asset.obiM2 / (asset.obiCount - 1);
-        const std = Math.sqrt(variance);
-        if (std < 0.0001) return;
+        const stdDev = Math.sqrt(variance);
+        
+        // Apply Noise Floor: prevents dividing by a near-zero stdDev
+        const effectiveStdDev = Math.max(stdDev, this.MIN_NOISE_FLOOR);
+        const zScore = (currentDeepOBI - asset.obiMean) / effectiveStdDev;
 
-        const z = (x - asset.obiMean) / std;
-
-        if (z > 1.2) asset.currentRegime = 2;
-        else if (z > 0.5) asset.currentRegime = 1;
-        else if (z < -1.2) asset.currentRegime = -2;
-        else if (z < -0.5) asset.currentRegime = -1;
-        else asset.currentRegime = 0;
+        // 6. Regime Logic with Hysteresis (Prevents Flipping)
+        this.handleRegimeShift(symbol, zScore);
     }
 
-    calculateHawkesZ(asset, now) {
-        if (asset.tradeCount === 0) return 0.0;
-        const dt = (now - asset.lastTradeUpdate) / 1000;
-        const decay = Math.exp(-this.HAWKES_DECAY * dt);
-        const currBuy = asset.buyIntensity * decay;
-        const currSell = asset.sellIntensity * decay;
-        const netIntensity = currBuy - currSell;
-        const totalIntensity = currBuy + currSell + 1.0; 
-        return Math.abs(netIntensity / Math.sqrt(totalIntensity));
-    }
+    handleRegimeShift(symbol, zScore) {
+        const asset = this.assets[symbol];
+        const absZ = Math.abs(zScore);
 
-    applyPLFF(asset, levels, now) {
-        if (!levels || !Array.isArray(levels)) return [];
-        return levels.filter((item) => {
-            const priceStr = Array.isArray(item) ? item[0] : item.p;
-            if (!priceStr) return false;
-            const price = parseFloat(priceStr);
-            const last = asset.levelTimestamps.get(price) || 0;
-            if (now - last > this.PLFF_THRESHOLD_MS) {
-                asset.levelTimestamps.set(price, now);
-                return true;
+        if (asset.currentRegime === 0) {
+            // IDLE -> ACTIVE
+            if (absZ > this.ENTRY_Z) {
+                asset.currentRegime = 1;
+                const side = zScore > 0 ? 'buy' : 'sell';
+                this.logger.info(`[REGIME_CHANGE] IDLE -> ACTIVE | Z: ${zScore.toFixed(2)} | Side: ${side}`);
+                this.executeTrade(symbol, side, zScore);
             }
-            return false;
-        });
+        } else {
+            // ACTIVE -> IDLE
+            if (absZ < this.EXIT_Z) {
+                asset.currentRegime = 0;
+                this.logger.info(`[REGIME_CHANGE] ACTIVE -> IDLE | Z: ${zScore.toFixed(2)}`);
+            }
+        }
     }
 
-    pruneMap(asset, now) {
-        for (const [p, t] of asset.levelTimestamps) {
-            if (now - t > 10000) asset.levelTimestamps.delete(p);
-        }
-        asset.lastCleanupTime = now;
+    async onTradeUpdate(symbol, trade) {
+        const asset = this.assets[symbol];
+        if (asset) asset.lastPrice = parseFloat(trade.p);
     }
 
     async executeTrade(symbol, side, score) {
         const asset = this.assets[symbol];
-        asset.isOrderInProgress = true;
+        
+        // 1. Position & Lock Checks
+        if (this.bot.isOrderInProgress) return;
+        
+        // Check if we already have a position in the same direction
+        const pos = this.bot.getPosition(symbol);
+        if (pos && ((side === 'buy' && pos > 0) || (side === 'sell' && pos < 0))) {
+            return; 
+        }
+
         try {
             const spec = this.specs[symbol];
-            const price = asset.lastPrice > 0 ? asset.lastPrice : 0;
-            
-            if (!price) {
-                this.logger.warn(`[EXEC_FAIL] No Price for ${symbol}`);
-                return;
-            }
+            const price = asset.lastPrice;
+            if (!price) return;
 
-            const limit = side === 'buy' ? price * 1.0005 : price * 0.9995;
-            let trail = price * 0.0005;
-            if (side === 'buy') trail = -trail;
+            // 2. Pricing & Trailing Stop Logic
+            const limitPrice = side === 'buy' ? price * 1.0005 : price * 0.9995;
+            let trail = price * 0.0005; // 0.05% trail
+            if (side === 'buy') trail = -trail; // Buy trails upwards (negative offset)
 
+            // 3. Order Placement
             await this.bot.placeOrder({
                 product_id: spec.deltaId.toString(),
-                side,
+                side: side,
                 size: process.env.ORDER_SIZE || "1",
                 order_type: 'limit_order',
                 time_in_force: 'ioc',
-                limit_price: limit.toFixed(spec.precision),
+                limit_price: limitPrice.toFixed(spec.precision),
                 bracket_trail_amount: trail.toFixed(spec.precision),
                 bracket_stop_trigger_method: 'mark_price'
             });
 
-            this.logger.info(`[EXEC] ${side} ${symbol} | Z=${score.toFixed(2)} | TradeObi=${asset.tradeObi.toFixed(2)}`);
+            this.logger.info(`[EXECUTE] ${side.toUpperCase()} ${symbol} | Z: ${score.toFixed(2)} | Price: ${price}`);
         } catch (e) {
-            this.logger.error(`[EXEC_FAIL] ${e.message}`);
-        } finally {
-            asset.isOrderInProgress = false;
+            this.logger.error(`[EXEC_ERROR] ${symbol}: ${e.message}`);
         }
     }
 }
