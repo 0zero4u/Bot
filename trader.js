@@ -1,10 +1,11 @@
 // trader.js
-// v72.2 - [PRODUCTION] Smart Strategy Loader + Startup Fix + Delta Orders/Positions
-// Changes: Auto-resolves 'Tick' -> 'TickStrategy.js', Fixes Logger Crash
+// v72.3 - [PRODUCTION] Smart Path Resolution + Smart Naming + Delta Connection
+// Changes: Auto-finds strategy in '../strategies/' or './strategies/' or './'
 
 const WebSocket = require('ws');
 const winston = require('winston');
 const crypto = require('crypto');
+const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
 
@@ -12,7 +13,7 @@ const DeltaClient = require('./client.js');
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'TickStrategy', // Default
+    strategy: process.env.STRATEGY || 'TickStrategy',
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
@@ -28,26 +29,44 @@ const config = {
     heartbeatTimeoutMs: parseInt(process.env.HEARTBEAT_TIMEOUT_MS || '40000'),
 };
 
-// --- Smart Strategy Loader ---
-// This block fixes the "MODULE_NOT_FOUND" error by trying both names
+// --- Super-Smart Strategy Loader ---
 let StrategyClass;
-try {
-    // Attempt 1: Load exactly what is in config (e.g., "TickStrategy")
-    StrategyClass = require(`./${config.strategy}.js`);
-} catch (e) {
-    try {
-        // Attempt 2: If failed, try appending "Strategy" (e.g., "Tick" -> "TickStrategy")
-        console.log(`[Loader] Standard load failed for '${config.strategy}'. Trying '${config.strategy}Strategy'...`);
-        StrategyClass = require(`./${config.strategy}Strategy.js`);
-        // Update config to match the found file for logging consistency
-        config.strategy = `${config.strategy}Strategy`; 
-    } catch (e2) {
-        console.error(`\n[FATAL] CRITICAL ERROR: Could not load strategy.`);
-        console.error(`1. Checked: ./${config.strategy}.js`);
-        console.error(`2. Checked: ./${config.strategy}Strategy.js`);
-        console.error(`Ensure the file exists and the name matches EXACTLY.\n`);
-        process.exit(1);
+
+function loadStrategy(strategyName) {
+    // Possible paths to check (Relative to this file)
+    const candidates = [
+        `./${strategyName}.js`,                       // 1. Same folder (Bot/TickStrategy.js)
+        `../strategies/${strategyName}.js`,           // 2. Parent sibling (strategies/TickStrategy.js)
+        `./strategies/${strategyName}.js`,            // 3. Child folder (Bot/strategies/TickStrategy.js)
+        `./${strategyName}Strategy.js`,               // 4. Name variant (Bot/Tick.js -> TickStrategy.js)
+        `../strategies/${strategyName}Strategy.js`    // 5. Parent variant
+    ];
+
+    for (const relativePath of candidates) {
+        try {
+            // Resolve absolute path to be sure
+            const absolutePath = path.resolve(__dirname, relativePath);
+            if (fs.existsSync(absolutePath)) {
+                console.log(`[Loader] Found strategy at: ${absolutePath}`);
+                return require(absolutePath);
+            }
+        } catch (e) {
+            // Continue checking
+        }
     }
+    throw new Error(`Could not find '${strategyName}' in any standard directory.`);
+}
+
+try {
+    StrategyClass = loadStrategy(config.strategy);
+} catch (e) {
+    console.error(`\n[FATAL] STRATEGY NOT FOUND`);
+    console.error(`Searched for '${config.strategy}' in:`);
+    console.error(`- ./`);
+    console.error(`- ../strategies/`);
+    console.error(`- ./strategies/`);
+    console.error(`\nPlease check your folder structure or .env STRATEGY name.\n`);
+    process.exit(1);
 }
 
 // --- Main Trading Bot Class ---
@@ -86,14 +105,11 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`Starting Delta Trader v72.2...`);
-        this.logger.info(`Strategy Loaded: ${this.config.strategy}`);
+        this.logger.info(`Starting Delta Trader v72.3...`);
+        this.logger.info(`Strategy Active: ${this.config.strategy}`);
         this.logger.info(`Product: ${this.config.productSymbol} (ID: ${this.config.productId})`);
 
-        // 1. Setup Internal WebSocket Server (Listener -> Trader)
         this.setupInternalServer();
-
-        // 2. Connect to Delta WebSocket (For Execution Updates)
         this.connectDeltaWebSocket();
     }
 
@@ -109,12 +125,9 @@ class TradingBot {
 
                 try {
                     const data = JSON.parse(message);
-                    
-                    // Route data to Strategy
                     if (this.strategy && typeof this.strategy.execute === 'function') {
                         await this.strategy.execute(data);
                     }
-
                 } catch (e) {
                     this.logger.error(`Strategy Execution Error: ${e.message}`);
                 }
@@ -148,18 +161,12 @@ class TradingBot {
             this.heartbeat(); 
             try {
                 const msg = JSON.parse(data);
-                
-                if (msg.type === 'v2/ticker') {
-                   // Ignore ticker
-                } else if (msg.type === 'orders') {
+                if (msg.type === 'orders') {
                     this.handleOrderUpdate(msg);
                 } else if (msg.type === 'positions') {
                     this.handlePositionUpdate(msg);
                 }
-
-            } catch (e) {
-                // Squelch heartbeat/pong parse errors
-            }
+            } catch (e) {}
         });
 
         this.deltaWs.on('close', () => {
@@ -189,8 +196,6 @@ class TradingBot {
     handleOrderUpdate(msg) {
         if(msg.data) {
              this.logger.info(`[ORDER UPDATE] ${msg.data.status} | ID: ${msg.data.id} | ${msg.data.side} ${msg.data.size}`);
-             
-             // Lock Release Logic
              if (['filled', 'cancelled', 'closed'].includes(msg.data.status)) {
                  if (this.isOrderInProgress) {
                      this.logger.info("Order finalized. Releasing Lock.");
@@ -212,7 +217,6 @@ class TradingBot {
         }
     }
 
-    // --- Heartbeat Logic ---
     startHeartbeat() {
         this.stopHeartbeat();
         this.pingInterval = setInterval(() => {
@@ -236,7 +240,6 @@ class TradingBot {
         }, this.config.heartbeatTimeoutMs);
     }
 
-    // --- Execution Methods ---
     async placeOrder(orderData) {
         if (this.isOrderInProgress) {
             this.logger.warn("Order blocked: Internal Lock is active.");
@@ -264,7 +267,6 @@ class TradingBot {
             
             if (response && response.success) {
                 this.logger.info(`[SUCCESS] Order ID: ${response.result.id}`);
-                // Safety Release
                 setTimeout(() => { 
                     if(this.isOrderInProgress) {
                         this.logger.warn("Auto-releasing Order Lock (Timeout)");
@@ -286,7 +288,6 @@ class TradingBot {
 
 // --- Start the Bot ---
 (async () => {
-    // 1. Create a simple global logger for startup errors
     const startupLogger = winston.createLogger({
         level: 'info',
         format: winston.format.simple(),
@@ -312,4 +313,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                   
+    
