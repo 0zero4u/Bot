@@ -1,17 +1,18 @@
 // trader.js
-// v72.1 - [PRODUCTION] TickStrategy + Delta (Orders & Positions Channels)
-// Changes: Fixed Startup Crash (Logger Scope), Removed Ticker, Added 'orders'/'positions'
+// v72.2 - [PRODUCTION] Smart Strategy Loader + Startup Fix + Delta Orders/Positions
+// Changes: Auto-resolves 'Tick' -> 'TickStrategy.js', Fixes Logger Crash
 
 const WebSocket = require('ws');
 const winston = require('winston');
 const crypto = require('crypto');
+const fs = require('fs');
 require('dotenv').config();
 
 const DeltaClient = require('./client.js');
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'TickStrategy',
+    strategy: process.env.STRATEGY || 'TickStrategy', // Default
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
@@ -27,14 +28,26 @@ const config = {
     heartbeatTimeoutMs: parseInt(process.env.HEARTBEAT_TIMEOUT_MS || '40000'),
 };
 
-// --- Strategy Loader ---
-// We dynamically require the strategy file based on config
+// --- Smart Strategy Loader ---
+// This block fixes the "MODULE_NOT_FOUND" error by trying both names
 let StrategyClass;
 try {
+    // Attempt 1: Load exactly what is in config (e.g., "TickStrategy")
     StrategyClass = require(`./${config.strategy}.js`);
 } catch (e) {
-    console.error(`[FATAL] Could not load strategy: ${config.strategy}.js`);
-    process.exit(1);
+    try {
+        // Attempt 2: If failed, try appending "Strategy" (e.g., "Tick" -> "TickStrategy")
+        console.log(`[Loader] Standard load failed for '${config.strategy}'. Trying '${config.strategy}Strategy'...`);
+        StrategyClass = require(`./${config.strategy}Strategy.js`);
+        // Update config to match the found file for logging consistency
+        config.strategy = `${config.strategy}Strategy`; 
+    } catch (e2) {
+        console.error(`\n[FATAL] CRITICAL ERROR: Could not load strategy.`);
+        console.error(`1. Checked: ./${config.strategy}.js`);
+        console.error(`2. Checked: ./${config.strategy}Strategy.js`);
+        console.error(`Ensure the file exists and the name matches EXACTLY.\n`);
+        process.exit(1);
+    }
 }
 
 // --- Main Trading Bot Class ---
@@ -66,15 +79,15 @@ class TradingBot {
         this.strategy = new StrategyClass(this);
 
         // WebSocket State
-        this.internalWsServer = null; // Receives data from market_listener
-        this.deltaWs = null;          // Connects to Delta Exchange (Orders/Positions)
+        this.internalWsServer = null; 
+        this.deltaWs = null;          
         this.pingInterval = null;
         this.heartbeatTimeout = null;
     }
 
     async start() {
-        this.logger.info(`Starting Delta Trader v72.1...`);
-        this.logger.info(`Strategy: ${this.config.strategy}`);
+        this.logger.info(`Starting Delta Trader v72.2...`);
+        this.logger.info(`Strategy Loaded: ${this.config.strategy}`);
         this.logger.info(`Product: ${this.config.productSymbol} (ID: ${this.config.productId})`);
 
         // 1. Setup Internal WebSocket Server (Listener -> Trader)
@@ -92,13 +105,12 @@ class TradingBot {
             this.logger.info(`Market Listener connected on port ${this.config.port}`);
 
             ws.on('message', async (message) => {
-                if (this.isOrderInProgress) return; // Block new signals while busy
+                if (this.isOrderInProgress) return; 
 
                 try {
                     const data = JSON.parse(message);
                     
                     // Route data to Strategy
-                    // Strategies should implement an 'execute(data)' method
                     if (this.strategy && typeof this.strategy.execute === 'function') {
                         await this.strategy.execute(data);
                     }
@@ -115,7 +127,6 @@ class TradingBot {
 
         this.internalWsServer.on('error', (err) => {
             this.logger.error(`Internal Server Error (Port ${this.config.port}): ${err.message}`);
-            // If port is in use, we might want to exit or retry
             if (err.code === 'EADDRINUSE') {
                 this.logger.error(`Port ${this.config.port} is already in use. Exiting.`);
                 process.exit(1);
@@ -134,12 +145,12 @@ class TradingBot {
         });
 
         this.deltaWs.on('message', (data) => {
-            this.heartbeat(); // Reset timeout on any message
+            this.heartbeat(); 
             try {
                 const msg = JSON.parse(data);
                 
                 if (msg.type === 'v2/ticker') {
-                   // We ignore ticker data here (handled by market_listener)
+                   // Ignore ticker
                 } else if (msg.type === 'orders') {
                     this.handleOrderUpdate(msg);
                 } else if (msg.type === 'positions') {
@@ -176,12 +187,10 @@ class TradingBot {
     }
 
     handleOrderUpdate(msg) {
-        // Log order updates for debugging / auditing
-        // msg structure depends on Delta API, usually msg.data is the order object
         if(msg.data) {
              this.logger.info(`[ORDER UPDATE] ${msg.data.status} | ID: ${msg.data.id} | ${msg.data.side} ${msg.data.size}`);
              
-             // If an order reaches a terminal state, release the lock
+             // Lock Release Logic
              if (['filled', 'cancelled', 'closed'].includes(msg.data.status)) {
                  if (this.isOrderInProgress) {
                      this.logger.info("Order finalized. Releasing Lock.");
@@ -192,7 +201,6 @@ class TradingBot {
     }
 
     handlePositionUpdate(msg) {
-        // Optional: Track current position size for strategy logic
         if(msg.data) {
             this.logger.info(`[POSITION UPDATE] ${msg.data.product_symbol} | Size: ${msg.data.size}`);
         }
@@ -212,8 +220,6 @@ class TradingBot {
                 this.deltaWs.ping();
             }
         }, this.config.pingIntervalMs);
-
-        // Initial timeout set
         this.heartbeat(); 
     }
 
@@ -240,7 +246,6 @@ class TradingBot {
         this.isOrderInProgress = true;
 
         try {
-            // Sign the request
             const method = 'POST';
             const path = '/v2/orders';
             const body = JSON.stringify(orderData);
@@ -255,13 +260,11 @@ class TradingBot {
                 'timestamp': timestamp
             };
 
-            // Use the HTTP Client (axios wrapper)
             const response = await this.client.post(path, orderData, headers);
             
             if (response && response.success) {
                 this.logger.info(`[SUCCESS] Order ID: ${response.result.id}`);
-                // Lock remains TRUE until WebSocket confirms 'filled/cancelled'
-                // Safety release after 5s just in case WS misses the packet
+                // Safety Release
                 setTimeout(() => { 
                     if(this.isOrderInProgress) {
                         this.logger.warn("Auto-releasing Order Lock (Timeout)");
@@ -270,7 +273,7 @@ class TradingBot {
                 }, 5000);
             } else {
                 this.logger.error(`[FAIL] ${JSON.stringify(response)}`);
-                this.isOrderInProgress = false; // Release immediately on API error
+                this.isOrderInProgress = false; 
             }
             return response;
 
@@ -296,7 +299,7 @@ class TradingBot {
         
         process.on('uncaughtException', async (err) => {
             startupLogger.error(`Uncaught Exception: ${err.message}`);
-            console.error(err); // Fallback to console
+            console.error(err); 
         });
         
         process.on('unhandledRejection', (reason, p) => {
@@ -304,10 +307,9 @@ class TradingBot {
         });
 
     } catch (error) {
-        // 2. Use the startupLogger here instead of 'logger' (which was undefined)
         startupLogger.error(`Failed to start bot: ${error.message}`);
-        console.error(error); // Print full stack trace to console
+        console.error(error); 
         process.exit(1);
     }
 })();
-                                        
+                   
