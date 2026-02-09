@@ -5,11 +5,11 @@
  * with Directional Velocity Gating & Dynamic Trailing Stop.
  *
  * CORE LOGIC:
- * 1. Total Notional Liquidity Filter (Filters dust/noise).
- * 2. Velocity Gate (Ensures price is moving > 0.02%).
- * 3. Microprice Imbalance (Calculates pressure direction).
- * 4. Directional Confluence (Signal + Velocity must agree).
- * 5. Execution: Limit IOC with 10-Tick Trailing Stop.
+ * 1. Normalized Liquidity: Filters out "dust" (requires ~$2000 USDT on L1).
+ * 2. Velocity Gate: Requires price to move > 0.02% in ~30ms to wake up.
+ * 3. Microprice Imbalance: Calculates weighted pressure of the order book.
+ * 4. Directional Confluence: Trades ONLY if Microprice & Velocity agree.
+ * 5. Execution: Limit IOC with a Dynamic 10-Tick Trailing Stop.
  */
 
 class MicroStrategy {
@@ -20,11 +20,12 @@ class MicroStrategy {
         // --- CONFIGURATION ---
 
         // Signal Strength Threshold
-        // 0.6 means Microprice has moved 60% across the spread.
+        // 0.6 means Microprice has moved 60% across the spread toward the other side.
         this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.6');
 
         // Liquidity Filter: Minimum TOTAL value on L1 (Bid + Ask) in USDT.
         // We sum them to allow for heavy imbalances (e.g., huge Buy wall, empty Sell side).
+        // Default: $2000 USDT visible on L1 required to trade.
         this.MIN_NOTIONAL_VALUE = parseFloat(process.env.MIN_NOTIONAL || '2000');
 
         this.COOLDOWN_MS = 2000;
@@ -35,7 +36,9 @@ class MicroStrategy {
 
         this.assets = {};
 
-        // Asset Specs (Delta Exchange / Standard)
+        // Asset Specs (Delta Exchange Standard)
+        // Precision: Decimal places for price.
+        // DeltaId: Product ID for order placement.
         this.specs = {
             'BTC': { deltaId: 27,    precision: 1, lot: 0.001 },
             'ETH': { deltaId: 299,   precision: 2, lot: 0.01 },
@@ -61,6 +64,10 @@ class MicroStrategy {
         return "MicroStrategy (VWM + Velocity + 10-Tick Trail)";
     }
 
+    /**
+     * Main Tick Handler
+     * Expects depth payload: { bids: [[price, vol]], asks: [[price, vol]] }
+     */
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
         if (!asset) return;
@@ -83,7 +90,7 @@ class MicroStrategy {
         // Calculate Total Value on L1 (Price * Volume)
         const totalNotional = (Vb * Pb) + (Va * Pa);
 
-        // If total liquidity is too low (dust), ignore.
+        // If total liquidity is too low (dust/spoofing), ignore.
         if (totalNotional < this.MIN_NOTIONAL_VALUE) {
             return;
         }
@@ -97,7 +104,7 @@ class MicroStrategy {
         // Prune history:
         // Remove ticks older than Window (30ms) + Buffer (200ms).
         // CRITICAL: We ensure we keep at least 2 ticks (length > 2).
-        // This prevents the buffer from emptying on slow data feeds.
+        // This prevents the buffer from emptying on slow data feeds/stale markets.
         while (asset.priceHistory.length > 2 &&
                (now - asset.priceHistory[0].time > this.SPIKE_WINDOW_MS + 200)) {
             asset.priceHistory.shift();
@@ -105,7 +112,7 @@ class MicroStrategy {
 
         // Baseline Selection:
         // We use the oldest available tick in our buffer to compare against.
-        // Even if the feed is slow (e.g. last tick was 100ms ago), we use it.
+        // Even if the feed is slow (e.g. last tick was 100ms ago), we use it as the baseline.
         const baselineTick = asset.priceHistory[0];
 
         // Calculate Velocity (Percentage Change)
@@ -118,6 +125,7 @@ class MicroStrategy {
         // ============================================================
 
         // If price hasn't moved 0.02%, stop immediately.
+        // This saves CPU and filters out "creeping" trends.
         if (absChange < this.SPIKE_PERCENT) {
             return;
         }
@@ -165,8 +173,13 @@ class MicroStrategy {
             asset.lastLogTime = now;
         }
 
-        // Execute
-        if (side && !this.bot.hasOpenPosition && !this.bot.isOrderInProgress) {
+        // Execute Logic
+        // We check:
+        // 1. Valid Side
+        // 2. No open position FOR THIS SPECIFIC ASSET
+        // 3. No order currently being placed
+        if (side && !this.bot.hasOpenPosition(symbol) && !this.bot.isOrderInProgress) {
+            
             if (now - asset.lastTriggerTime < this.COOLDOWN_MS) return;
 
             this.logger.info(`[TRIGGER] ${symbol} ${side.toUpperCase()} | Vel:${(signedChange*100).toFixed(4)}% | Sig:${signalStrength.toFixed(3)}`);
@@ -207,6 +220,8 @@ class MicroStrategy {
                 limit_price: entryPrice.toFixed(spec.precision),
 
                 // --- 10-TICK TRAILING STOP ---
+                // This activates immediately. If price moves in favor, it trails.
+                // If price moves against by 10 ticks, it exits.
                 bracket_trail_amount: trailAmount.toFixed(spec.precision),
                 bracket_stop_trigger_method: 'mark_price'
             });
@@ -220,3 +235,4 @@ class MicroStrategy {
 }
 
 module.exports = MicroStrategy;
+        
