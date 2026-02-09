@@ -11,6 +11,12 @@ module.exports = {
       script: "./trader.js",
       cwd: "/home/ubuntu/trading-bot/Bot",
       restart_delay: 5000
+    },
+    {
+      name: "gateio-market-listener",
+      script: "./gateIOmarket_listener.js",
+      cwd: "/home/ubuntu/trading-bot/Bot",
+      restart_delay: 5000
     }
   ]
 };
