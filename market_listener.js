@@ -52,7 +52,7 @@ function connectBinance() {
         .map(a => `${a.toLowerCase()}usdt@bookTicker`)
         .join('/');
 
-    const url = `wss://fstream.binance.com/stream?streams=${streams}`;
+    const url = `ws s://fstream.bin ance.com/stream?streams=${streams}`;
 
     logger.info(`[Binance] Connecting to Low-Latency Stream...`);
     
