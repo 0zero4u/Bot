@@ -17,7 +17,7 @@ class TickStrategy {
 
         // --- PARAMETERS ---
         this.PLFF_THRESHOLD_MS = 20;     
-        this.HAWKES_DECAY = 3.0;         
+        this.HAWKES_DECAY = 1.0;         
         this.MIN_CAUSAL_Z = 3.0;         
         this.MEMORY_CAP = 50000;         
         this.CLEANUP_INTERVAL_MS = 5000;
