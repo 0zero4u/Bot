@@ -29,13 +29,13 @@ class MicroStrategy {
         // Trailing Stop Configuration (Percentage Based)
         // 0.005% = The price only needs to dip 0.005% from its peak to trigger the exit.
         // This is calculated dynamically based on Entry Price at the moment of the trade.
-        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.01');
+        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.02');
 
         this.COOLDOWN_MS = 2000;
 
         // --- VELOCITY GATE CONFIG ---
         // Prevents trading in chopping/stagnant markets.
-        this.SPIKE_PERCENT = 0.0003;   // 0.03% Price Move required
+        this.SPIKE_PERCENT = 0.0005;   // 0.03% Price Move required
         this.SPIKE_WINDOW_MS = 30;     // 30ms Time Window
 
         this.assets = {};
