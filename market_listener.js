@@ -1,35 +1,21 @@
 /**
  * market_listener.js
- * Unified Market Data Adapter
- * Sources: 
- * 0: Binance Futures (Low Latency BookTicker)
- * 1: Gate.io Futures (Order Book + Trades)
- * * Logic:
- * - Reads process.env.MARKET_SOURCE to determine which exchange to connect to.
- * - Forwards normalized data to the internal Trader Bot.
+ * v2.0 - Gate.io Incremental Sync Implementation
+ * Rules: First update = Snapshot | Sequence (U/u) is Law | Gap = Resync
  */
 
 const WebSocket = require('ws');
 const winston = require('winston');
 require('dotenv').config();
 
-// --- CONFIGURATION ---
 const config = {
-    // 0 = Binance, 1 = Gate.io
     marketSource: process.env.MARKET_SOURCE || '1', 
-    
-    // Connects to the trader.js websocket server
     internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
-    
-    // Exchange URLs
-    binanceUrl: 'wss://fstream.binance.com/stream',
     gateUrl: 'wss://fx-ws.gateio.ws/v4/ws/usdt',
-
-    reconnectInterval: 5000,
-    assets: (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',')
+    assets: (process.env.TARGET_ASSETS || 'XRP').split(','),
+    reconnectInterval: 5000
 };
 
-// --- LOGGING ---
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
@@ -39,268 +25,150 @@ const logger = winston.createLogger({
     transports: [new winston.transports.Console()]
 });
 
-// --- STATE MANAGEMENT ---
-let internalWs = null;
-let exchangeWs = null;
+// --- LOCAL BOOK STORAGE ---
+const orderBooks = new Map();
+config.assets.forEach(asset => {
+    orderBooks.set(asset, {
+        bids: new Map(),
+        asks: new Map(),
+        lastUpdateId: 0,
+        state: 'INITIALIZING' // INITIALIZING -> LIVE
+    });
+});
 
-// Gate.io Specific State
-const orderBooks = new Map(); 
+let botWs = null;
 
-// --- HELPER CLASS: Gate.io OrderBook ---
-class LocalOrderBook {
-    constructor(symbol) {
-        this.symbol = symbol;
-        this.bids = new Map();
-        this.asks = new Map();
-        this.lastUpdateId = 0;
-        this.firstReceived = false;
-        this.ready = false;
-    }
-
-    reset() {
-        this.bids.clear();
-        this.asks.clear();
-        this.lastUpdateId = 0;
-        this.firstReceived = false;
-        this.ready = false;
-    }
-
-    processUpdate(data) {
-        const U = data.U; 
-        const u = data.u; 
-
-        if (!this.firstReceived) {
-            this.reset();
-            this.applyChanges(data.b, this.bids);
-            this.applyChanges(data.a, this.asks);
-            this.lastUpdateId = u;
-            this.firstReceived = true;
-            this.ready = true;
-            return true;
-        }
-
-        // Gap detection
-        if (U > this.lastUpdateId + 1) {
-            logger.warn(`[${this.symbol}] Gap detected in Gate.io sequence. Resyncing...`);
-            return false; 
-        }
-
-        // Ignore old packets
-        if (u < this.lastUpdateId) return true; 
-
-        this.applyChanges(data.b, this.bids);
-        this.applyChanges(data.a, this.asks);
-        this.lastUpdateId = u;
-        return true;
-    }
-
-    applyChanges(changes, bookMap) {
-        if (!changes) return;
-        for (const point of changes) {
-            const p = parseFloat(point.p);
-            const s = parseFloat(point.s);
-            if (s === 0) bookMap.delete(p);
-            else bookMap.set(p, s);
-        }
-    }
-
-    getSnapshot(depth = 20) {
-        if (!this.ready) return null;
-        const sortedBids = Array.from(this.bids.entries()).sort((a, b) => b[0] - a[0]).slice(0, depth).map(([p, s]) => [p.toString(), s.toString()]);
-        const sortedAsks = Array.from(this.asks.entries()).sort((a, b) => a[0] - b[0]).slice(0, depth).map(([p, s]) => [p.toString(), s.toString()]);
-        return { bids: sortedBids, asks: sortedAsks };
-    }
-}
-
-// Initialize OrderBooks for Gate.io assets
-config.assets.forEach(asset => orderBooks.set(asset, new LocalOrderBook(asset)));
-
-
-// --- 1. INTERNAL CONNECTION (To Trader Bot) ---
 function connectToInternal() {
-    internalWs = new WebSocket(config.internalReceiverUrl);
-
-    internalWs.on('open', () => {
-        logger.info(`✓ Connected to Trader Bot. Ready to forward data for: ${config.assets.join(', ')}`);
-    });
-
-    internalWs.on('close', () => {
-        logger.warn('⚠ Internal Bot Disconnected. Retrying...');
-        setTimeout(connectToInternal, config.reconnectInterval);
-    });
-
-    internalWs.on('error', (e) => logger.error(`Internal WS Error: ${e.message}`));
+    botWs = new WebSocket(config.internalReceiverUrl);
+    botWs.on('open', () => logger.info('✓ Connected to Trader Bot.'));
+    botWs.on('close', () => setTimeout(connectToInternal, 2000));
+    botWs.on('error', () => {});
 }
 
 function sendToBot(payload) {
-    if (internalWs && internalWs.readyState === WebSocket.OPEN) {
-        internalWs.send(JSON.stringify(payload));
+    if (botWs && botWs.readyState === WebSocket.OPEN) {
+        botWs.send(JSON.stringify(payload));
     }
 }
 
-
-// --- 2. SOURCE: BINANCE (Mode 0) ---
-function connectBinance() {
-    // bookTicker is the fastest L1 update (Best Bid/Ask only)
-    const streams = config.assets
-        .map(a => `${a.toLowerCase()}usdt@bookTicker`)
-        .join('/');
-
-    const url = `${config.binanceUrl}?streams=${streams}`;
-
-    logger.info(`[Mode 0: Binance] Connecting to Low-Latency Stream...`);
-    
-    exchangeWs = new WebSocket(url);
-
-    exchangeWs.on('open', () => logger.info('[Binance] ✓ Connected & Streaming.'));
-
-    exchangeWs.on('message', (data) => {
-        try {
-            const msg = JSON.parse(data);
-            if (!msg.data) return;
-
-            // Extract Asset Name (e.g., "BTCUSDT" -> "BTC")
-            const asset = msg.data.s.replace('USDT', '');
-
-            // Standardize Payload
-            const payload = {
-                type: 'B',                     // 'B' for Binance BookTicker
-                s: asset,                      // Symbol
-                bb: parseFloat(msg.data.b),    // Best Bid Price
-                bq: parseFloat(msg.data.B),    // Best Bid Qty
-                ba: parseFloat(msg.data.a),    // Best Ask Price
-                aq: parseFloat(msg.data.A)     // Best Ask Qty
-            };
-
-            sendToBot(payload);
-
-        } catch (e) {
-            // Squelch parsing errors
-        }
-    });
-
-    exchangeWs.on('close', () => {
-        logger.warn('[Binance] Disconnected. Reconnecting...');
-        setTimeout(connectBinance, config.reconnectInterval);
-    });
-
-    exchangeWs.on('error', (e) => logger.error(`[Binance] Error: ${e.message}`));
-}
-
-
-// --- 3. SOURCE: GATE.IO (Mode 1) ---
 function connectGate() {
-    logger.info(`[Mode 1: Gate.io] Connecting to Futures V4 Stream...`);
-    exchangeWs = new WebSocket(config.gateUrl);
+    const exchangeWs = new WebSocket(config.gateUrl);
 
     exchangeWs.on('open', () => {
-        logger.info('[Gate.io] Connected.');
+        logger.info('[Gate.io] Connected. Subscribing to Book and Trades...');
         
-        config.assets.forEach(asset => {
-            // 1. Subscribe to Order Book (20ms)
-             exchangeWs.send(JSON.stringify({
-                time: Math.floor(Date.now() / 1000),
-                channel: "futures.order_book_update",
-                event: "subscribe",
-                payload: [`${asset}_USDT`, "20ms", "20"]
-            }));
-            
-            // 2. Subscribe to TRADES (Real-Time)
-            exchangeWs.send(JSON.stringify({
-                time: Math.floor(Date.now() / 1000),
-                channel: "futures.trades",
-                event: "subscribe",
-                payload: [`${asset}_USDT`]
-            }));
-        });
-        
-        logger.info(`[Gate.io] Subscribed to Books & Trades for: ${config.assets.join(', ')}`);
+        // Subscribe to Order Book Updates (Rule 1)
+        const assetPairs = config.assets.map(a => `${a}_USDT`);
+        exchangeWs.send(JSON.stringify({
+            time: Math.floor(Date.now() / 1000),
+            channel: "futures.order_book_update",
+            event: "subscribe",
+            payload: [...assetPairs, "20ms", "20"]
+        }));
+
+        // Subscribe to Trades
+        exchangeWs.send(JSON.stringify({
+            time: Math.floor(Date.now() / 1000),
+            channel: "futures.trades",
+            event: "subscribe",
+            payload: assetPairs
+        }));
     });
 
-    exchangeWs.on('message', (data) => {
+    exchangeWs.on('message', (raw) => {
         try {
-            const msg = JSON.parse(data);
-            const channel = msg.channel;
-            const event = msg.event;
-            const result = msg.result;
+            const msg = JSON.parse(raw);
+            if (!msg.result || msg.event === 'subscribe') return;
 
-            if (event === 'update' && result) {
-                // --- HANDLE ORDER BOOK ---
-                if (channel === 'futures.order_book_update') {
-                    const gateSymbol = result.s; 
-                    const asset = gateSymbol.replace('_USDT', '');
-                    const book = orderBooks.get(asset);
-                    
-                    if (book) {
-                        if (!book.processUpdate(result)) {
-                            book.reset(); 
-                            // Ideally trigger resubscribe here in full prod
-                            return; 
-                        }
-                        
-                        // Send 'depth' payload to Bot
-                        sendToBot({
-                            type: 'depth',
-                            s: asset,
-                            ts: Date.now(),
-                            ...book.getSnapshot()
-                        });
+            const channel = msg.channel;
+            const data = msg.result;
+            const symbol = (data.s || "").replace('_USDT', '');
+
+            // --- 1. HANDLE ORDER BOOK (INCREMENTAL) ---
+            if (channel === 'futures.order_book_update') {
+                const book = orderBooks.get(symbol);
+                if (!book) return;
+
+                // RULE 2 & 4: First update = Snapshot OR Resync on Gap
+                if (book.state === 'INITIALIZING' || data.U !== book.lastUpdateId + 1) {
+                    if (book.state === 'LIVE') {
+                        logger.warn(`[Gate] Sequence Gap on ${symbol}! Expected ${book.lastUpdateId + 1}, got ${data.U}. Resyncing...`);
                     }
+                    book.bids.clear();
+                    book.asks.clear();
+                    book.state = 'LIVE';
                 }
 
-                // --- HANDLE TRADES ---
-                if (channel === 'futures.trades') {
-                    // Result is an array of trades
-                    const trades = Array.isArray(result) ? result : [result];
-                    
-                    trades.forEach(trade => {
-                        const gateSymbol = trade.contract; 
-                        const asset = (gateSymbol || config.assets[0] + '_USDT').replace('_USDT', ''); 
-                        const size = parseFloat(trade.size);
-                        const price = parseFloat(trade.price);
-                        const side = size > 0 ? 'buy' : 'sell';
-
-                        // Send 'trade' payload to Bot
-                        sendToBot({
-                            type: 'trade',
-                            s: asset,
-                            p: price,
-                            q: Math.abs(size),
-                            side: side,
-                            id: trade.id,
-                            ts: Date.now()
-                        });
+                // RULE 3: Apply Updates (a = asks, b = bids)
+                if (data.a) {
+                    data.a.forEach(([p, s]) => {
+                        const price = p; // String price as key
+                        const size = parseFloat(s);
+                        if (size === 0) book.asks.delete(price);
+                        else book.asks.set(price, size);
                     });
                 }
+                if (data.b) {
+                    data.b.forEach(([p, s]) => {
+                        const price = p;
+                        const size = parseFloat(s);
+                        if (size === 0) book.bids.delete(price);
+                        else book.bids.set(price, size);
+                    });
+                }
+
+                book.lastUpdateId = data.u;
+
+                // Sort and Prepare Top 20 for Strategy
+                const sortedBids = Array.from(book.bids.entries())
+                    .sort((a, b) => parseFloat(b[0]) - parseFloat(a[0]))
+                    .slice(0, 20);
+                const sortedAsks = Array.from(book.asks.entries())
+                    .sort((a, b) => parseFloat(a[0]) - parseFloat(b[0]))
+                    .slice(0, 20);
+
+                sendToBot({
+                    type: 'depthUpdate',
+                    s: symbol,
+                    bids: sortedBids,
+                    asks: sortedAsks,
+                    u: data.u,
+                    ts: Date.now()
+                });
+            }
+
+            // --- 2. HANDLE TRADES ---
+            else if (channel === 'futures.trades') {
+                const trades = Array.isArray(data) ? data : [data];
+                trades.forEach(t => {
+                    const asset = t.s.replace('_USDT', '');
+                    sendToBot({
+                        type: 'trade',
+                        s: asset,
+                        p: t.p,
+                        q: Math.abs(parseFloat(t.size)),
+                        side: parseFloat(t.size) > 0 ? 'buy' : 'sell',
+                        ts: Date.now()
+                    });
+                });
             }
         } catch (e) {
-            logger.error(`[Gate.io] Parse Error: ${e.message}`);
+            logger.error(`[Gate.io] Error: ${e.message}`);
         }
     });
 
     exchangeWs.on('close', () => {
-        logger.warn('[Gate.io] Disconnected. Reconnecting...');
-        config.assets.forEach(a => orderBooks.get(a).reset()); 
+        logger.warn('[Gate.io] Disconnected. Resetting books and reconnecting...');
+        config.assets.forEach(asset => {
+            const book = orderBooks.get(asset);
+            book.state = 'INITIALIZING';
+            book.lastUpdateId = 0;
+        });
         setTimeout(connectGate, config.reconnectInterval);
     });
-
-    exchangeWs.on('error', (e) => logger.error(`[Gate.io] Error: ${e.message}`));
 }
 
-
-// --- MAIN EXECUTION ---
-function start() {
-    // 1. Always connect to the internal bot first
-    connectToInternal();
-
-    // 2. Select External Source based on ENV
-    if (config.marketSource === '1') {
-        connectGate();
-    } else {
-        // Default to Binance (Source 0)
-        connectBinance();
-    }
-}
-
-start();
-
+// Start
+connectToInternal();
+connectGate();
+        
