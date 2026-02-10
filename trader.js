@@ -1,5 +1,5 @@
 // trader.js
-// v67.0 - Latency Analyzed + Connection Warmup
+// v67.1 - Rust Native Client Integration
 // 
 
 const WebSocket = require('ws');
@@ -7,7 +7,9 @@ const winston = require('winston');
 const crypto = require('crypto');
 require('dotenv').config();
 
-const DeltaClient = require('./client.js');
+// --- [CHANGED] Use Rust Native Client ---
+const { DeltaNativeClient } = require('fast-client');
+const DeltaClient = DeltaNativeClient; // Alias to keep existing code working
 
 // --- Configuration ---
 const config = {
@@ -63,9 +65,16 @@ class TradingBot {
     constructor(botConfig) {
         this.config = { ...botConfig };
         this.logger = logger;
-        this.client = new DeltaClient(this.config.apiKey, this.config.apiSecret, this.config.baseURL, this.logger);
+        
+        // Initialize Rust Client
+        this.client = new DeltaClient(
+            this.config.apiKey, 
+            this.config.apiSecret, 
+            this.config.baseURL
+        );
 
-        this.ws = null; this.authenticated = false;
+        this.ws = null; 
+        this.authenticated = false;
         this.isOrderInProgress = false;
 
         // [CRITICAL] Per-Asset Position Tracking
@@ -82,7 +91,8 @@ class TradingBot {
         });
 
         this.isStateSynced = false;
-        this.pingInterval = null; this.heartbeatTimeout = null;
+        this.pingInterval = null; 
+        this.heartbeatTimeout = null;
         this.restKeepAliveInterval = null;
 
         try {
@@ -109,18 +119,15 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v67.0 - Latency Analyzed) ---`);
+        this.logger.info(`--- Bot Initializing (v67.1 - Rust Native Client) ---`);
 
         // --- 1. WARM UP CONNECTION ---
         // Forces SSL handshake and DNS lookup before first trade
-        this.logger.info("🔥 Warming up HTTP Connection...");
+        this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
-            await Promise.all([
-                this.client.getWalletBalance(),
-                this.client.getWalletBalance(),
-                this.client.getWalletBalance()
-            ]);
-            this.logger.info("🔥 Connection Warmed. Socket is open.");
+            // Note: Rust client handles its own connection pooling, but this ensures DNS is resolved
+            await this.client.getWalletBalance();
+            this.logger.info("🔥 Connection Warmed. Native Socket is open.");
         } catch (e) {
             this.logger.warn("Warmup failed (non-fatal), continuing...");
         }
@@ -135,9 +142,11 @@ class TradingBot {
         if (this.restKeepAliveInterval) clearInterval(this.restKeepAliveInterval);
         this.restKeepAliveInterval = setInterval(async () => {
             try {
+                // Periodically fetch balance to keep Rust TCP pool active
                 await this.client.getWalletBalance();
             } catch (error) {
-                this.logger.warn(`[Keep-Alive] Check Failed: ${error.message}`);
+                // Rust errors come as strings usually, but we log safely
+                this.logger.warn(`[Keep-Alive] Check Failed: ${error}`);
             }
         }, 25000);
     }
@@ -211,7 +220,7 @@ class TradingBot {
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
             { name: 'all_trades', symbols: symbols },
-            // ✅ NEW: Subscribe to user_trades for latency tracking
+            // ✅ Subscribe to user_trades for latency tracking
             { name: 'user_trades', symbols: ['all'] } 
         ]}}));
     }
@@ -254,7 +263,6 @@ class TradingBot {
                 }
                 break;
             
-            // ✅ NEW CASE: Measure Latency from Execution Report
             case 'user_trades':
                 this.measureLatency(message);
                 break;
@@ -330,7 +338,7 @@ class TradingBot {
             this.isStateSynced = true;
             this.logger.info(`Position State Synced: ${JSON.stringify(this.activePositions)}`);
         } catch (error) {
-            this.logger.error('Failed to sync position state:', error.message);
+            this.logger.error(`Failed to sync position state: ${error}`);
         }
     }
 
@@ -401,4 +409,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-        
+                   
