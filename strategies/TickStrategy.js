@@ -46,7 +46,7 @@ class TickStrategy {
         this.ENTRY_Z = 2.5;          // 2.5 Sigma = 99% Confidence Interval
         this.EXIT_Z = 0.5;           // Hysteresis: Stay in until signal dies
         this.MIN_NOISE_FLOOR = 0.05; // Prevents division by zero in dead markets
-        this.WARMUP_TICKS = 50;      // Need 50 valid updates before trusting Z-Score
+        this.WARMUP_TICKS = 500;      // Need 50 valid updates before trusting Z-Score
 
         // --- MASTER CONFIGURATION ---
         // 'tickSize' is vital for the Normalized Decay to work across BTC & XRP.
