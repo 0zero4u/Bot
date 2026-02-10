@@ -1,5 +1,5 @@
 // trader.js
-// v66.0 - Latency Analyzed
+// v67.0 - Latency Analyzed + Connection Warmup
 // 
 
 const WebSocket = require('ws');
@@ -69,10 +69,9 @@ class TradingBot {
         this.isOrderInProgress = false;
 
         // [CRITICAL] Per-Asset Position Tracking
-        // Format: { 'BTC': true, 'XRP': false }
         this.activePositions = {};
 
-        // [NEW] Latency Analysis Storage (T0 Storage)
+        // [NEW] Latency Analysis Storage
         this.orderLatencies = new Map(); 
 
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
@@ -101,7 +100,7 @@ class TradingBot {
         // Record T0: The moment we decided to send
         this.orderLatencies.set(clientOrderId, Date.now());
         
-        // Auto-cleanup after 60s to prevent memory leaks
+        // Auto-cleanup after 60s
         setTimeout(() => {
             if (this.orderLatencies.has(clientOrderId)) {
                 this.orderLatencies.delete(clientOrderId);
@@ -110,7 +109,22 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v66.0 - Latency Analyzed) ---`);
+        this.logger.info(`--- Bot Initializing (v67.0 - Latency Analyzed) ---`);
+
+        // --- 1. WARM UP CONNECTION ---
+        // Forces SSL handshake and DNS lookup before first trade
+        this.logger.info("🔥 Warming up HTTP Connection...");
+        try {
+            await Promise.all([
+                this.client.getWalletBalance(),
+                this.client.getWalletBalance(),
+                this.client.getWalletBalance()
+            ]);
+            this.logger.info("🔥 Connection Warmed. Socket is open.");
+        } catch (e) {
+            this.logger.warn("Warmup failed (non-fatal), continuing...");
+        }
+
         await this.syncPositionState();
         await this.initWebSocket();
         this.setupHttpServer();
@@ -194,14 +208,11 @@ class TradingBot {
         this.logger.info(`Subscribing to Execution Channels: ${symbols.join(', ')}`);
 
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
-            // Track Orders (Fills) - Standard channel
             { name: 'orders', symbols: ['all'] },
-            // Track Positions (Open/Close State)
             { name: 'positions', symbols: ['all'] },
-            // Track Public Trades (Optional)
             { name: 'all_trades', symbols: symbols },
-            // [NEW] Private User Trades for Precision Latency Analysis
-            { name: 'user_trades', symbols: ['all'] }
+            // ✅ NEW: Subscribe to user_trades for latency tracking
+            { name: 'user_trades', symbols: ['all'] } 
         ]}}));
     }
 
@@ -234,17 +245,16 @@ class TradingBot {
             case 'orders':
                 if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
                 break;
-                
+
             case 'positions':
-                // Handle Position Updates (Array or Single Object)
                 if (Array.isArray(message.data)) {
                     message.data.forEach(pos => this.handlePositionUpdate(pos));
                 } else if (message.size !== undefined) {
                     this.handlePositionUpdate(message);
                 }
                 break;
-
-            // [NEW] Latency Analysis Channel
+            
+            // ✅ NEW CASE: Measure Latency from Execution Report
             case 'user_trades':
                 this.measureLatency(message);
                 break;
@@ -266,7 +276,7 @@ class TradingBot {
 
             let logMsg = `[LATENCY] ⚡ ${trade.symbol} | OID:${clientOid} | T0:${t0} | T1:${t1.toFixed(0)} | Delay: ${latency.toFixed(2)}ms`;
             
-            // Visual indicators for log scanning
+            // Visual indicators
             if (latency < 0) {
                 logMsg += " ⚠️ (Clock Drift Detected!)";
             } else if (latency < 60) {
@@ -286,15 +296,12 @@ class TradingBot {
 
     handlePositionUpdate(pos) {
         if (!pos.product_symbol) return;
-        
-        // Find which asset this update belongs to (e.g. BTCUSD -> BTC)
         const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
         
         if (asset) {
             const size = parseFloat(pos.size);
             const isOpen = size !== 0;
 
-            // Update State Map
             if (this.activePositions[asset] !== isOpen) {
                 this.activePositions[asset] = isOpen;
                 this.logger.info(`[POS UPDATE] ${asset} is now ${isOpen ? 'OPEN' : 'CLOSED'} (Size: ${size})`);
@@ -307,10 +314,8 @@ class TradingBot {
             const response = await this.client.getPositions();
             const positions = response.result || [];
             
-            // 1. Reset all to Closed
             this.targetAssets.forEach(a => this.activePositions[a] = false);
 
-            // 2. Mark Open ones
             positions.forEach(pos => {
                 const size = parseFloat(pos.size);
                 if (size !== 0) {
@@ -329,14 +334,10 @@ class TradingBot {
         }
     }
 
-    /**
-     * Helper: Checks if we have an open position for a specific asset.
-     */
     hasOpenPosition(symbol) {
         if (symbol) {
             return this.activePositions[symbol] === true;
         }
-        // Fallback: Check if ANY position is open
         return Object.values(this.activePositions).some(status => status === true);
     }
 
@@ -347,27 +348,19 @@ class TradingBot {
         try {
             const data = JSON.parse(message.toString());
             
-            // [PAYLOAD ADAPTER] BINANCE LOW-LATENCY FEED
-            // Comes from market_listener.js (Type 'B')
             if (data.type === 'B') {
-                const asset = data.s; // e.g. 'BTC'
-                
-                // 1. Check if this is a target asset
+                const asset = data.s;
                 if (!this.targetAssets.includes(asset)) return;
 
-                // 2. Format for MicroStrategy
-                // { bids: [[Price, Vol]], asks: [[Price, Vol]] }
                 const depthPayload = {
                     bids: [[ data.bb, data.bq ]], 
                     asks: [[ data.ba, data.aq ]]  
                 };
 
-                // 3. Inject into Strategy
                 if (this.strategy.onDepthUpdate) {
                     await this.strategy.onDepthUpdate(asset, depthPayload);
                 }
             }
-            
         } catch (error) {
             this.logger.error("Error handling signal message:", error);
         }
@@ -408,4 +401,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-            
+        
