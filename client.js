@@ -1,3 +1,4 @@
+
 const got = require('got');
 const crypto = require('crypto');
 const https = require('https');
@@ -32,7 +33,7 @@ class DeltaClient {
             maxFreeSockets: 16,
             scheduling: 'lifo',
             timeout: 15000,
-            // 🔥 CRITICAL FIX: Force IPv4 to prevent 800ms delay
+            // 🔥 IPv4 Force to fix 800ms latency
             lookup: (hostname, options, callback) => {
                 options.family = 4;
                 dns.lookup(hostname, options, callback);
@@ -65,7 +66,11 @@ class DeltaClient {
         const timestamp = Math.floor(Date.now() / 1000).toString();
         const bodyStr = payload ? JSON.stringify(payload) : '';
         
-        let signatureData = method + timestamp + endpoint;
+        // Note: We must add the leading slash BACK for the signature calculation
+        // because Delta expects it in the signature string (e.g., POST.../v2/orders...)
+        const signatureEndpoint = endpoint.startsWith('/') ? endpoint : '/' + endpoint;
+
+        let signatureData = method + timestamp + signatureEndpoint;
         if (Object.keys(qs).length > 0) {
             signatureData += '?' + new URLSearchParams(qs).toString();
         }
@@ -93,15 +98,13 @@ class DeltaClient {
         }
 
         try {
+            // Send request WITHOUT the leading slash (required by 'got' prefixUrl)
             const response = await this.#client(endpoint, options);
             
-            // Attach timing metrics if available
             if (response.body && typeof response.body === 'object') {
                 const timings = response.timings || {};
                 Object.defineProperty(response.body, '_metrics', {
-                    value: {
-                        total: timings.phases?.total || 0
-                    },
+                    value: { total: timings.phases?.total || 0 },
                     enumerable: false
                 });
             }
@@ -120,11 +123,12 @@ class DeltaClient {
         }
     }
 
-    placeOrder(payload) { return this.#request('POST', '/v2/orders', payload); }
-    getPositions() { return this.#request('GET', '/v2/positions/margined'); }
-    getLiveOrders(productId, opts = {}) { return this.#request('GET', '/v2/orders', null, {}); }
-    getWalletBalance() { return this.#request('GET', '/v2/wallet/balances'); }
+    // ✅ FIXED: Removed leading slashes from these calls
+    placeOrder(payload) { return this.#request('POST', 'v2/orders', payload); }
+    getPositions() { return this.#request('GET', 'v2/positions/margined'); }
+    getLiveOrders(productId, opts = {}) { return this.#request('GET', 'v2/orders', null, {}); }
+    getWalletBalance() { return this.#request('GET', 'v2/wallet/balances'); }
 }
 
 module.exports = DeltaClient;
-    
+                   
