@@ -148,7 +148,7 @@ class TradingBot {
                 // Rust errors come as strings usually, but we log safely
                 this.logger.warn(`[Keep-Alive] Check Failed: ${error}`);
             }
-        }, 25000);
+        }, 29000);
     }
 
     // --- WebSocket Heartbeat ---
