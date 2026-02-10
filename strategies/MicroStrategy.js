@@ -81,7 +81,7 @@ class MicroStrategyContinuation {
         asset.priceHistory.push({ price: midPrice, time: now });
         while (
             asset.priceHistory.length > 2 &&
-            now - asset.priceHistory[0].time > this.SPIKE_WINDOW_MS + 200
+            now - asset.priceHistory[0].time > this.SPIKE_WINDOW_MS + 1
         ) {
             asset.priceHistory.shift();
         }
