@@ -4,10 +4,12 @@
  * Strategy: Volume-Weighted Microprice (VWM)
  * with Directional Velocity Gating & Server-Side Trailing Stop.
  *
- * ADDITIONAL SAFETY (NO LATENCY ADDED):
- * - Require velocity to be DECELERATING (pressure exhaustion)
- * - Require spread stability (no panic liquidity pull)
- * - Require L1 liquidity persistence (anti-spoof)
+ * CORE LOGIC:
+ * 1. Normalized Liquidity: Filters out "dust" (requires ~$2000 USDT on L1).
+ * 2. Velocity Gate: Requires price impulse in ~30ms.
+ * 3. Microprice Imbalance: Detects liquidity pressure.
+ * 4. Directional Confluence: Trades ONLY if pressure is failing.
+ * 5. Execution: Market IOC with Server-Side Trailing Stop.
  */
 
 class MicroStrategy {
@@ -15,16 +17,19 @@ class MicroStrategy {
         this.bot = bot;
         this.logger = bot.logger;
 
+        // --- CONFIGURATION ---
         this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.75');
         this.MIN_NOTIONAL_VALUE = parseFloat(process.env.MIN_NOTIONAL || '2000');
         this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.02');
         this.COOLDOWN_MS = 2000;
 
+        // --- VELOCITY CONFIG ---
         this.SPIKE_PERCENT = 0.00017;   // 0.017%
         this.SPIKE_WINDOW_MS = 30;
 
         this.assets = {};
 
+        // Delta Exchange Specs
         this.specs = {
             'BTC': { deltaId: 27,    precision: 1, lot: 0.001 },
             'ETH': { deltaId: 299,   precision: 2, lot: 0.01 },
@@ -46,22 +51,32 @@ class MicroStrategy {
         });
     }
 
+    // ✅ REQUIRED BY LOADER (DO NOT REMOVE)
+    getName() {
+        return `MicroStrategy (VWM + Vel + ${this.TRAILING_PERCENT}% Server-Trail)`;
+    }
+
+    /**
+     * Runs on every order book update
+     */
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
-        if (!asset || !depth.bids[0] || !depth.asks[0]) return;
+        if (!asset) return;
+        if (!depth.bids[0] || !depth.asks[0]) return;
 
         const now = Date.now();
 
-        const Pb = +depth.bids[0][0];
-        const Vb = +depth.bids[0][1];
-        const Pa = +depth.asks[0][0];
-        const Va = +depth.asks[0][1];
+        // --- L1 Data ---
+        const Pb = parseFloat(depth.bids[0][0]);
+        const Vb = parseFloat(depth.bids[0][1]);
+        const Pa = parseFloat(depth.asks[0][0]);
+        const Va = parseFloat(depth.asks[0][1]);
 
         const midPrice = (Pa + Pb) / 2;
         const totalNotional = (Vb * Pb) + (Va * Pa);
         if (totalNotional < this.MIN_NOTIONAL_VALUE) return;
 
-        // --- Velocity buffer ---
+        // --- Velocity Buffer ---
         asset.priceHistory.push({ price: midPrice, time: now });
         while (
             asset.priceHistory.length > 2 &&
@@ -70,7 +85,7 @@ class MicroStrategy {
             asset.priceHistory.shift();
         }
 
-        // Time-correct baseline
+        // Time-aligned baseline
         let baselineTick = null;
         for (let i = asset.priceHistory.length - 1; i >= 0; i--) {
             if (now - asset.priceHistory[i].time >= this.SPIKE_WINDOW_MS) {
@@ -87,11 +102,10 @@ class MicroStrategy {
         const isVelocityUp = signedChange > 0;
         const isVelocityDown = signedChange < 0;
 
-        // --- FIX #1: Velocity must be DECELERATING ---
+        // --- Anti-Trap #1: Velocity MUST be decelerating ---
         if (asset.prevVelocity !== null) {
             if (absChange >= Math.abs(asset.prevVelocity)) return;
         }
-
         asset.prevVelocity = signedChange;
 
         // --- Microprice ---
@@ -99,13 +113,13 @@ class MicroStrategy {
         const halfSpread = (Pa - Pb) / 2;
         if (halfSpread <= 1e-8) return;
 
-        // --- FIX #2: Spread stability (no panic pull) ---
+        // --- Anti-Trap #2: Spread must be stable ---
         if (asset.prevHalfSpread !== null) {
             if (halfSpread > asset.prevHalfSpread * 1.05) return;
         }
         asset.prevHalfSpread = halfSpread;
 
-        // --- FIX #3: Liquidity persistence (anti-spoof) ---
+        // --- Anti-Trap #3: Liquidity persistence ---
         if (asset.prevBidVol !== null && asset.prevAskVol !== null) {
             if (Vb < asset.prevBidVol * 0.8 && Va < asset.prevAskVol * 0.8) return;
         }
@@ -135,6 +149,9 @@ class MicroStrategy {
         }
     }
 
+    /**
+     * Execution Logic
+     */
     async executeTrade(symbol, side, bestAsk, bestBid) {
         this.bot.isOrderInProgress = true;
         try {
@@ -150,7 +167,7 @@ class MicroStrategy {
             const payload = {
                 product_id: spec.deltaId.toString(),
                 size: process.env.ORDER_SIZE || "1",
-                side,
+                side: side,
                 order_type: 'market_order',
                 limit_price: entryPrice.toFixed(spec.precision),
                 bracket_trail_amount: signedTrailAmount.toFixed(spec.precision),
@@ -158,6 +175,10 @@ class MicroStrategy {
             };
 
             await this.bot.placeOrder(payload);
+
+            this.logger.info(
+                `[EXEC] ${symbol} ${side} @ ${entryPrice} | Trail:${signedTrailAmount.toFixed(spec.precision)}`
+            );
         } catch (e) {
             this.logger.error(`[EXEC_FAIL] ${e.message}`);
         } finally {
@@ -167,4 +188,4 @@ class MicroStrategy {
 }
 
 module.exports = MicroStrategy;
-                
+            
