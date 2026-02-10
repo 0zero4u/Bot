@@ -197,7 +197,7 @@ class MicroStrategy {
                 // The exchange engine automatically adjusts the stop price.
                 bracket_trail_amount: signedTrailAmount.toFixed(spec.precision),
                 bracket_stop_trigger_method: 'mark_price',
-                reduce_only: true
+                
             };
 
             // E. Send Order
