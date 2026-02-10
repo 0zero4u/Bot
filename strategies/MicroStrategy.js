@@ -188,7 +188,7 @@ class MicroStrategy {
                 product_id: spec.deltaId.toString(),
                 size: size,
                 side: side,
-                order_type: 'limit_order',
+                order_type: 'market_order',
                 time_in_force: 'ioc', // Immediate or Cancel
                 limit_price: entryPrice.toFixed(spec.precision),
                 
