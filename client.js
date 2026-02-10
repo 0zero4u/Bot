@@ -40,7 +40,7 @@ class DeltaClient {
         this.#heartbeatTimer = setInterval(() => {
             // Silently fetch balance to keep socket hot
             this.getWalletBalance().catch(() => {}); 
-        }, 3000); 
+        }, 30000); 
     }
 
     async #request(method, endpoint, payload = null, qs = {}) {
