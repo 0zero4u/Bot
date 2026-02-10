@@ -1,10 +1,11 @@
 /**
  * TickStrategy.js
- * v5.0 [HYBRID] - Deep Fusion & Momentum Gating
+ * v5.2 [HYBRID] - Deep Fusion & Momentum Gating + Heartbeat
  * * CORE LOGIC:
- * 1. WEIGHTING: Uses Inverse Distance Weighting (from OrderBookPressure) to filter deep spoofs.
- * 2. SIGNAL: Uses Welford's Online Algorithm to track Z-Score (StdDev) of the Order Book Imbalance.
+ * 1. WEIGHTING: Uses Inverse Distance Weighting (IDW) to filter deep spoofs.
+ * 2. SIGNAL: Uses Welford's Online Algorithm to track Z-Score (StdDev) of Order Book Imbalance.
  * 3. EXECUTION: Enters on High Z-Score ONLY if Momentum is increasing (Zero-Latency Gate).
+ * 4. MONITORING: Logs a heartbeat every 4s to confirm strategy is alive.
  */
 
 class TickStrategy {
@@ -13,15 +14,15 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- STRATEGY PARAMETERS ---
-        this.ENTRY_Z = 4.0;         // Z-score trigger to enter Active Regime
-        this.EXIT_Z = 2.0;          // Z-score hysteresis to return to Idle
+        this.ENTRY_Z = 4.0;          // Z-score trigger to enter Active Regime
+        this.EXIT_Z = 2.0;           // Z-score hysteresis to return to Idle
         this.MIN_NOISE_FLOOR = 0.05; // Prevents Z-score explosion in flat markets
-        this.WARMUP_TICKS = 100;    // Minimum samples before trading
+        this.WARMUP_TICKS = 100;     // Minimum samples before trading
         
         // --- DISTANCE WEIGHTING PARAMS (From OrderBookPressure) ---
         // Formula: w = 1 / (GAMMA * distance + BETA)
-        this.GAMMA = 100;           // High gamma = heavily penalizes distance
-        this.BETA = 1;              // Base weight
+        this.GAMMA = 100;            // High gamma = heavily penalizes distance
+        this.BETA = 1;               // Base weight
 
         // --- ASSET STATE ---
         this.assets = {};
@@ -36,10 +37,12 @@ class TickStrategy {
                 obiCount: 0,
                 
                 // Regime & Signal State
-                currentRegime: 0, 
+                currentRegime: 0, // 0=IDLE, 1=ACTIVE
                 lastPrice: 0,
-                lastZ: 0,   // NEW: Tracks previous tick's Z-score for Momentum Gating
-                isOrderInProgress: false
+                lastZ: 0,   // Tracks previous tick's Z-score for Momentum Gating
+                
+                // Logging State
+                lastLogTime: 0 // Track last heartbeat time
             };
         });
     }
@@ -111,6 +114,14 @@ class TickStrategy {
         // Apply Noise Floor: prevents dividing by a near-zero stdDev
         const effectiveStdDev = Math.max(stdDev, this.MIN_NOISE_FLOOR);
         const zScore = (currentDeepOBI - asset.obiMean) / effectiveStdDev;
+
+        // --- HEARTBEAT LOG (Every 4s) ---
+        const now = Date.now();
+        if (now - asset.lastLogTime > 4000) {
+            const regimeStr = asset.currentRegime === 1 ? 'ACTIVE' : 'IDLE';
+            this.logger.info(`[HEARTBEAT] ${symbol} | Z: ${zScore.toFixed(2)} | Price: ${midPrice.toFixed(2)} | Regime: ${regimeStr}`);
+            asset.lastLogTime = now;
+        }
 
         // 6. Regime Logic with Momentum Gating
         // Pass the current Z AND the previous Z (stored in asset.lastZ)
