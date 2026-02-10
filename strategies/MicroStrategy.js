@@ -189,14 +189,15 @@ class MicroStrategy {
                 size: size,
                 side: side,
                 order_type: 'market_order',
-                time_in_force: 'ioc', // Immediate or Cancel
+                
                 limit_price: entryPrice.toFixed(spec.precision),
                 
                 // --- SERVER-SIDE TRAILING STOP ---
                 // "bracket_trail_amount": The signed distance (e.g., -0.05 for buy, 0.05 for sell).
                 // The exchange engine automatically adjusts the stop price.
                 bracket_trail_amount: signedTrailAmount.toFixed(spec.precision),
-                bracket_stop_trigger_method: 'mark_price'
+                bracket_stop_trigger_method: 'mark_price',
+                reduce_only: true
             };
 
             // E. Send Order
