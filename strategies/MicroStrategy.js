@@ -1,19 +1,19 @@
-
 /**
- * MicroStrategy.js
+ * MicroStrategyContinuation.js
  *
  * Strategy: Volume-Weighted Microprice (VWM)
- * with Directional Velocity Gating & Server-Side Trailing Stop.
+ * with Directional Velocity Confirmation & Server-Side Trailing Stop.
  *
  * CORE LOGIC:
- * 1. Normalized Liquidity: Filters out "dust" (requires ~$2000 USDT on L1).
- * 2. Velocity Gate: Requires price impulse in ~30ms.
- * 3. Microprice Imbalance: Detects liquidity pressure.
- * 4. Directional Confluence: Trades ONLY if pressure is failing.
- * 5. Execution: Market IOC with Server-Side Trailing Stop.
+ * 1. Normalized Liquidity (filters dust)
+ * 2. Velocity MUST be increasing
+ * 3. Microprice confirms dominance
+ * 4. Spread stable or tightening
+ * 5. Abort immediately if pressure shows failure
+ * 6. Market IOC with Server-Side Trailing Stop
  */
 
-class MicroStrategy {
+class MicroStrategyContinuation {
     constructor(bot) {
         this.bot = bot;
         this.logger = bot.logger;
@@ -21,7 +21,7 @@ class MicroStrategy {
         // --- CONFIGURATION ---
         this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.60');
         this.MIN_NOTIONAL_VALUE = parseFloat(process.env.MIN_NOTIONAL || '2000');
-        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.02');
+        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.05'); // wider for continuation
         this.COOLDOWN_MS = 2000;
 
         // --- VELOCITY CONFIG ---
@@ -52,9 +52,9 @@ class MicroStrategy {
         });
     }
 
-    // ✅ REQUIRED BY LOADER (DO NOT REMOVE)
+    // REQUIRED BY LOADER
     getName() {
-        return `MicroStrategy (VWM + Vel + ${this.TRAILING_PERCENT}% Server-Trail)`;
+        return `MicroStrategy (VWM + Continuation + ${this.TRAILING_PERCENT}% Server-Trail)`;
     }
 
     /**
@@ -86,7 +86,7 @@ class MicroStrategy {
             asset.priceHistory.shift();
         }
 
-        // Time-aligned baseline
+        // Baseline aligned to window
         let baselineTick = null;
         for (let i = asset.priceHistory.length - 1; i >= 0; i--) {
             if (now - asset.priceHistory[i].time >= this.SPIKE_WINDOW_MS) {
@@ -103,9 +103,9 @@ class MicroStrategy {
         const isVelocityUp = signedChange > 0;
         const isVelocityDown = signedChange < 0;
 
-        // --- Anti-Trap #1: Velocity MUST be decelerating ---
+        // --- Velocity MUST be increasing ---
         if (asset.prevVelocity !== null) {
-            if (absChange >= Math.abs(asset.prevVelocity)) return;
+            if (absChange <= Math.abs(asset.prevVelocity)) return;
         }
         asset.prevVelocity = signedChange;
 
@@ -114,36 +114,50 @@ class MicroStrategy {
         const halfSpread = (Pa - Pb) / 2;
         if (halfSpread <= 1e-8) return;
 
-        // --- Anti-Trap #2: Spread must be stable ---
+        // --- Spread must be stable or tightening ---
         if (asset.prevHalfSpread !== null) {
-            if (halfSpread > asset.prevHalfSpread * 1.05) return;
+            if (halfSpread > asset.prevHalfSpread * 1.02) return;
         }
         asset.prevHalfSpread = halfSpread;
 
-        // --- Anti-Trap #3: Liquidity persistence ---
-        if (asset.prevBidVol !== null && asset.prevAskVol !== null) {
-            if (Vb < asset.prevBidVol * 0.8 && Va < asset.prevAskVol * 0.8) return;
-        }
-        asset.prevBidVol = Vb;
-        asset.prevAskVol = Va;
-
+        // --- Signal Strength ---
         const signalStrength = (microPrice - midPrice) / halfSpread;
+
+        // --- Pressure failure kill-switch ---
+        const pressureFailing =
+            (isVelocityUp && signalStrength < 0) ||
+            (isVelocityDown && signalStrength > 0);
+
+        if (pressureFailing) return;
+
         let side = null;
 
+        // --- Directional Liquidity Persistence ---
         if (signalStrength > this.TRIGGER_THRESHOLD && isVelocityUp) {
+            if (asset.prevBidVol !== null && Vb < asset.prevBidVol * 0.9) return;
             side = 'buy';
-        } else if (signalStrength < -this.TRIGGER_THRESHOLD && isVelocityDown) {
+        }
+
+        if (signalStrength < -this.TRIGGER_THRESHOLD && isVelocityDown) {
+            if (asset.prevAskVol !== null && Va < asset.prevAskVol * 0.9) return;
             side = 'sell';
         }
 
+        asset.prevBidVol = Vb;
+        asset.prevAskVol = Va;
+
         if (now - asset.lastLogTime > 5000) {
             this.logger.info(
-                `[MICRO] ${symbol} | Vel:${(signedChange * 100).toFixed(4)}% | Sig:${signalStrength.toFixed(2)}`
+                `[CONT] ${symbol} | Vel:${(signedChange * 100).toFixed(4)}% | Sig:${signalStrength.toFixed(2)}`
             );
             asset.lastLogTime = now;
         }
 
-        if (side && !this.bot.hasOpenPosition(symbol) && !this.bot.isOrderInProgress) {
+        if (
+            side &&
+            !this.bot.hasOpenPosition(symbol) &&
+            !this.bot.isOrderInProgress
+        ) {
             if (now - asset.lastTriggerTime < this.COOLDOWN_MS) return;
             asset.lastTriggerTime = now;
             await this.executeTrade(symbol, side, Pa, Pb);
@@ -151,7 +165,7 @@ class MicroStrategy {
     }
 
     /**
-     * Execution Logic (Updated for Latency Tracking)
+     * Execution Logic
      */
     async executeTrade(symbol, side, bestAsk, bestBid) {
         this.bot.isOrderInProgress = true;
@@ -163,16 +177,11 @@ class MicroStrategy {
             const tickSize = 1 / Math.pow(10, spec.precision);
             if (trailDistance < tickSize) trailDistance = tickSize;
 
-            let signedTrailAmount = side === 'buy' ? -trailDistance : trailDistance;
+            const signedTrailAmount =
+                side === 'buy' ? -trailDistance : trailDistance;
 
-            // --- LATENCY TRACKING: START ---
-            // 1. Generate Unique Client Order ID
-            const clientOid = `m_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-
-            // 2. Record "Punch Time" (T0) immediately
-            // This stores Date.now() in the bot's memory map
+            const clientOid = `c_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
             this.bot.recordOrderPunch(clientOid);
-            // --- LATENCY TRACKING: END ---
 
             const payload = {
                 product_id: spec.deltaId.toString(),
@@ -182,13 +191,13 @@ class MicroStrategy {
                 limit_price: entryPrice.toFixed(spec.precision),
                 bracket_trail_amount: signedTrailAmount.toFixed(spec.precision),
                 bracket_stop_trigger_method: 'mark_price',
-                client_order_id: clientOid  // <--- ATTACH ID HERE
+                client_order_id: clientOid
             };
 
             await this.bot.placeOrder(payload);
 
             this.logger.info(
-                `[EXEC] ${symbol} ${side} @ ${entryPrice} | Trail:${signedTrailAmount.toFixed(spec.precision)} | OID:${clientOid}`
+                `[EXEC_CONT] ${symbol} ${side} @ ${entryPrice} | Trail:${signedTrailAmount.toFixed(spec.precision)} | OID:${clientOid}`
             );
         } catch (e) {
             this.logger.error(`[EXEC_FAIL] ${e.message}`);
@@ -198,5 +207,5 @@ class MicroStrategy {
     }
 }
 
-module.exports = MicroStrategy;
-            
+module.exports = MicroStrategyContinuation;
+        
