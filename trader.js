@@ -1,5 +1,5 @@
 // trader.js
-// v65.0 - 
+// v66.0 - Latency Analyzed
 // 
 
 const WebSocket = require('ws');
@@ -72,6 +72,9 @@ class TradingBot {
         // Format: { 'BTC': true, 'XRP': false }
         this.activePositions = {};
 
+        // [NEW] Latency Analysis Storage (T0 Storage)
+        this.orderLatencies = new Map(); 
+
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         
         // Initialize State
@@ -93,8 +96,21 @@ class TradingBot {
         }
     }
 
+    // --- [NEW] Latency Helper ---
+    recordOrderPunch(clientOrderId) {
+        // Record T0: The moment we decided to send
+        this.orderLatencies.set(clientOrderId, Date.now());
+        
+        // Auto-cleanup after 60s to prevent memory leaks
+        setTimeout(() => {
+            if (this.orderLatencies.has(clientOrderId)) {
+                this.orderLatencies.delete(clientOrderId);
+            }
+        }, 60000);
+    }
+
     async start() {
-        this.logger.info(`--- Bot Initializing (v65.0 - Micro Production) ---`);
+        this.logger.info(`--- Bot Initializing (v66.0 - Latency Analyzed) ---`);
         await this.syncPositionState();
         await this.initWebSocket();
         this.setupHttpServer();
@@ -178,12 +194,14 @@ class TradingBot {
         this.logger.info(`Subscribing to Execution Channels: ${symbols.join(', ')}`);
 
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
-            // Track Orders (Fills)
+            // Track Orders (Fills) - Standard channel
             { name: 'orders', symbols: ['all'] },
             // Track Positions (Open/Close State)
             { name: 'positions', symbols: ['all'] },
             // Track Public Trades (Optional)
-            { name: 'all_trades', symbols: symbols }
+            { name: 'all_trades', symbols: symbols },
+            // [NEW] Private User Trades for Precision Latency Analysis
+            { name: 'user_trades', symbols: ['all'] }
         ]}}));
     }
 
@@ -225,6 +243,42 @@ class TradingBot {
                     this.handlePositionUpdate(message);
                 }
                 break;
+
+            // [NEW] Latency Analysis Channel
+            case 'user_trades':
+                this.measureLatency(message);
+                break;
+        }
+    }
+
+    // --- [NEW] Latency Calculation Logic ---
+    measureLatency(trade) {
+        const clientOid = trade.client_order_id;
+        
+        // Only track if it's OUR order
+        if (clientOid && this.orderLatencies.has(clientOid)) {
+            const t0 = this.orderLatencies.get(clientOid); // Punch Time (Local)
+            
+            // Delta timestamp is in MICROSECONDS. Convert to Milliseconds.
+            const t1 = parseInt(trade.timestamp) / 1000;   // Engine Time (Exchange)
+            
+            const latency = t1 - t0;
+
+            let logMsg = `[LATENCY] ⚡ ${trade.symbol} | OID:${clientOid} | T0:${t0} | T1:${t1.toFixed(0)} | Delay: ${latency.toFixed(2)}ms`;
+            
+            // Visual indicators for log scanning
+            if (latency < 0) {
+                logMsg += " ⚠️ (Clock Drift Detected!)";
+            } else if (latency < 60) {
+                logMsg += " 🚀 (Fast)";
+            } else if (latency > 250) {
+                logMsg += " 🐢 (Slow)";
+            }
+
+            this.logger.info(logMsg);
+            
+            // Cleanup
+            this.orderLatencies.delete(clientOid);
         }
     }
 
@@ -354,3 +408,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
+            
