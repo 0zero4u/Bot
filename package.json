@@ -24,7 +24,8 @@
     "pm2": "^5.4.1",
     "uuid": "^9.0.1",
     "ws": "^8.18.0",
-    "winston": "^3.11.0"
+    "winston": "^3.11.0",
+    "fast-client": "file:./fast-client"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
