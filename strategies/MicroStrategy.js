@@ -18,7 +18,7 @@ class MicroStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.75');
+        this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.60');
         this.MIN_NOTIONAL_VALUE = parseFloat(process.env.MIN_NOTIONAL || '2000');
         this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.02');
         this.COOLDOWN_MS = 2000;
