@@ -1,3 +1,4 @@
+
 /**
  * MicroStrategy.js
  *
@@ -150,7 +151,7 @@ class MicroStrategy {
     }
 
     /**
-     * Execution Logic
+     * Execution Logic (Updated for Latency Tracking)
      */
     async executeTrade(symbol, side, bestAsk, bestBid) {
         this.bot.isOrderInProgress = true;
@@ -164,6 +165,15 @@ class MicroStrategy {
 
             let signedTrailAmount = side === 'buy' ? -trailDistance : trailDistance;
 
+            // --- LATENCY TRACKING: START ---
+            // 1. Generate Unique Client Order ID
+            const clientOid = `m_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+
+            // 2. Record "Punch Time" (T0) immediately
+            // This stores Date.now() in the bot's memory map
+            this.bot.recordOrderPunch(clientOid);
+            // --- LATENCY TRACKING: END ---
+
             const payload = {
                 product_id: spec.deltaId.toString(),
                 size: process.env.ORDER_SIZE || "1",
@@ -171,13 +181,14 @@ class MicroStrategy {
                 order_type: 'market_order',
                 limit_price: entryPrice.toFixed(spec.precision),
                 bracket_trail_amount: signedTrailAmount.toFixed(spec.precision),
-                bracket_stop_trigger_method: 'mark_price'
+                bracket_stop_trigger_method: 'mark_price',
+                client_order_id: clientOid  // <--- ATTACH ID HERE
             };
 
             await this.bot.placeOrder(payload);
 
             this.logger.info(
-                `[EXEC] ${symbol} ${side} @ ${entryPrice} | Trail:${signedTrailAmount.toFixed(spec.precision)}`
+                `[EXEC] ${symbol} ${side} @ ${entryPrice} | Trail:${signedTrailAmount.toFixed(spec.precision)} | OID:${clientOid}`
             );
         } catch (e) {
             this.logger.error(`[EXEC_FAIL] ${e.message}`);
