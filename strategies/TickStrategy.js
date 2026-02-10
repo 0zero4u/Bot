@@ -1,6 +1,6 @@
 /**
  * TickStrategy.js
- * v5.3 [FIXED] - Added 'execute' Router for Trader.js Compatibility
+ * v5.4 [FIXED] - Uses MidPrice for Execution + Router
  */
 
 class TickStrategy {
@@ -9,8 +9,10 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- STRATEGY PARAMETERS ---
-        this.ENTRY_Z = 4.0;          
-        this.EXIT_Z = 2.0;           
+        // [NOTE] Lowered to 1.5 so you can actually see it trade during testing.
+        // Revert to 4.0 later if you want it to be very conservative.
+        this.ENTRY_Z = 1.5;          
+        this.EXIT_Z = 0.5;           
         this.MIN_NOISE_FLOOR = 0.05; 
         this.WARMUP_TICKS = 100;     
         
@@ -29,7 +31,7 @@ class TickStrategy {
                 obiM2: 0,
                 obiCount: 0,
                 currentRegime: 0, // 0=IDLE, 1=ACTIVE
-                lastPrice: 0,
+                midPrice: 0,      // [NEW] Storing OrderBook MidPrice
                 lastZ: 0,   
                 lastLogTime: 0 
             };
@@ -37,8 +39,7 @@ class TickStrategy {
     }
 
     /**
-     * [CRITICAL FIX] Router method required by trader.js
-     * This bridges the gap between market_listener and the strategy logic.
+     * Router method required by trader.js
      */
     async execute(data) {
         if (!data || !data.type) return;
@@ -46,17 +47,13 @@ class TickStrategy {
         try {
             if (data.type === 'depthUpdate') {
                 await this.onDepthUpdate(data.s, data);
-            } else if (data.type === 'trade') {
-                await this.onTradeUpdate(data.s, data);
-            }
+            } 
+            // We ignore 'trade' updates for pricing now, purely using depth
         } catch (e) {
             this.logger.error(`[STRATEGY] Execution Error: ${e.message}`);
         }
     }
 
-    /**
-     * Calculates volume weighted by DISTANCE from mid-price.
-     */
     calcWeightedVol(levels, midPrice) {
         let weightedTotal = 0;
         const limit = Math.min(levels.length, 10); 
@@ -79,7 +76,6 @@ class TickStrategy {
         const asset = this.assets[symbol];
         if (!asset) return;
 
-        // 0. Validation
         if (!depth.bids || !depth.asks || depth.bids.length === 0 || depth.asks.length === 0) return;
         
         const bestBid = parseFloat(depth.bids[0][0]);
@@ -87,6 +83,9 @@ class TickStrategy {
         const midPrice = (bestBid + bestAsk) / 2;
 
         if (!midPrice || bestBid >= bestAsk) return; 
+
+        // [CRITICAL] Store MidPrice for execution
+        asset.midPrice = midPrice;
 
         // 1. Fusion Logic
         const wBidVol = this.calcWeightedVol(depth.bids, midPrice);
@@ -104,27 +103,23 @@ class TickStrategy {
         const delta2 = currentDeepOBI - asset.obiMean;
         asset.obiM2 += delta * delta2;
 
-        // 4. Warmup Check
         if (asset.obiCount < this.WARMUP_TICKS) return;
 
-        // 5. Z-Score
+        // 4. Z-Score
         const variance = asset.obiM2 / (asset.obiCount - 1);
         const stdDev = Math.sqrt(variance);
         const effectiveStdDev = Math.max(stdDev, this.MIN_NOISE_FLOOR);
         const zScore = (currentDeepOBI - asset.obiMean) / effectiveStdDev;
 
-        // --- HEARTBEAT LOG ---
+        // Heartbeat
         const now = Date.now();
         if (now - asset.lastLogTime > 4000) {
             const regimeStr = asset.currentRegime === 1 ? 'ACTIVE' : 'IDLE';
-            this.logger.info(`[HEARTBEAT] ${symbol} | Z: ${zScore.toFixed(2)} | Price: ${midPrice.toFixed(2)} | Regime: ${regimeStr}`);
+            this.logger.info(`[HEARTBEAT] ${symbol} | Z: ${zScore.toFixed(2)} | MidPrice: ${midPrice.toFixed(2)} | Regime: ${regimeStr}`);
             asset.lastLogTime = now;
         }
 
-        // 6. Regime Logic
         this.handleRegimeShift(symbol, zScore, asset.lastZ);
-
-        // 7. Store State
         asset.lastZ = zScore; 
     }
 
@@ -139,7 +134,7 @@ class TickStrategy {
 
                 asset.currentRegime = 1;
                 const side = zScore > 0 ? 'buy' : 'sell';
-                this.logger.info(`[REGIME_CHANGE] IDLE -> ACTIVE | Z: ${zScore.toFixed(2)} (Growing) | Side: ${side}`);
+                this.logger.info(`[REGIME_CHANGE] IDLE -> ACTIVE | Z: ${zScore.toFixed(2)} | Side: ${side}`);
                 this.executeTrade(symbol, side, zScore);
             }
         } else {
@@ -148,11 +143,6 @@ class TickStrategy {
                 this.logger.info(`[REGIME_CHANGE] ACTIVE -> IDLE | Z: ${zScore.toFixed(2)}`);
             }
         }
-    }
-
-    async onTradeUpdate(symbol, trade) {
-        const asset = this.assets[symbol];
-        if (asset) asset.lastPrice = parseFloat(trade.p);
     }
 
     async executeTrade(symbol, side, score) {
@@ -168,12 +158,16 @@ class TickStrategy {
         try {
             const spec = this.specs[symbol];
             if(!spec) {
-                 // Fetch spec lazily if missing, or default to 3 decimals for XRP
                  this.specs[symbol] = { deltaId: process.env.DELTA_PRODUCT_ID, precision: 3 }; 
             }
             
-            const price = asset.lastPrice;
-            if (!price) return;
+            // [FIXED] Use cached MidPrice from Order Book
+            const price = asset.midPrice;
+            
+            if (!price) {
+                this.logger.warn(`[SKIP] Signal high but no MidPrice for ${symbol}`);
+                return;
+            }
 
             const limitPrice = side === 'buy' ? price * 1.0005 : price * 0.9995;
             
@@ -191,7 +185,7 @@ class TickStrategy {
                 bracket_stop_trigger_method: 'mark_price'
             });
 
-            this.logger.info(`[EXECUTE] ${side.toUpperCase()} ${symbol} | Z: ${score.toFixed(2)} | Price: ${price}`);
+            this.logger.info(`[EXECUTE] ${side.toUpperCase()} ${symbol} | Z: ${score.toFixed(2)} | MidPrice: ${price}`);
         } catch (e) {
             this.logger.error(`[EXEC_ERROR] ${symbol}: ${e.message}`);
         }
@@ -199,4 +193,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-            
+                
