@@ -13,7 +13,7 @@
  * 6. Market IOC with Server-Side Trailing Stop
  */
 
-class MicroStrategyContinuation {
+class MicroStrategy {
     constructor(bot) {
         this.bot = bot;
         this.logger = bot.logger;
@@ -207,5 +207,5 @@ class MicroStrategyContinuation {
     }
 }
 
-module.exports = MicroStrategyContinuation;
+module.exports = MicroStrategy;
         
