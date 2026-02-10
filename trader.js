@@ -1,306 +1,356 @@
-/**
- * trader.js
- * v73.0 - [PERFECT SYNC]
- * * FIX 1: Removed 'isOrderInProgress' blocker on data feed. 
- * Strategy must ALWAYS receive data to keep Welford stats fresh.
- * * FIX 2: Normalizes Position Symbols (removes '_USDT') so Strategy can find them.
- */
+// trader.js
+// v65.0 - 
+// 
 
 const WebSocket = require('ws');
 const winston = require('winston');
-const path = require('path');
-const fs = require('fs');
+const crypto = require('crypto');
 require('dotenv').config();
 
-// Check for client.js
-if (!fs.existsSync('./client.js')) {
-    console.error("[FATAL] 'client.js' not found.");
-    process.exit(1);
-}
 const DeltaClient = require('./client.js');
 
-// --- CONFIGURATION ---
+// --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'TickStrategy',
+    strategy: process.env.STRATEGY || 'Micro',
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
     apiSecret: process.env.DELTA_API_SECRET,
+    productId: parseInt(process.env.DELTA_PRODUCT_ID),
+    productSymbol: process.env.DELTA_PRODUCT_SYMBOL,
+    orderSize: parseInt(process.env.ORDER_SIZE || '1'),
+    leverage: process.env.DELTA_LEVERAGE || '50',
     logLevel: process.env.LOG_LEVEL || 'info',
     reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
+    pingIntervalMs: parseInt(process.env.PING_INTERVAL_MS || '30000'),
     heartbeatTimeoutMs: parseInt(process.env.HEARTBEAT_TIMEOUT_MS || '40000'),
 };
 
-// --- GLOBAL LOGGER ---
+// --- Logging Setup ---
 const logger = winston.createLogger({
     level: config.logLevel,
     format: winston.format.combine(
         winston.format.timestamp(),
-        winston.format.colorize(),
         winston.format.printf(({ timestamp, level, message }) => {
-            return `${timestamp} [${level}]: ${message}`;
+            return `${timestamp} [${level.toUpperCase()}]: ${message}`;
         })
     ),
     transports: [
-        new winston.transports.Console(),
-        new winston.transports.File({ filename: 'trader.log' })
+        new winston.transports.File({ filename: 'error.log', level: 'error' }),
+        new winston.transports.File({ filename: 'combined.log' }),
+        new winston.transports.Console({
+            format: winston.format.combine(
+                winston.format.colorize(),
+                winston.format.simple()
+            )
+        })
     ]
 });
 
-// --- SMART STRATEGY LOADER ---
-let StrategyClass;
-function loadStrategy(strategyName) {
-    const candidates = [
-        `./${strategyName}.js`,
-        `../strategies/${strategyName}.js`,
-        `./strategies/${strategyName}.js`
-    ];
-    for (const relativePath of candidates) {
-        try {
-            const absolutePath = path.resolve(__dirname, relativePath);
-            if (fs.existsSync(absolutePath)) {
-                logger.info(`[Loader] Found strategy at: ${absolutePath}`);
-                return require(absolutePath);
-            }
-        } catch (e) {}
+function validateConfig() {
+    const required = ['apiKey', 'apiSecret', 'leverage'];
+    const missing = required.filter(key => !config[key]);
+    if (missing.length > 0) {
+        logger.error(`FATAL: Missing config: ${missing.join(', ')}`);
+        process.exit(1);
     }
-    throw new Error(`Could not find '${strategyName}' in any standard directory.`);
+    logger.info(`API Key Loaded: ${config.apiKey.substring(0, 4)}...${config.apiKey.slice(-4)}`);
 }
+validateConfig();
 
-try {
-    StrategyClass = loadStrategy(config.strategy);
-} catch (e) {
-    logger.error(`[FATAL] STRATEGY LOAD ERROR: ${e.message}`);
-    process.exit(1);
-}
-
-// --- MAIN TRADING BOT ---
 class TradingBot {
-    constructor(config) {
-        this.config = config;
+    constructor(botConfig) {
+        this.config = { ...botConfig };
+        this.logger = logger;
+        this.client = new DeltaClient(this.config.apiKey, this.config.apiSecret, this.config.baseURL, this.logger);
+
+        this.ws = null; this.authenticated = false;
         this.isOrderInProgress = false;
-        this.logger = logger; 
+
+        // [CRITICAL] Per-Asset Position Tracking
+        // Format: { 'BTC': true, 'XRP': false }
+        this.activePositions = {};
+
+        this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         
-        // Store Positions Memory
-        this.positions = {}; 
+        // Initialize State
+        this.targetAssets.forEach(asset => {
+            this.activePositions[asset] = false;
+        });
+
+        this.isStateSynced = false;
+        this.pingInterval = null; this.heartbeatTimeout = null;
+        this.restKeepAliveInterval = null;
 
         try {
-            this.client = new DeltaClient(config.apiKey, config.apiSecret, config.baseURL, logger); 
-        } catch (err) {
-            logger.error(`[FATAL] Client Init Failed: ${err.message}`);
-            process.exit(1);
-        }
-
-        try {
+            const StrategyClass = require(`./strategies/${this.config.strategy}Strategy.js`);
             this.strategy = new StrategyClass(this);
-        } catch (err) {
-            logger.error(`[FATAL] Strategy Init Failed: ${err.message}`);
+            this.logger.info(`Successfully loaded strategy: ${this.strategy.getName()}`);
+        } catch (e) {
+            this.logger.error(`FATAL: Could not load strategy: ${e.message}`);
             process.exit(1);
         }
-
-        this.internalWsServer = null; 
-        this.deltaWs = null;          
-        this.heartbeatTimeout = null;
     }
 
     async start() {
-        this.logger.info(`Starting Delta Trader v73.0 [Sync Fix]...`);
-        this.setupInternalServer();
-        this.connectDeltaWebSocket();
+        this.logger.info(`--- Bot Initializing (v65.0 - Micro Production) ---`);
+        await this.syncPositionState();
+        await this.initWebSocket();
+        this.setupHttpServer();
+        this.startRestKeepAlive();
     }
 
-    /**
-     * Helper for Strategy to check Position
-     * Normalizes input symbol to match storage key (e.g. 'BTC' -> 'BTC')
-     */
-    getPosition(symbol) {
-        // Strategy sends 'BTC', storage has 'BTC' (thanks to fix below)
-        return this.positions[symbol] || 0.0;
-    }
-    
-    hasOpenPosition(symbol) {
-        const size = this.positions[symbol];
-        return size && parseFloat(size) !== 0;
-    }
-
-    setupInternalServer() {
-        this.internalWsServer = new WebSocket.Server({ port: this.config.port });
-        this.internalWsServer.on('connection', (ws) => {
-            this.logger.info(`Market Listener connected on port ${this.config.port}`);
-            ws.on('message', async (message) => {
-                // [FIX 1] REMOVED "if (this.isOrderInProgress) return;"
-                // We MUST process data to keep Strategy Memory (Welford) fresh!
-                // The Strategy itself handles the execution lock.
-                try {
-                    const data = JSON.parse(message);
-                    if (this.strategy && typeof this.strategy.execute === 'function') {
-                        await this.strategy.execute(data);
-                    }
-                } catch (e) {
-                    this.logger.error(`Strategy Execution Error: ${e.message}`);
-                }
-            });
-        });
-    }
-
-    connectDeltaWebSocket() {
-        this.deltaWs = new WebSocket(this.config.wsURL);
-
-        this.deltaWs.on('open', () => {
-            this.logger.info('Connected to Delta Exchange WebSocket.');
-            this.sendToDelta({ type: "enable_heartbeat" });
-            this.startHeartbeat();
-            this.subscribeDeltaChannels();
-        });
-
-        this.deltaWs.on('message', (data) => {
-            this.heartbeat(); 
+    startRestKeepAlive() {
+        if (this.restKeepAliveInterval) clearInterval(this.restKeepAliveInterval);
+        this.restKeepAliveInterval = setInterval(async () => {
             try {
-                const msg = JSON.parse(data);
-                if (msg.type === 'orders') {
-                    this.handleOrderUpdate(msg);
-                } else if (msg.type === 'positions') {
-                    this.handlePositionUpdate(msg);
-                }
-            } catch (e) {}
-        });
-
-        this.deltaWs.on('close', () => {
-            this.logger.warn('Delta WebSocket Disconnected. Reconnecting...');
-            this.stopHeartbeat();
-            setTimeout(() => this.connectDeltaWebSocket(), this.config.reconnectInterval);
-        });
-
-        this.deltaWs.on('error', (err) => {
-            this.logger.error(`Delta WS Error: ${err.message}`);
-        });
-    }
-
-    subscribeDeltaChannels() {
-        this.sendToDelta({
-            type: 'subscribe',
-            payload: {
-                channels: [
-                    { name: 'orders', symbols: ['all'] },
-                    { name: 'positions', symbols: ['all'] }
-                ]
+                await this.client.getWalletBalance();
+            } catch (error) {
+                this.logger.warn(`[Keep-Alive] Check Failed: ${error.message}`);
             }
-        });
+        }, 25000);
     }
 
-    handleOrderUpdate(msg) {
-        if(msg.data) {
-             this.logger.info(`[ORDER] ${msg.data.status} | ${msg.data.side} ${msg.data.size}`);
-             // Unlock on final states
-             if (['filled', 'cancelled', 'closed'].includes(msg.data.status)) {
-                 if (this.isOrderInProgress) {
-                     this.isOrderInProgress = false;
-                 }
-             }
-        }
-    }
-
-    /**
-     * [FIX 2] Normalize Symbols in Position Storage
-     * Delta sends "BTCUSDT" or "BTC_USDT". Strategy uses "BTC".
-     * We strip "_USDT" and "USDT" to ensure keys match.
-     */
-    handlePositionUpdate(msg) {
-        const updatePosition = (rawSymbol, size) => {
-            // Normalize: BTCUSDT -> BTC, BTC_USDT -> BTC
-            const cleanSymbol = rawSymbol.replace('_USDT', '').replace('USDT', '');
-            
-            // Only log changes
-            if (this.positions[cleanSymbol] !== size) {
-                this.positions[cleanSymbol] = size;
-                if (size !== 0) {
-                     this.logger.info(`[POS UPDATE] ${cleanSymbol} | Size: ${size}`);
-                }
-            } else {
-                this.positions[cleanSymbol] = size;
-            }
-        };
-
-        // Case 1: Snapshot
-        if (msg.action === 'snapshot' && Array.isArray(msg.result)) {
-            msg.result.forEach(pos => {
-                const sym = pos.symbol || pos.product_symbol;
-                updatePosition(sym, parseFloat(pos.size));
-            });
-            return;
-        }
-
-        // Case 2: Update
-        const data = msg.data || msg; 
-        if (data && (data.symbol || data.product_symbol) && data.size !== undefined) {
-            const sym = data.symbol || data.product_symbol;
-            updatePosition(sym, parseFloat(data.size));
-        }
-    }
-
-    sendToDelta(data) {
-        if (this.deltaWs && this.deltaWs.readyState === WebSocket.OPEN) {
-            this.deltaWs.send(JSON.stringify(data));
-        }
-    }
-
+    // --- WebSocket Heartbeat ---
     startHeartbeat() {
-        this.stopHeartbeat();
-        this.heartbeat(); 
+        this.resetHeartbeatTimeout();
+        this.pingInterval = setInterval(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify({ type: 'ping' }));
+            }
+        }, this.config.pingIntervalMs);
     }
 
-    stopHeartbeat() {
-        if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
-    }
-
-    heartbeat() {
-        if (this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout);
+    resetHeartbeatTimeout() {
+        clearTimeout(this.heartbeatTimeout);
         this.heartbeatTimeout = setTimeout(() => {
-            this.logger.warn("Heartbeat Timeout (No Data). Reconnecting...");
-            if (this.deltaWs) this.deltaWs.terminate();
+            this.logger.warn('Heartbeat timeout! No pong received. Terminating.');
+            if (this.ws) this.ws.terminate();
         }, this.config.heartbeatTimeoutMs);
     }
 
-    async placeOrder(orderData) {
-        if (this.isOrderInProgress) {
-            this.logger.warn("Order Blocked: Internal Lock Active.");
-            return null;
+    stopHeartbeat() {
+        clearTimeout(this.heartbeatTimeout);
+        clearInterval(this.pingInterval);
+    }
+
+    // --- WebSocket Connection ---
+    async initWebSocket() {
+        this.logger.info(`Connecting to: ${this.config.wsURL}`);
+        this.ws = new WebSocket(this.config.wsURL);
+
+        this.ws.on('open', () => this.authenticateWebSocket());
+        this.ws.on('message', (data) => this.handleWebSocketMessage(JSON.parse(data.toString())));
+        this.ws.on('error', (error) => this.logger.error('WebSocket error:', error.message));
+        this.ws.on('close', (code, reason) => {
+            this.logger.warn(`WebSocket disconnected: ${code} - ${reason}. Reconnecting...`);
+            this.stopHeartbeat();
+            this.authenticated = false;
+            setTimeout(() => this.initWebSocket(), this.config.reconnectInterval);
+        });
+    }
+
+    authenticateWebSocket() {
+        const timestampNum = Math.floor(Date.now() / 1000);
+        const timestampStr = timestampNum.toString();
+
+        const signatureData = 'GET' + timestampStr + '/live';
+        const signature = crypto
+            .createHmac('sha256', this.config.apiSecret)
+            .update(signatureData)
+            .digest('hex');
+
+        const payload = {
+            type: 'key-auth',
+            payload: {
+                'api-key': this.config.apiKey,
+                timestamp: timestampStr,
+                signature: signature
+            }
+        };
+
+        this.ws.send(JSON.stringify(payload));
+    }
+
+    subscribeToChannels() {
+        const symbols = this.targetAssets.map(asset => `${asset}USD`);
+        this.logger.info(`Subscribing to Execution Channels: ${symbols.join(', ')}`);
+
+        this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
+            // Track Orders (Fills)
+            { name: 'orders', symbols: ['all'] },
+            // Track Positions (Open/Close State)
+            { name: 'positions', symbols: ['all'] },
+            // Track Public Trades (Optional)
+            { name: 'all_trades', symbols: symbols }
+        ]}}));
+    }
+
+    handleWebSocketMessage(message) {
+        // 1. Auth Handling
+        if (
+            (message.type === 'success' && message.message === 'Authenticated') ||
+            (message.type === 'key-auth' && message.status === 'authenticated') ||
+            (message.success === true && message.status === 'authenticated')
+        ) {
+            this.logger.info('✅ WebSocket AUTHENTICATED Successfully.');
+            this.authenticated = true;
+            this.subscribeToChannels();
+            this.startHeartbeat();
+            this.syncPositionState();
+            return;
         }
-        this.isOrderInProgress = true;
+
+        if (message.type === 'error' && !this.authenticated) {
+            this.logger.error(`❌ AUTH FAILED. Error Code: ${message.error ? message.error.code : 'Unknown'}`);
+        }
+
+        if (message.type === 'pong') {
+            this.resetHeartbeatTimeout();
+            return;
+        }
+
+        // 2. Data Handling
+        switch (message.type) {
+            case 'orders':
+                if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
+                break;
+                
+            case 'positions':
+                // Handle Position Updates (Array or Single Object)
+                if (Array.isArray(message.data)) {
+                    message.data.forEach(pos => this.handlePositionUpdate(pos));
+                } else if (message.size !== undefined) {
+                    this.handlePositionUpdate(message);
+                }
+                break;
+        }
+    }
+
+    // --- State Management ---
+
+    handlePositionUpdate(pos) {
+        if (!pos.product_symbol) return;
+        
+        // Find which asset this update belongs to (e.g. BTCUSD -> BTC)
+        const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
+        
+        if (asset) {
+            const size = parseFloat(pos.size);
+            const isOpen = size !== 0;
+
+            // Update State Map
+            if (this.activePositions[asset] !== isOpen) {
+                this.activePositions[asset] = isOpen;
+                this.logger.info(`[POS UPDATE] ${asset} is now ${isOpen ? 'OPEN' : 'CLOSED'} (Size: ${size})`);
+            }
+        }
+    }
+
+    async syncPositionState() {
+        try {
+            const response = await this.client.getPositions();
+            const positions = response.result || [];
+            
+            // 1. Reset all to Closed
+            this.targetAssets.forEach(a => this.activePositions[a] = false);
+
+            // 2. Mark Open ones
+            positions.forEach(pos => {
+                const size = parseFloat(pos.size);
+                if (size !== 0) {
+                    const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
+                    if (asset) {
+                        this.activePositions[asset] = true;
+                        this.logger.info(`[SYNC] Found OPEN position for ${asset}: ${size}`);
+                    }
+                }
+            });
+            
+            this.isStateSynced = true;
+            this.logger.info(`Position State Synced: ${JSON.stringify(this.activePositions)}`);
+        } catch (error) {
+            this.logger.error('Failed to sync position state:', error.message);
+        }
+    }
+
+    /**
+     * Helper: Checks if we have an open position for a specific asset.
+     */
+    hasOpenPosition(symbol) {
+        if (symbol) {
+            return this.activePositions[symbol] === true;
+        }
+        // Fallback: Check if ANY position is open
+        return Object.values(this.activePositions).some(status => status === true);
+    }
+
+    // --- External Feed Handler (Binance) ---
+    async handleSignalMessage(message) {
+        if (!this.authenticated) return;
 
         try {
-            const response = await this.client.placeOrder(orderData);
-            if (response && response.result) {
-                this.logger.info(`[SUCCESS] Order ID: ${response.result.id}`);
-                // Safety release in case socket update misses (5s timeout)
-                setTimeout(() => { 
-                    if(this.isOrderInProgress) {
-                        this.isOrderInProgress = false; 
-                    }
-                }, 5000);
-            } else {
-                this.logger.error(`[FAIL] ${JSON.stringify(response)}`);
-                this.isOrderInProgress = false; 
+            const data = JSON.parse(message.toString());
+            
+            // [PAYLOAD ADAPTER] BINANCE LOW-LATENCY FEED
+            // Comes from market_listener.js (Type 'B')
+            if (data.type === 'B') {
+                const asset = data.s; // e.g. 'BTC'
+                
+                // 1. Check if this is a target asset
+                if (!this.targetAssets.includes(asset)) return;
+
+                // 2. Format for MicroStrategy
+                // { bids: [[Price, Vol]], asks: [[Price, Vol]] }
+                const depthPayload = {
+                    bids: [[ data.bb, data.bq ]], 
+                    asks: [[ data.ba, data.aq ]]  
+                };
+
+                // 3. Inject into Strategy
+                if (this.strategy.onDepthUpdate) {
+                    await this.strategy.onDepthUpdate(asset, depthPayload);
+                }
             }
-            return response;
+            
         } catch (error) {
-            const errMsg = error.response ? JSON.stringify(error.response.body) : error.message;
-            this.logger.error(`[EXCEPTION] Order Failed: ${errMsg}`);
-            this.isOrderInProgress = false;
-            return null;
+            this.logger.error("Error handling signal message:", error);
+        }
+    }
+    
+    setupHttpServer() {
+        const httpServer = new WebSocket.Server({ port: this.config.port });
+        httpServer.on('connection', ws => {
+            this.logger.info('External Data Feed Connected (Binance)');
+            ws.on('message', m => this.handleSignalMessage(m));
+            ws.on('close', () => this.logger.warn('External Feed Disconnected'));
+            ws.on('error', (err) => this.logger.error('Signal listener error:', err));
+        });
+        this.logger.info(`Internal Data Server running on port ${this.config.port}`);
+    }
+    
+    async placeOrder(orderData) {
+        return this.client.placeOrder(orderData);
+    }
+    
+    handleOrderUpdate(orderUpdate) {
+        if (orderUpdate.state === 'filled') {
+            this.logger.info(`[Trader] Order ${orderUpdate.id} FILLED.`);
         }
     }
 }
 
-// Start
 (async () => {
     try {
         const bot = new TradingBot(config);
         await bot.start();
+        process.on('uncaughtException', async (err) => {
+            logger.error('Uncaught Exception:', err);
+            process.exit(1);
+        });
     } catch (error) {
-        logger.error(`Failed to start bot: ${error.message}`);
+        logger.error("Failed to start bot:", error);
         process.exit(1);
     }
 })();
-            
