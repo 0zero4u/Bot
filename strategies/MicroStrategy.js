@@ -1,5 +1,5 @@
 /**
- * MicroStrategyContinuation.js
+ * 
  *
  * Strategy: Volume-Weighted Microprice (VWM)
  * with Directional Velocity Confirmation & Server-Side Trailing Stop.
