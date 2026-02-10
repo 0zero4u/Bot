@@ -1,4 +1,3 @@
-
 const got = require('got');
 const crypto = require('crypto');
 const https = require('https');
@@ -25,14 +24,19 @@ class DeltaClient {
             this.#logger.warn(`[DeltaClient] DNS Warming setup failed: ${e.message}`);
         }
 
-        // --- 2. OPTIMIZED AGENT ---
+        // --- 2. OPTIMIZED AGENT (IPv4 FORCED) ---
         const httpsAgent = new https.Agent({
             keepAlive: true,
             keepAliveMsecs: 1000,
             maxSockets: 64,
             maxFreeSockets: 16,
             scheduling: 'lifo',
-            timeout: 15000
+            timeout: 15000,
+            // 🔥 CRITICAL FIX: Force IPv4 to prevent 800ms delay
+            lookup: (hostname, options, callback) => {
+                options.family = 4;
+                dns.lookup(hostname, options, callback);
+            }
         });
 
         this.#client = got.extend({
@@ -42,69 +46,76 @@ class DeltaClient {
             timeout: { request: 10000, connect: 2000 },
             retry: { limit: 0 },
             headers: {
-                'User-Agent': 'nodejs-delta-xray',
+                'User-Agent': 'nodejs-delta-hft-v1',
                 'Accept': 'application/json',
-                'Connection': 'keep-alive' 
+                'Content-Type': 'application/json'
             }
         });
     }
 
     #warmDNS(hostname) {
-        dns.lookup(hostname, { family: 4 }, (err, address) => { });
+        dns.lookup(hostname, { family: 4 }, (err, address) => {
+            if (!err && this.#logger) {
+                // Silently refresh OS DNS cache
+            }
+        });
     }
 
-    async #request(method, path, data = null, query = null) {
+    async #request(method, endpoint, payload = null, qs = {}) {
         const timestamp = Math.floor(Date.now() / 1000).toString();
-        const params = new URLSearchParams(query);
-        const qs = params.toString().replace(/%2C/g, ','); 
-        const body = data ? JSON.stringify(data) : '';
+        const bodyStr = payload ? JSON.stringify(payload) : '';
         
-        const sigStr = method.toUpperCase() + timestamp + path + (qs ? `?${qs}` : '') + body;
-        const signature = crypto.createHmac('sha256', this.#apiSecret).update(sigStr).digest('hex');
+        let signatureData = method + timestamp + endpoint;
+        if (Object.keys(qs).length > 0) {
+            signatureData += '?' + new URLSearchParams(qs).toString();
+        }
+        if (payload) {
+            signatureData += bodyStr;
+        }
 
-        const headers = {
-            'api-key': this.#apiKey,
-            'timestamp': timestamp,
-            'signature': signature,
-            'Content-Type': body ? 'application/json' : undefined
+        const signature = crypto
+            .createHmac('sha256', this.#apiSecret)
+            .update(signatureData)
+            .digest('hex');
+
+        const options = {
+            method: method,
+            headers: {
+                'api-key': this.#apiKey,
+                'timestamp': timestamp,
+                'signature': signature
+            },
+            searchParams: qs
         };
 
-        try {
-            const response = await this.#client(path.startsWith('/') ? path.substring(1) : path, {
-                method: method,
-                searchParams: qs || undefined,
-                body: body || undefined,
-                headers: headers,
-                responseType: 'json'
-            });
+        if (payload) {
+            options.body = bodyStr;
+        }
 
-            // [X-RAY] Extract precise timings
-            const timings = response.timings;
+        try {
+            const response = await this.#client(endpoint, options);
+            
+            // Attach timing metrics if available
             if (response.body && typeof response.body === 'object') {
+                const timings = response.timings || {};
                 Object.defineProperty(response.body, '_metrics', {
                     value: {
-                        dns: timings.phases.dns,
-                        tcp: timings.phases.tcp,
-                        tls: timings.phases.tls,
-                        server: timings.phases.total
+                        total: timings.phases?.total || 0
                     },
                     enumerable: false
                 });
             }
 
-            return response.body;
+            return JSON.parse(response.body);
         } catch (err) {
-            // --- ERROR HANDLING FIX ---
             const status = err.response?.statusCode;
             const errorBody = err.response?.body;
             
-            // Log the specifics of the 400 Bad Request
             if (status === 400 || status === 422) {
-                this.#logger.error(`[DeltaClient] ❌ API REJECTED (${status}): ${JSON.stringify(errorBody)}`);
+                this.#logger.error(`[DeltaClient] ❌ REJECTED (${status}): ${errorBody}`);
             } else {
-                this.#logger.error(`[DeltaClient] Request Failed (${status || 'Net'}): ${err.message}`);
+                this.#logger.error(`[DeltaClient] Net Error: ${err.message}`);
             }
-            
             throw err; 
         }
     }
@@ -116,4 +127,4 @@ class DeltaClient {
 }
 
 module.exports = DeltaClient;
-            
+    
