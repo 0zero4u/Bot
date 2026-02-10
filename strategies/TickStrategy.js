@@ -1,6 +1,6 @@
 /**
  * TickStrategy.js
- * v5.4 [FIXED] - Uses MidPrice for Execution + Router
+ * v5.5 [FIXED] - Aligned Product ID & Config with Standard Strategies
  */
 
 class TickStrategy {
@@ -9,9 +9,7 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- STRATEGY PARAMETERS ---
-        // [NOTE] Lowered to 1.5 so you can actually see it trade during testing.
-        // Revert to 4.0 later if you want it to be very conservative.
-        this.ENTRY_Z = 1.5;          
+        this.ENTRY_Z = 1.5;          // Z-score trigger (Lowered for testing)
         this.EXIT_Z = 0.5;           
         this.MIN_NOISE_FLOOR = 0.05; 
         this.WARMUP_TICKS = 100;     
@@ -20,21 +18,39 @@ class TickStrategy {
         this.GAMMA = 100;            
         this.BETA = 1;               
 
+        // --- MASTER CONFIGURATION (Aligned with other strategies) ---
+        // This ensures we always have the correct ID and precision for each asset.
+        const MASTER_CONFIG = {
+            'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
+            'BTC': { deltaId: 27,    precision: 1, tickSize: 0.1 },
+            'ETH': { deltaId: 299,   precision: 2, tickSize: 0.01 },
+            'SOL': { deltaId: 417,   precision: 3, tickSize: 0.1 }
+        };
+
         // --- ASSET STATE ---
         this.assets = {};
-        this.specs = {}; 
         
+        // Load targets from env or default
         const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
+        
         targets.forEach(symbol => {
-            this.assets[symbol] = {
-                obiMean: 0,
-                obiM2: 0,
-                obiCount: 0,
-                currentRegime: 0, // 0=IDLE, 1=ACTIVE
-                midPrice: 0,      // [NEW] Storing OrderBook MidPrice
-                lastZ: 0,   
-                lastLogTime: 0 
-            };
+            // Normalize symbol (remove _USDT if present)
+            const cleanSymbol = symbol.replace('_USDT', '');
+            
+            if (MASTER_CONFIG[cleanSymbol]) {
+                this.assets[cleanSymbol] = {
+                    config: MASTER_CONFIG[cleanSymbol], // Store static config here
+                    obiMean: 0,
+                    obiM2: 0,
+                    obiCount: 0,
+                    currentRegime: 0, 
+                    midPrice: 0,      
+                    lastZ: 0,   
+                    lastLogTime: 0 
+                };
+            } else {
+                this.logger.warn(`[STRATEGY] Warning: No config found for ${cleanSymbol}`);
+            }
         });
     }
 
@@ -46,9 +62,10 @@ class TickStrategy {
 
         try {
             if (data.type === 'depthUpdate') {
-                await this.onDepthUpdate(data.s, data);
+                // Ensure we strip '_USDT' to match our asset keys
+                const cleanSymbol = data.s.replace('_USDT', '');
+                await this.onDepthUpdate(cleanSymbol, data);
             } 
-            // We ignore 'trade' updates for pricing now, purely using depth
         } catch (e) {
             this.logger.error(`[STRATEGY] Execution Error: ${e.message}`);
         }
@@ -156,32 +173,37 @@ class TickStrategy {
         }
 
         try {
-            const spec = this.specs[symbol];
-            if(!spec) {
-                 this.specs[symbol] = { deltaId: process.env.DELTA_PRODUCT_ID, precision: 3 }; 
+            // --- 1. GET CONFIG (Clean & Aligned) ---
+            const config = asset.config;
+            if (!config || !config.deltaId) {
+                this.logger.error(`[CONFIG_ERROR] No ID for ${symbol}`);
+                return;
             }
-            
-            // [FIXED] Use cached MidPrice from Order Book
+
+            // --- 2. GET PRICE ---
             const price = asset.midPrice;
-            
             if (!price) {
                 this.logger.warn(`[SKIP] Signal high but no MidPrice for ${symbol}`);
                 return;
             }
 
+            // --- 3. CALCULATE LIMITS ---
+            // Aggressive limit: +/- 0.05%
             const limitPrice = side === 'buy' ? price * 1.0005 : price * 0.9995;
             
+            // Trailing Stop: +/- 0.05%
             let trail = price * 0.0005; 
             if (side === 'buy') trail = -trail; 
 
+            // --- 4. EXECUTE ---
             await this.bot.placeOrder({
-                product_id: this.specs[symbol] ? this.specs[symbol].deltaId.toString() : process.env.DELTA_PRODUCT_ID,
+                product_id: config.deltaId.toString(),
                 side: side,
                 size: process.env.ORDER_SIZE || "1",
                 order_type: 'limit_order',
                 time_in_force: 'ioc', 
-                limit_price: limitPrice.toFixed(3),
-                bracket_trail_amount: trail.toFixed(3),
+                limit_price: limitPrice.toFixed(config.precision),
+                bracket_trail_amount: trail.toFixed(config.precision),
                 bracket_stop_trigger_method: 'mark_price'
             });
 
@@ -193,4 +215,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-                
+            
