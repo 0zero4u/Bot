@@ -1,9 +1,11 @@
 const https = require('https');
 const crypto = require('crypto');
+const dns = require('dns');
 
 class DeltaClient {
     #apiKey;
     #apiSecret;
+    #agent;
     #logger;
 
     constructor(apiKey, apiSecret, baseURL, logger) {
@@ -11,17 +13,34 @@ class DeltaClient {
         this.#apiSecret = apiSecret;
         this.#logger = logger;
         
-        this.DIRECT_IP = '13.227.249.121'; 
-        this.REAL_HOSTNAME = 'api.india.delta.exchange';
+        // Use the standard domain to avoid WAF blocks during diagnosis
+        this.HOSTNAME = 'api.india.delta.exchange';
+
+        // Standard Agent with Keep-Alive
+        this.#agent = new https.Agent({
+            keepAlive: true,
+            keepAliveMsecs: 1000,
+            maxSockets: 64,
+            scheduling: 'lifo',
+            timeout: 10000,
+            // Force IPv4 to rule out IPv6 timeouts
+            lookup: (hostname, opts, cb) => {
+                opts.family = 4;
+                dns.lookup(hostname, opts, cb);
+            }
+        });
     }
 
     async #request(method, endpoint, payload = null, qs = {}) {
         return new Promise((resolve, reject) => {
-            const tStart = Date.now();
+            // --- ⏱️ HIGH PRECISION TIMING START ---
+            const startNs = process.hrtime.bigint();
+            let dnsNs = 0n, tcpNs = 0n, tlsNs = 0n, uploadNs = 0n, ttfbNs = 0n;
 
             const timestamp = Math.floor(Date.now() / 1000).toString();
             const bodyStr = payload ? JSON.stringify(payload) : '';
 
+            // Signature Logic
             const pathWithSlash = endpoint.startsWith('/') ? endpoint : '/' + endpoint;
             let queryStr = '';
             if (Object.keys(qs).length > 0) {
@@ -35,37 +54,48 @@ class DeltaClient {
                 .digest('hex');
 
             const options = {
-                hostname: this.DIRECT_IP,
+                hostname: this.HOSTNAME,
                 port: 443,
                 path: pathWithSlash + queryStr,
                 method: method,
                 headers: {
-                    'Host': this.REAL_HOSTNAME,
-                    // ⚡ SPOOF BROWSER: Look like Chrome to bypass WAF throttling
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'User-Agent': 'nodejs-diag-v1',
                     'Content-Type': 'application/json',
                     'Accept': 'application/json',
                     'api-key': this.#apiKey,
                     'timestamp': timestamp,
                     'signature': signature,
-                    'Content-Length': Buffer.byteLength(bodyStr),
-                    // ⚡ CRITICAL FIX: FORCE CLOSE. Do not reuse dead sockets.
-                    'Connection': 'close' 
+                    'Content-Length': Buffer.byteLength(bodyStr)
                 },
-                // ⚡ DISABLE AGENT: Forces a fresh TCP handshake every time
-                agent: false, 
-                servername: this.REAL_HOSTNAME,
-                rejectUnauthorized: false
+                agent: this.#agent,
+                timeout: 5000
             };
 
             const req = https.request(options, (res) => {
+                // ⏱️ TTFB Captured (Time To First Byte)
+                ttfbNs = process.hrtime.bigint();
+
                 let data = '';
                 res.on('data', (chunk) => data += chunk);
                 res.on('end', () => {
-                    // Log only if slow
-                    const totalTime = Date.now() - tStart;
-                    if (totalTime > 100) {
-                        this.#logger.warn(`[REQ] Total:${totalTime}ms | Fresh Connection Used`);
+                    const endNs = process.hrtime.bigint();
+                    
+                    // --- CALCULATION (Nanoseconds to Milliseconds) ---
+                    const totalMs = Number(endNs - startNs) / 1e6;
+                    const dnsMs = dnsNs > 0n ? Number(dnsNs - startNs) / 1e6 : 0;
+                    const tcpMs = tcpNs > 0n ? Number(tcpNs - (dnsNs || startNs)) / 1e6 : 0;
+                    const tlsMs = tlsNs > 0n ? Number(tlsNs - (tcpNs || startNs)) / 1e6 : 0;
+                    const waitMs = Number(ttfbNs - (uploadNs || tlsNs || startNs)) / 1e6; // Server Think Time
+
+                    // LOG THE WATERFALL
+                    if (totalMs > 50) { // Log anything slower than 50ms
+                        this.#logger.warn(
+                            `[PROFILE] Total:${totalMs.toFixed(1)}ms | ` +
+                            `DNS:${dnsMs.toFixed(1)} | ` +
+                            `TCP:${tcpMs.toFixed(1)} | ` +
+                            `TLS:${tlsMs.toFixed(1)} | ` +
+                            `Wait(Server):${waitMs.toFixed(1)}`
+                        );
                     }
 
                     try {
@@ -76,13 +106,24 @@ class DeltaClient {
                 });
             });
 
-            // ⚡ FORCE TCP NO DELAY (Just in case)
+            // --- ⏱️ EVENT LISTENERS FOR TIMING ---
             req.on('socket', (socket) => {
-                socket.setNoDelay(true);
+                socket.on('lookup', () => { dnsNs = process.hrtime.bigint(); });
+                socket.on('connect', () => { tcpNs = process.hrtime.bigint(); });
+                socket.on('secureConnect', () => { tlsNs = process.hrtime.bigint(); });
+                
+                // Force optimizations
+                socket.setNoDelay(true); 
+                socket.setKeepAlive(true, 1000);
+            });
+
+            req.on('finish', () => {
+                // Request flushed to OS kernel
+                uploadNs = process.hrtime.bigint();
             });
 
             req.on('error', (err) => {
-                this.#logger.error(`[NativeReq] Error: ${err.message}`);
+                this.#logger.error(`[NetError] ${err.message}`);
                 reject(err);
             });
 
@@ -100,3 +141,4 @@ class DeltaClient {
 }
 
 module.exports = DeltaClient;
+                    
