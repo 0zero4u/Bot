@@ -1,5 +1,3 @@
-// client.js
-// Version 15.1.0 - [FIX] Exposed 400 Errors & Detailed Debugging
 
 const got = require('got');
 const crypto = require('crypto');
