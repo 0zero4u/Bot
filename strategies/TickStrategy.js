@@ -1,11 +1,6 @@
 /**
  * TickStrategy.js
- * v5.3 [FIXED] - Added 'execute()' Entry Point & Heartbeat
- * * CORE LOGIC:
- * 1. WEIGHTING: Uses Inverse Distance Weighting to filter deep spoofs.
- * 2. SIGNAL: Uses Welford's Online Algorithm to track Z-Score.
- * 3. EXECUTION: Enters on High Z-Score ONLY if Momentum is increasing.
- * 4. COMPATIBILITY: Added execute() to route data from trader.js.
+ * v5.3 [FIXED] - Added 'execute' Router for Trader.js Compatibility
  */
 
 class TickStrategy {
@@ -14,14 +9,14 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- STRATEGY PARAMETERS ---
-        this.ENTRY_Z = 4.0;         // Z-score trigger to enter Active Regime
-        this.EXIT_Z = 2.0;          // Z-score hysteresis to return to Idle
-        this.MIN_NOISE_FLOOR = 0.05; // Prevents Z-score explosion in flat markets
-        this.WARMUP_TICKS = 100;    // Minimum samples before trading
+        this.ENTRY_Z = 4.0;          
+        this.EXIT_Z = 2.0;           
+        this.MIN_NOISE_FLOOR = 0.05; 
+        this.WARMUP_TICKS = 100;     
         
-        // --- DISTANCE WEIGHTING PARAMS ---
-        this.GAMMA = 100;           
-        this.BETA = 1;              
+        // --- IDW PARAMS ---
+        this.GAMMA = 100;            
+        this.BETA = 1;               
 
         // --- ASSET STATE ---
         this.assets = {};
@@ -30,46 +25,41 @@ class TickStrategy {
         const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
         targets.forEach(symbol => {
             this.assets[symbol] = {
-                // Welford State
                 obiMean: 0,
                 obiM2: 0,
                 obiCount: 0,
-                
-                // Regime & Signal State
-                currentRegime: 0, 
+                currentRegime: 0, // 0=IDLE, 1=ACTIVE
                 lastPrice: 0,
-                lastZ: 0,
-                
-                // Logging State
+                lastZ: 0,   
                 lastLogTime: 0 
             };
         });
     }
 
     /**
-     * [CRITICAL FIX] Entry Point for trader.js
-     * This method routes the raw WebSocket data to the correct logic.
+     * [CRITICAL FIX] Router method required by trader.js
+     * This bridges the gap between market_listener and the strategy logic.
      */
     async execute(data) {
-        if (!data) return;
+        if (!data || !data.type) return;
 
-        // 1. Map 'depthUpdate' or 'orderBook' to onDepthUpdate
-        // Adjust 'type' string based on exactly what your market-1 process sends.
-        // Common types: 'depth', 'depthUpdate', 'book', 'ticker'
-        if (data.type === 'depth' || data.type === 'depthUpdate' || data.bids) {
-            // If data comes wrapped (e.g. data.payload), unwrap it here
-            const symbol = data.symbol || data.product_id; 
-            await this.onDepthUpdate(symbol, data);
-        }
-        // 2. Map 'trade' to onTradeUpdate
-        else if (data.type === 'trade') {
-            await this.onTradeUpdate(data.symbol, data);
+        try {
+            if (data.type === 'depthUpdate') {
+                await this.onDepthUpdate(data.s, data);
+            } else if (data.type === 'trade') {
+                await this.onTradeUpdate(data.s, data);
+            }
+        } catch (e) {
+            this.logger.error(`[STRATEGY] Execution Error: ${e.message}`);
         }
     }
 
+    /**
+     * Calculates volume weighted by DISTANCE from mid-price.
+     */
     calcWeightedVol(levels, midPrice) {
         let weightedTotal = 0;
-        const limit = Math.min(levels.length, 10); // Process top 10 levels
+        const limit = Math.min(levels.length, 10); 
 
         for (let i = 0; i < limit; i++) {
             const price = parseFloat(levels[i][0]);
@@ -79,6 +69,7 @@ class TickStrategy {
 
             const d = Math.abs(price - midPrice) / midPrice;
             const weight = 1 / (this.GAMMA * d + this.BETA);
+            
             weightedTotal += size * weight;
         }
         return weightedTotal;
@@ -86,12 +77,7 @@ class TickStrategy {
 
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
-        
-        // Auto-register asset if it's new (handles dynamic symbols)
-        if (!asset) {
-             // Optional: Initialize new asset state if needed
-             return; 
-        }
+        if (!asset) return;
 
         // 0. Validation
         if (!depth.bids || !depth.asks || depth.bids.length === 0 || depth.asks.length === 0) return;
@@ -102,7 +88,7 @@ class TickStrategy {
 
         if (!midPrice || bestBid >= bestAsk) return; 
 
-        // 1. Calculate Weighted Volumes
+        // 1. Fusion Logic
         const wBidVol = this.calcWeightedVol(depth.bids, midPrice);
         const wAskVol = this.calcWeightedVol(depth.asks, midPrice);
 
@@ -111,7 +97,7 @@ class TickStrategy {
         // 2. Deep OBI Calculation
         const currentDeepOBI = (wBidVol - wAskVol) / (wBidVol + wAskVol);
 
-        // 3. Update Welford's Algorithm
+        // 3. Welford's Algorithm
         asset.obiCount++;
         const delta = currentDeepOBI - asset.obiMean;
         asset.obiMean += delta / asset.obiCount;
@@ -121,14 +107,13 @@ class TickStrategy {
         // 4. Warmup Check
         if (asset.obiCount < this.WARMUP_TICKS) return;
 
-        // 5. Calculate Standardized Signal (Z-Score)
+        // 5. Z-Score
         const variance = asset.obiM2 / (asset.obiCount - 1);
         const stdDev = Math.sqrt(variance);
-        
         const effectiveStdDev = Math.max(stdDev, this.MIN_NOISE_FLOOR);
         const zScore = (currentDeepOBI - asset.obiMean) / effectiveStdDev;
 
-        // --- HEARTBEAT LOG (Every 4s) ---
+        // --- HEARTBEAT LOG ---
         const now = Date.now();
         if (now - asset.lastLogTime > 4000) {
             const regimeStr = asset.currentRegime === 1 ? 'ACTIVE' : 'IDLE';
@@ -149,9 +134,7 @@ class TickStrategy {
         const absLastZ = Math.abs(lastZ);
 
         if (asset.currentRegime === 0) {
-            // IDLE -> ACTIVE
             if (absZ > this.ENTRY_Z) {
-                // Momentum Gate
                 if (absZ < absLastZ) return; 
 
                 asset.currentRegime = 1;
@@ -160,7 +143,6 @@ class TickStrategy {
                 this.executeTrade(symbol, side, zScore);
             }
         } else {
-            // ACTIVE -> IDLE
             if (absZ < this.EXIT_Z) {
                 asset.currentRegime = 0;
                 this.logger.info(`[REGIME_CHANGE] ACTIVE -> IDLE | Z: ${zScore.toFixed(2)}`);
@@ -170,33 +152,42 @@ class TickStrategy {
 
     async onTradeUpdate(symbol, trade) {
         const asset = this.assets[symbol];
-        if (asset) asset.lastPrice = parseFloat(trade.p || trade.price);
+        if (asset) asset.lastPrice = parseFloat(trade.p);
     }
 
     async executeTrade(symbol, side, score) {
         const asset = this.assets[symbol];
+        
         if (this.bot.isOrderInProgress) return;
         
         const pos = this.bot.getPosition(symbol);
-        if (pos && ((side === 'buy' && pos > 0) || (side === 'sell' && pos < 0))) return; 
+        if (pos && ((side === 'buy' && pos > 0) || (side === 'sell' && pos < 0))) {
+            return; 
+        }
 
         try {
-            const spec = this.specs[symbol] || { deltaId: 14969, precision: 4 }; // Fallback
+            const spec = this.specs[symbol];
+            if(!spec) {
+                 // Fetch spec lazily if missing, or default to 3 decimals for XRP
+                 this.specs[symbol] = { deltaId: process.env.DELTA_PRODUCT_ID, precision: 3 }; 
+            }
+            
             const price = asset.lastPrice;
             if (!price) return;
 
             const limitPrice = side === 'buy' ? price * 1.0005 : price * 0.9995;
+            
             let trail = price * 0.0005; 
             if (side === 'buy') trail = -trail; 
 
             await this.bot.placeOrder({
-                product_id: spec.deltaId.toString(),
+                product_id: this.specs[symbol] ? this.specs[symbol].deltaId.toString() : process.env.DELTA_PRODUCT_ID,
                 side: side,
                 size: process.env.ORDER_SIZE || "1",
                 order_type: 'limit_order',
                 time_in_force: 'ioc', 
-                limit_price: limitPrice.toFixed(spec.precision),
-                bracket_trail_amount: trail.toFixed(spec.precision),
+                limit_price: limitPrice.toFixed(3),
+                bracket_trail_amount: trail.toFixed(3),
                 bracket_stop_trigger_method: 'mark_price'
             });
 
