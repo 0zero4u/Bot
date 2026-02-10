@@ -9,7 +9,7 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- STRATEGY PARAMETERS ---
-        this.ENTRY_Z = 1.5;          // Z-score trigger (Lowered for testing)
+        this.ENTRY_Z = 3.5;          // Z-score trigger (Lowered for testing)
         this.EXIT_Z = 0.5;           
         this.MIN_NOISE_FLOOR = 0.05; 
         this.WARMUP_TICKS = 100;     
