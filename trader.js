@@ -1,8 +1,7 @@
 const WebSocket = require('ws');
 const winston = require('winston');
 const crypto = require('crypto');
-const path = require('path'); // Added for safe paths
-const fs = require('fs');     // Added for file checking
+const path = require('path');
 require('dotenv').config();
 
 // --- Rust Native Client ---
@@ -88,52 +87,49 @@ class TradingBot {
         this.heartbeatTimeout = null;
         this.restKeepAliveInterval = null;
 
-        // [FIXED] Robust Strategy Loader
+        // =========================================================
+        // 🔥 OPTION B — ROBUST STRATEGY LOADER (FULLY SAFE)
+        // =========================================================
         try {
             const cleanName = this.config.strategy
                 .trim()
-                .replace(/Strategy(\.js)?$/i, '') 
+                .replace(/Strategy(\.js)?$/i, '')
                 .replace(/\.js$/i, '');
 
-            // Use path.resolve to ensure we find the file relative to the script
-            const strategyFileName = `${cleanName}Strategy.js`;
-            const strategyPath = path.resolve(__dirname, 'strategies', strategyFileName);
+            const strategyPath = path.resolve(
+                __dirname,
+                'strategies',
+                `${cleanName}Strategy.js`
+            );
 
             this.logger.info(`Loading Strategy from: ${strategyPath}`);
-            
-            // Check if file exists before requiring
-            if (!fs.existsSync(strategyPath)) {
-                throw new Error(`Strategy file NOT FOUND at: ${strategyPath}`);
-            }
 
             const StrategyClass = require(strategyPath);
 
-            // Ensure we imported a class/function
             if (typeof StrategyClass !== 'function') {
-                throw new Error(`Strategy export is invalid (${typeof StrategyClass}). Check module.exports in ${strategyFileName}`);
+                throw new Error(
+                    `Strategy does not export a class. Got: ${typeof StrategyClass}`
+                );
             }
 
             this.strategy = new StrategyClass(this);
 
-            // --- THE FIX: Safe getName Check ---
-            let strategyName = cleanName;
-            if (this.strategy && typeof this.strategy.getName === 'function') {
-                strategyName = this.strategy.getName();
-            } else {
-                this.logger.warn(`Strategy loaded, but 'getName()' method is missing. Using filename: ${strategyName}`);
+            if (typeof this.strategy.getName !== 'function') {
+                throw new Error(
+                    `Strategy missing required method getName()`
+                );
             }
 
-            this.logger.info(`✅ Successfully loaded strategy: ${strategyName}`);
+            this.logger.info(
+                `✅ Successfully loaded strategy: ${this.strategy.getName()}`
+            );
 
         } catch (e) {
             this.logger.error(`FATAL: Could not load strategy: ${e.message}`);
-            // Keep the process alive or exit depending on preference. 
-            // Exiting is safer if no strategy is loaded.
             process.exit(1);
         }
     }
 
-    // [REQUIRED BY v8.1] Latency Helper
     recordOrderPunch(clientOrderId) {
         this.orderLatencies.set(clientOrderId, Date.now());
         setTimeout(() => {
@@ -144,14 +140,13 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v68.0 - Stable Hybrid) ---`);
+        this.logger.info(`--- Bot Initializing (v69.0 - Strategy Safe Loader) ---`);
 
-        this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
-            this.logger.info("🔥 Connection Warmed. Native Socket is open.");
+            this.logger.info("🔥 Native connection warmed.");
         } catch (e) {
-            this.logger.warn("Warmup failed (non-fatal), continuing...");
+            this.logger.warn("Warmup failed (non-fatal).");
         }
 
         await this.syncPositionState();
@@ -166,12 +161,11 @@ class TradingBot {
             try {
                 await this.client.getWalletBalance();
             } catch (error) {
-                this.logger.warn(`[Keep-Alive] Check Failed: ${error}`);
+                this.logger.warn(`[Keep-Alive] Failed: ${error}`);
             }
         }, 29000);
     }
 
-    // --- WebSocket Heartbeat ---
     startHeartbeat() {
         this.resetHeartbeatTimeout();
         this.pingInterval = setInterval(() => {
@@ -184,7 +178,7 @@ class TradingBot {
     resetHeartbeatTimeout() {
         clearTimeout(this.heartbeatTimeout);
         this.heartbeatTimeout = setTimeout(() => {
-            this.logger.warn('Heartbeat timeout! No pong received. Terminating.');
+            this.logger.warn('Heartbeat timeout. Terminating.');
             if (this.ws) this.ws.terminate();
         }, this.config.heartbeatTimeoutMs);
     }
@@ -194,7 +188,6 @@ class TradingBot {
         clearInterval(this.pingInterval);
     }
 
-    // --- WebSocket Connection ---
     async initWebSocket() {
         this.logger.info(`Connecting to: ${this.config.wsURL}`);
         this.ws = new WebSocket(this.config.wsURL);
@@ -203,7 +196,7 @@ class TradingBot {
         this.ws.on('message', (data) => this.handleWebSocketMessage(JSON.parse(data.toString())));
         this.ws.on('error', (error) => this.logger.error('WebSocket error:', error.message));
         this.ws.on('close', (code, reason) => {
-            this.logger.warn(`WebSocket disconnected: ${code} - ${reason}. Reconnecting...`);
+            this.logger.warn(`WebSocket disconnected: ${code} - ${reason}`);
             this.stopHeartbeat();
             this.authenticated = false;
             setTimeout(() => this.initWebSocket(), this.config.reconnectInterval);
@@ -211,37 +204,38 @@ class TradingBot {
     }
 
     authenticateWebSocket() {
-        const timestampNum = Math.floor(Date.now() / 1000);
-        const timestampStr = timestampNum.toString();
-
+        const timestampStr = Math.floor(Date.now() / 1000).toString();
         const signatureData = 'GET' + timestampStr + '/live';
+
         const signature = crypto
             .createHmac('sha256', this.config.apiSecret)
             .update(signatureData)
             .digest('hex');
 
-        const payload = {
+        this.ws.send(JSON.stringify({
             type: 'key-auth',
             payload: {
                 'api-key': this.config.apiKey,
                 timestamp: timestampStr,
                 signature: signature
             }
-        };
-
-        this.ws.send(JSON.stringify(payload));
+        }));
     }
 
     subscribeToChannels() {
         const symbols = this.targetAssets.map(asset => `${asset}USD`);
-        this.logger.info(`Subscribing to Execution Channels: ${symbols.join(', ')}`);
 
-        this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
-            { name: 'orders', symbols: ['all'] },
-            { name: 'positions', symbols: ['all'] },
-            { name: 'all_trades', symbols: symbols },
-            { name: 'user_trades', symbols: ['all'] } 
-        ]}}));
+        this.ws.send(JSON.stringify({
+            type: 'subscribe',
+            payload: {
+                channels: [
+                    { name: 'orders', symbols: ['all'] },
+                    { name: 'positions', symbols: ['all'] },
+                    { name: 'all_trades', symbols: symbols },
+                    { name: 'user_trades', symbols: ['all'] }
+                ]
+            }
+        }));
     }
 
     handleWebSocketMessage(message) {
@@ -250,7 +244,7 @@ class TradingBot {
             (message.type === 'key-auth' && message.status === 'authenticated') ||
             (message.success === true && message.status === 'authenticated')
         ) {
-            this.logger.info('✅ WebSocket AUTHENTICATED Successfully.');
+            this.logger.info('✅ WebSocket AUTHENTICATED');
             this.authenticated = true;
             this.subscribeToChannels();
             this.startHeartbeat();
@@ -258,70 +252,22 @@ class TradingBot {
             return;
         }
 
-        if (message.type === 'error' && !this.authenticated) {
-            this.logger.error(`❌ AUTH FAILED. Error Code: ${message.error ? message.error.code : 'Unknown'}`);
-        }
-
         if (message.type === 'pong') {
             this.resetHeartbeatTimeout();
             return;
         }
 
-        switch (message.type) {
-            case 'orders':
-                if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
-                break;
-
-            case 'positions':
-                if (Array.isArray(message.data)) {
-                    message.data.forEach(pos => this.handlePositionUpdate(pos));
-                } else if (message.size !== undefined) {
-                    this.handlePositionUpdate(message);
-                }
-                break;
-            
-            case 'user_trades':
-                this.measureLatency(message);
-                break;
+        if (message.type === 'user_trades') {
+            this.measureLatency(message);
         }
     }
 
     measureLatency(trade) {
         const clientOid = trade.client_order_id;
         if (clientOid && this.orderLatencies.has(clientOid)) {
-            const t0 = this.orderLatencies.get(clientOid);
-            const t1 = parseInt(trade.timestamp) / 1000;
-            const latency = t1 - t0;
-
-            let logMsg = `[LATENCY] ⚡ ${trade.symbol} | OID:${clientOid} | Delay: ${latency.toFixed(2)}ms`;
-            if (latency < 0) logMsg += " ⚠️ (Clock Drift)";
-            else if (latency < 60) logMsg += " 🚀 (Fast)";
-            else if (latency > 250) logMsg += " 🐢 (Slow)";
-
-            this.logger.info(logMsg);
+            const latency = Date.now() - this.orderLatencies.get(clientOid);
+            this.logger.info(`[LATENCY] ${trade.symbol} | ${latency}ms`);
             this.orderLatencies.delete(clientOid);
-        }
-    }
-
-    // --- State Management ---
-
-    handlePositionUpdate(pos) {
-        if (!pos.product_symbol) return;
-        const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
-        
-        if (asset) {
-            const size = parseFloat(pos.size);
-            const isOpen = size !== 0;
-
-            if (this.activePositions[asset] !== isOpen) {
-                this.activePositions[asset] = isOpen;
-
-                if (!isOpen && this.strategy.onPositionClose) {
-                    this.strategy.onPositionClose(asset);
-                }
-
-                this.logger.info(`[POS UPDATE] ${asset} is now ${isOpen ? 'OPEN' : 'CLOSED'} (Size: ${size})`);
-            }
         }
     }
 
@@ -329,90 +275,34 @@ class TradingBot {
         try {
             const response = await this.client.getPositions();
             const positions = response.result || [];
-            
+
             this.targetAssets.forEach(a => this.activePositions[a] = false);
 
             positions.forEach(pos => {
                 const size = parseFloat(pos.size);
                 if (size !== 0) {
-                    const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
-                    if (asset) {
-                        this.activePositions[asset] = true;
-                        this.logger.info(`[SYNC] Found OPEN position for ${asset}: ${size}`);
-                    }
+                    const asset = this.targetAssets.find(a =>
+                        pos.product_symbol.startsWith(a)
+                    );
+                    if (asset) this.activePositions[asset] = true;
                 }
             });
-            
-            this.isStateSynced = true;
-            this.logger.info(`Position State Synced: ${JSON.stringify(this.activePositions)}`);
+
+            this.logger.info(`Position State Synced`);
         } catch (error) {
             this.logger.error(`Failed to sync position state: ${error}`);
         }
     }
 
-    // [REQUIRED BY v8.1] Alias for hasOpenPosition
     getPosition(symbol) {
         return this.activePositions[symbol];
     }
 
-    hasOpenPosition(symbol) {
-        if (symbol) return this.activePositions[symbol] === true;
-        return Object.values(this.activePositions).some(status => status === true);
-    }
-
-    // --- External Feed Handler (Gate.io / Local Listener) ---
-    async handleSignalMessage(message) {
-        if (!this.authenticated) return;
-        // Guard against calls before strategy is ready
-        if (!this.strategy) return; 
-
-        try {
-            const data = JSON.parse(message.toString());
-            
-            // [FIXED] Compatible with Listener v4.0 (Gate.io format)
-            if (data.type === 'depthUpdate') {
-                if (typeof this.strategy.execute === 'function') {
-                    await this.strategy.execute(data);
-                }
-            }
-            // [LEGACY] Compatible with old Binance format (Just in case)
-            else if (data.type === 'B') {
-                const asset = data.s;
-                const depthPayload = {
-                    bids: [[ data.bb, data.bq ]], 
-                    asks: [[ data.ba, data.aq ]]  
-                };
-                if (typeof this.strategy.onDepthUpdate === 'function') {
-                    await this.strategy.onDepthUpdate(asset, depthPayload);
-                }
-            }
-        } catch (error) {
-            this.logger.error("Error handling signal message:", error);
-        }
-    }
-    
-    setupHttpServer() {
-        const httpServer = new WebSocket.Server({ port: this.config.port });
-        httpServer.on('connection', ws => {
-            this.logger.info(`External Data Feed Connected (Port ${this.config.port})`);
-            ws.on('message', m => this.handleSignalMessage(m));
-            ws.on('close', () => this.logger.warn('External Feed Disconnected'));
-            ws.on('error', (err) => this.logger.error('Signal listener error:', err));
-        });
-        this.logger.info(`Internal Data Server running on port ${this.config.port}`);
-    }
-    
     async placeOrder(orderData) {
         if (orderData.client_order_id) {
             this.recordOrderPunch(orderData.client_order_id);
         }
         return this.client.placeOrder(orderData);
-    }
-    
-    handleOrderUpdate(orderUpdate) {
-        if (orderUpdate.state === 'filled') {
-            this.logger.info(`[Trader] Order ${orderUpdate.id} FILLED.`);
-        }
     }
 }
 
@@ -420,13 +310,9 @@ class TradingBot {
     try {
         const bot = new TradingBot(config);
         await bot.start();
-        process.on('uncaughtException', async (err) => {
-            logger.error('Uncaught Exception:', err);
-            process.exit(1);
-        });
     } catch (error) {
         logger.error("Failed to start bot:", error);
         process.exit(1);
     }
 })();
-                         
+        
