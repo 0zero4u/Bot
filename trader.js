@@ -1,8 +1,8 @@
 const WebSocket = require('ws');
 const winston = require('winston');
 const crypto = require('crypto');
-const fs = require('fs'); // Added for file checks
-const path = require('path'); // Added for path safety
+const path = require('path'); // Added for safe paths
+const fs = require('fs');     // Added for file checking
 require('dotenv').config();
 
 // --- Rust Native Client ---
@@ -95,44 +95,40 @@ class TradingBot {
                 .replace(/Strategy(\.js)?$/i, '') 
                 .replace(/\.js$/i, '');
 
-            // Construct absolute path to ensure node finds it
+            // Use path.resolve to ensure we find the file relative to the script
             const strategyFileName = `${cleanName}Strategy.js`;
             const strategyPath = path.resolve(__dirname, 'strategies', strategyFileName);
 
             this.logger.info(`Loading Strategy from: ${strategyPath}`);
             
+            // Check if file exists before requiring
             if (!fs.existsSync(strategyPath)) {
-                throw new Error(`Strategy file not found at: ${strategyPath}`);
+                throw new Error(`Strategy file NOT FOUND at: ${strategyPath}`);
             }
 
             const StrategyClass = require(strategyPath);
 
-            // 1. Validate that we imported a Constructor/Class
+            // Ensure we imported a class/function
             if (typeof StrategyClass !== 'function') {
-                throw new Error(`Strategy file exports '${typeof StrategyClass}', expected a 'class' or 'function'. Check module.exports in ${strategyFileName}.`);
+                throw new Error(`Strategy export is invalid (${typeof StrategyClass}). Check module.exports in ${strategyFileName}`);
             }
 
             this.strategy = new StrategyClass(this);
 
-            // 2. Validate the Instance
-            if (!this.strategy) {
-                throw new Error("Strategy instantiation failed (returned null/undefined).");
-            }
-
-            // 3. Safe getName check
+            // --- THE FIX: Safe getName Check ---
             let strategyName = cleanName;
-            if (typeof this.strategy.getName === 'function') {
+            if (this.strategy && typeof this.strategy.getName === 'function') {
                 strategyName = this.strategy.getName();
             } else {
-                this.logger.warn(`Strategy loaded, but 'getName()' method is missing. Using default name: ${strategyName}`);
+                this.logger.warn(`Strategy loaded, but 'getName()' method is missing. Using filename: ${strategyName}`);
             }
 
             this.logger.info(`✅ Successfully loaded strategy: ${strategyName}`);
 
         } catch (e) {
             this.logger.error(`FATAL: Could not load strategy: ${e.message}`);
-            // Log stack trace for deeper debugging if needed
-            if (e.stack) this.logger.error(e.stack);
+            // Keep the process alive or exit depending on preference. 
+            // Exiting is safer if no strategy is loaded.
             process.exit(1);
         }
     }
@@ -320,7 +316,7 @@ class TradingBot {
             if (this.activePositions[asset] !== isOpen) {
                 this.activePositions[asset] = isOpen;
 
-                if (!isOpen && this.strategy && this.strategy.onPositionClose) {
+                if (!isOpen && this.strategy.onPositionClose) {
                     this.strategy.onPositionClose(asset);
                 }
 
@@ -367,7 +363,8 @@ class TradingBot {
     // --- External Feed Handler (Gate.io / Local Listener) ---
     async handleSignalMessage(message) {
         if (!this.authenticated) return;
-        if (!this.strategy) return; // Guard against missing strategy
+        // Guard against calls before strategy is ready
+        if (!this.strategy) return; 
 
         try {
             const data = JSON.parse(message.toString());
@@ -432,4 +429,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                
+                         
