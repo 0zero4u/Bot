@@ -1,8 +1,8 @@
-
-
 const WebSocket = require('ws');
 const winston = require('winston');
 const crypto = require('crypto');
+const fs = require('fs'); // Added for file checks
+const path = require('path'); // Added for path safety
 require('dotenv').config();
 
 // --- Rust Native Client ---
@@ -88,27 +88,51 @@ class TradingBot {
         this.heartbeatTimeout = null;
         this.restKeepAliveInterval = null;
 
-        // [FIX] Safe Strategy Loader (Prevents "Double Strategy" & "getName" crashes)
+        // [FIXED] Robust Strategy Loader
         try {
             const cleanName = this.config.strategy
                 .trim()
                 .replace(/Strategy(\.js)?$/i, '') 
                 .replace(/\.js$/i, '');
 
-            const strategyPath = `./strategies/${cleanName}Strategy.js`;
+            // Construct absolute path to ensure node finds it
+            const strategyFileName = `${cleanName}Strategy.js`;
+            const strategyPath = path.resolve(__dirname, 'strategies', strategyFileName);
+
             this.logger.info(`Loading Strategy from: ${strategyPath}`);
             
+            if (!fs.existsSync(strategyPath)) {
+                throw new Error(`Strategy file not found at: ${strategyPath}`);
+            }
+
             const StrategyClass = require(strategyPath);
+
+            // 1. Validate that we imported a Constructor/Class
+            if (typeof StrategyClass !== 'function') {
+                throw new Error(`Strategy file exports '${typeof StrategyClass}', expected a 'class' or 'function'. Check module.exports in ${strategyFileName}.`);
+            }
+
             this.strategy = new StrategyClass(this);
 
-            let strategyName = cleanName;
-            if (this.strategy && typeof this.strategy.getName === 'function') {
-                strategyName = this.strategy.getName();
+            // 2. Validate the Instance
+            if (!this.strategy) {
+                throw new Error("Strategy instantiation failed (returned null/undefined).");
             }
+
+            // 3. Safe getName check
+            let strategyName = cleanName;
+            if (typeof this.strategy.getName === 'function') {
+                strategyName = this.strategy.getName();
+            } else {
+                this.logger.warn(`Strategy loaded, but 'getName()' method is missing. Using default name: ${strategyName}`);
+            }
+
             this.logger.info(`✅ Successfully loaded strategy: ${strategyName}`);
 
         } catch (e) {
             this.logger.error(`FATAL: Could not load strategy: ${e.message}`);
+            // Log stack trace for deeper debugging if needed
+            if (e.stack) this.logger.error(e.stack);
             process.exit(1);
         }
     }
@@ -296,7 +320,7 @@ class TradingBot {
             if (this.activePositions[asset] !== isOpen) {
                 this.activePositions[asset] = isOpen;
 
-                if (!isOpen && this.strategy.onPositionClose) {
+                if (!isOpen && this.strategy && this.strategy.onPositionClose) {
                     this.strategy.onPositionClose(asset);
                 }
 
@@ -343,13 +367,14 @@ class TradingBot {
     // --- External Feed Handler (Gate.io / Local Listener) ---
     async handleSignalMessage(message) {
         if (!this.authenticated) return;
+        if (!this.strategy) return; // Guard against missing strategy
 
         try {
             const data = JSON.parse(message.toString());
             
             // [FIXED] Compatible with Listener v4.0 (Gate.io format)
             if (data.type === 'depthUpdate') {
-                if (this.strategy && typeof this.strategy.execute === 'function') {
+                if (typeof this.strategy.execute === 'function') {
                     await this.strategy.execute(data);
                 }
             }
@@ -360,7 +385,7 @@ class TradingBot {
                     bids: [[ data.bb, data.bq ]], 
                     asks: [[ data.ba, data.aq ]]  
                 };
-                if (this.strategy && typeof this.strategy.onDepthUpdate === 'function') {
+                if (typeof this.strategy.onDepthUpdate === 'function') {
                     await this.strategy.onDepthUpdate(asset, depthPayload);
                 }
             }
@@ -407,5 +432,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-
-    
+                
