@@ -1,6 +1,6 @@
 /**
  * TickStrategy.js
- * v9.1 [MARKET ORDER ENABLED]
+ * v9.2 [PERCENTAGE TRAIL NORMALIZED]
  */
 
 class TickStrategy {
@@ -15,6 +15,10 @@ class TickStrategy {
         this.EXIT_Z = 0.5;
         this.MIN_NOISE_FLOOR = 0.05;
         this.WARMUP_TICKS = 600; 
+        
+        // --- RISK SETTINGS (NORMALIZED) ---
+        // 0.02% = 0.0002. Example: BTC 96000 * 0.0002 = $19.2 trail
+        this.TRAIL_PERCENT = 0.0002; 
 
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
@@ -46,7 +50,7 @@ class TickStrategy {
     }
 
     getName() {
-        return "TickStrategy v9.1 (Market Order)";
+        return "TickStrategy v9.2 (Percentage Trail)";
     }
 
     onPositionClose(symbol) {
@@ -192,28 +196,37 @@ class TickStrategy {
             const asset = this.assets[symbol];
             const clientOid = `${symbol}_${Date.now()}`;
             
-            // Calculate Trail for bracket order
-            let trail = spread * 3; 
-            const minTrail = asset.config.tickSize * 10;
-            if (trail < minTrail) trail = minTrail;
+            // --- PERCENTAGE BASED NORMALIZATION ---
+            // Estimate entry price (Market Order)
+            const executionPrice = side === 'buy' ? bestAsk : bestBid;
             
+            // Calculate raw trail distance based on 0.02% of price
+            let rawTrail = executionPrice * this.TRAIL_PERCENT; 
+            
+            // Round to nearest valid Tick Size (Ceiling to avoid "0" on super low volatility)
+            // Example: XRP 2.50 * 0.0002 = 0.0005. tickSize is 0.0001. Result 0.0005.
+            let trail = Math.ceil(rawTrail / asset.config.tickSize) * asset.config.tickSize;
+
+            // Safety: Ensure we never go below 1 tick or a safe minimum
+            const minSafeTrail = asset.config.tickSize * 2; 
+            if (trail < minSafeTrail) trail = minSafeTrail;
+
             const trailAmount = trail.toFixed(asset.config.precision);
+            
             this.bot.recordOrderPunch(clientOid);
 
-            // [CHANGED] Market Order Execution
             await this.bot.placeOrder({
                 product_id: asset.config.deltaId.toString(),
                 side: side,
                 size: process.env.ORDER_SIZE || "1",
-                order_type: 'market_order', // Changed from limit_order
+                order_type: 'market_order', 
                 time_in_force: 'ioc', 
                 client_order_id: clientOid,
-                bracket_trail_amount: trailAmount,
+                bracket_trail_amount: trailAmount, // Normalized 0.02%
                 bracket_stop_trigger_method: 'mark_price'
-                // limit_price removed
             });
 
-            this.logger.info(`[EXECUTE] ${side.toUpperCase()} MARKET ORDER (Z-Score Trigger)`);
+            this.logger.info(`[EXECUTE] ${side.toUpperCase()} MARKET | Trail: ${trailAmount} (${(this.TRAIL_PERCENT*100).toFixed(3)}%)`);
 
         } catch (e) {
             this.logger.error(`[EXEC_ERROR] ${symbol}: ${e.message}`);
@@ -222,4 +235,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-        
+                    
