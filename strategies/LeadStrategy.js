@@ -1,37 +1,94 @@
-
 /**
  * LeadStrategy.js
- * v2.1 [KALMAN FILTER + LEADER IMBALANCE + DRIFT PROTECTION]
- * * Concept:
- * 1. Prediction: Driven by Binance BookTicker (via market_listener type 'B')
- * 2. Correction: Driven by Delta Public Trades (via 'all_trades')
- * 3. Synchronization: Uses LOCAL ARRIVAL TIME to manage uncertainty.
+ * Version: 8.0 [TIME-WINDOW BETA + SMOOTHED ADAPTIVE Q]
+ * * CRITICAL UPGRADES:
+ * 1. TIME-BASED BETA WINDOW:
+ * - Replaced fixed trade count (20) with time window (e.g., 10 seconds).
+ * - Ensures Beta represents the "Current Market Regime" regardless of volume.
+ * - High Vol = High Data Density = Robust Beta.
+ * 2. SMOOTHED ADAPTIVE Q:
+ * - Replaced raw error feedback with EMA of Innovation Variance.
+ * - Prevents Q from exploding due to single outlier trades.
+ * - Q only expands if divergence is persistent.
  */
+
+// --- UTILITY: Time-Based Rolling Statistics ---
+class TimeWindowStats {
+    constructor(windowMs = 10000) { // Default 10 seconds lookback
+        this.windowMs = windowMs;
+        this.data = []; // Stores { x, y, t }
+    }
+
+    add(x, y) {
+        const now = Date.now();
+        this.data.push({ x, y, t: now });
+
+        // Prune data older than windowMs
+        // Efficient enough for HFT (Array usually < 100 items)
+        while (this.data.length > 0 && (now - this.data[0].t > this.windowMs)) {
+            this.data.shift();
+        }
+    }
+
+    getBeta() {
+        const n = this.data.length;
+        // If data is sparse (quiet market), return 1.0 to be safe
+        if (n < 5) return 1.0; 
+
+        let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+        
+        for (let i = 0; i < n; i++) {
+            const p = this.data[i];
+            sumX += p.x;
+            sumY += p.y;
+            sumXY += p.x * p.y;
+            sumXX += p.x * p.x;
+        }
+
+        const meanX = sumX / n;
+        const meanY = sumY / n;
+        let varX = 0, covXY = 0;
+
+        for (let i = 0; i < n; i++) {
+            const p = this.data[i];
+            covXY += (p.x - meanX) * (p.y - meanY);
+            varX += (p.x - meanX) * (p.x - meanX);
+        }
+
+        if (varX < 1e-9) return 1.0;
+
+        let beta = covXY / varX;
+        // Clamp Beta (0.8 to 1.2) - Crypto arbs are rarely outside this
+        return Math.max(0.8, Math.min(1.2, beta));
+    }
+}
 
 class LeadStrategy {
     constructor(bot) {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- KALMAN PARAMETERS ---
-        // Process Noise (Q): How much we trust the Leader's move (High = Follow Leader Aggressively)
-        this.Q = 0.00005; 
-        // Measurement Noise (R): How much we trust the Lagger's LTP (High = Ignore Noise/Bounce)
-        this.R = 0.0005;  
-        // Correlation (Beta): 1.0 = Perfect Lock. 
-        this.BETA = 1.0;
+        // --- ADAPTIVE PARAMETERS ---
+        this.BASE_Q = 0.0000001; 
+        this.BASE_R = 0.001;  
+        
+        // Q SCALER: Multiplier for the Innovation Variance.
+        // Higher = Faster adaptation to trend changes.
+        this.Q_SCALER = 50000; 
+
+        // VARIANCE EMA ALPHA: Smoothing factor for error tracking.
+        // 0.05 means we need ~20 bad trades to fully shift the regime.
+        // This filters out "Shot Noise" (single outliers).
+        this.VAR_EMA_ALPHA = 0.05;
+
+        // Lagger EMA: Smoothing the Divergence signal
+        this.EMA_ALPHA = 0.2; 
 
         // --- TRADING TRIGGERS ---
-        this.ENTRY_THRESHOLD = 0.0006; // 0.06% Divergence (Conservative)
-        this.PROFIT_MARGIN = 0.0003;   // 0.03% Markup
-        this.IMBALANCE_FILTER = 0.35;  // Requires 35% Order Book Imbalance to confirm
-        this.COOLDOWN_MS = 400;        
+        this.ENTRY_THRESHOLD = 0.0005; 
+        this.PROFIT_MARGIN = 0.0003;   
+        this.COOLDOWN_MS = 200;        
 
-        // --- STATE ---
-        this.filters = {};
-        this.lastTriggerTime = {};
-        
-        // Asset Config - Mapped to Delta Product IDs
         this.assets = {
             'XRP': { deltaId: 14969, precision: 4 },
             'BTC': { deltaId: 27,    precision: 1 },
@@ -39,134 +96,160 @@ class LeadStrategy {
             'SOL': { deltaId: 417,   precision: 3 }
         };
 
-        this.logger.info(`[LeadStrategy] Loaded. Q:${this.Q} R:${this.R}`);
+        this.filters = {};
+        this.stats = {}; 
+        this.lastTriggerTime = {};
+
+        this.logger.info(`[LeadStrategy v8.0] Time-Window Beta & Smoothed Q Loaded.`);
     }
 
     initFilter(asset, initialPrice) {
         this.filters[asset] = {
-            x: initialPrice,       // The "Hidden" True Price
-            P: 1.0,                // Error Covariance (Uncertainty)
-            lastLeader: initialPrice,
+            x: initialPrice,             
+            P: 0.001,                    
+            lastLeader: initialPrice,    
+            
+            // Smoothed States
+            laggerEMA: initialPrice, 
+            innovationVar: 0, // Variance of the prediction error
+            
+            // Adaptive State
+            dynamicQ: this.BASE_Q,
+
+            // Snapshots
+            leaderAtLastTrade: initialPrice,
+            laggerAtLastTrade: initialPrice,
+            
             lastUpdateT: Date.now(),
-            initialized: true
+            beta: 1.0 
         };
+        // Use 10-second rolling window for Beta
+        this.stats[asset] = new TimeWindowStats(10000); 
     }
 
     /**
-     * PREDICTION STEP (Driven by Binance)
-     * Aligned with trader.js 'handleSignalMessage' type 'B'
+     * PREDICTION (Binance)
      */
     async onDepthUpdate(asset, depth) {
         if (!this.assets[asset]) return;
 
-        // Parse Binance Data
         const bestBid = parseFloat(depth.bids[0][0]);
         const bestAsk = parseFloat(depth.asks[0][0]);
-        const bidQty  = parseFloat(depth.bids[0][1]);
-        const askQty  = parseFloat(depth.asks[0][1]);
         const leaderMid = (bestBid + bestAsk) / 2;
         const now = Date.now();
 
-        // Init if missing
         if (!this.filters[asset]) {
             this.initFilter(asset, leaderMid);
             return;
         }
 
         const filter = this.filters[asset];
-
-        // 1. STALENESS CHECK (Drift Protection)
-        // If we haven't seen data for 2 seconds, reset uncertainty to High
-        if (now - filter.lastUpdateT > 2000) {
-            filter.P = 1.0; 
-        }
-
-        // 2. KALMAN PREDICTION
-        // Project State Forward: NewEst = OldEst + (LeaderChange * Beta)
-        const leaderDelta = leaderMid - filter.lastLeader;
-        filter.x = filter.x + (leaderDelta * this.BETA);
         
-        // Update Uncertainty
-        filter.P = filter.P + this.Q;
+        // 1. Time Scaling
+        let dt = (now - filter.lastUpdateT) / 1000;
+        if (dt < 0) dt = 0; if (dt > 5) dt = 5;
+
+        // 2. Prediction (State Extrapolation)
+        const incrementalLeaderMove = leaderMid - filter.lastLeader;
+        filter.x = filter.x + (incrementalLeaderMove * filter.beta);
         
-        // Update Memory
+        // 3. Uncertainty Update (Using Smoothed Dynamic Q)
+        filter.P = filter.P + (filter.dynamicQ * dt);
+
         filter.lastLeader = leaderMid;
         filter.lastUpdateT = now;
 
-        // 3. CALCULATE METRICS
-        const divergence = (leaderMid - filter.x) / filter.x; // % Diff
-        const imbalance = (bidQty - askQty) / (bidQty + askQty); // -1 to 1
+        // 4. Signal Check (EMA vs Fair Value)
+        const referencePrice = filter.laggerEMA;
+        if (referencePrice === 0) return;
 
-        // 4. CHECK TRIGGER
+        const divergence = (filter.x - referencePrice) / referencePrice;
+
         if (Math.abs(divergence) > this.ENTRY_THRESHOLD) {
-            await this.tryExecute(asset, divergence, imbalance, filter.x);
+            await this.tryExecute(asset, divergence, filter.x, referencePrice);
         }
     }
 
     /**
-     * CORRECTION STEP (Driven by Delta Trades)
-     * Now correctly called by trader.js 'all_trades'
+     * CORRECTION (Delta Trade)
      */
     onLaggerTrade(trade) {
         const rawSymbol = trade.symbol || trade.product_symbol;
         if (!rawSymbol) return;
-
-        // Map "XRPUSD" or "XRP" -> "XRP"
         const asset = Object.keys(this.assets).find(k => rawSymbol.startsWith(k));
-        
         if (!asset || !this.filters[asset]) return;
 
         const tradePrice = parseFloat(trade.price);
+        const tradeSize = parseFloat(trade.size || 0);
         if (isNaN(tradePrice)) return;
 
         const filter = this.filters[asset];
+        const stat = this.stats[asset];
 
-        // KALMAN CORRECTION
-        // K = P / (P + R)
-        const K = filter.P / (filter.P + this.R);
-        
-        // Correction: Move Estimate towards the Trade Price
-        filter.x = filter.x + K * (tradePrice - filter.x);
-        
-        // Reduce Uncertainty
+        // 1. Update Lagger EMA (Signal Smoothing)
+        if (filter.laggerEMA === 0) filter.laggerEMA = tradePrice;
+        else {
+            filter.laggerEMA = (1 - this.EMA_ALPHA) * filter.laggerEMA + (this.EMA_ALPHA * tradePrice);
+        }
+
+        // 2. Update Beta (Time-Based Window)
+        const deltaLagger = tradePrice - filter.laggerAtLastTrade;
+        const deltaLeader = filter.lastLeader - filter.leaderAtLastTrade;
+
+        if (Math.abs(deltaLeader) > 1e-8 || Math.abs(deltaLagger) > 1e-8) {
+            stat.add(deltaLeader, deltaLagger);
+            filter.beta = stat.getBeta();
+        }
+
+        // 3. Kalman Correction
+        const effectiveSize = Math.max(1, tradeSize);
+        const dynamicR = this.BASE_R / Math.sqrt(effectiveSize);
+
+        const K = filter.P / (filter.P + dynamicR);
+        const innovation = tradePrice - filter.x; 
+
+        filter.x = filter.x + K * innovation;
         filter.P = (1 - K) * filter.P;
 
-        // Debug Log (Occasional: 1% sample)
-        if (Math.random() < 0.01) {
-            this.logger.info(`[Kalman] ${asset} Trade:${tradePrice} Est:${filter.x.toFixed(4)} Gap:${(filter.x - tradePrice).toFixed(4)}`);
+        // 4. ADAPTIVE Q (Smoothed Variance) [USER FIX]
+        // Calculate raw normalized squared error
+        const rawErrorSq = (innovation * innovation) / (tradePrice * tradePrice);
+        
+        // Update Variance EMA
+        // If rawErrorSq is high, innovationVar rises slowly.
+        filter.innovationVar = (1 - this.VAR_EMA_ALPHA) * filter.innovationVar + (this.VAR_EMA_ALPHA * rawErrorSq);
+        
+        // Calculate Q based on SMOOTHED Variance
+        filter.dynamicQ = this.BASE_Q * (1 + (filter.innovationVar * this.Q_SCALER));
+
+        // 5. Snapshots
+        filter.laggerAtLastTrade = tradePrice;
+        filter.leaderAtLastTrade = filter.lastLeader; 
+
+        if (Math.random() < 0.05) {
+            this.logger.info(`[Kalman] ${asset} β:${filter.beta.toFixed(3)} | Q:${filter.dynamicQ.toExponential(2)} | Var:${filter.innovationVar.toExponential(2)}`);
         }
     }
 
-    /**
-     * EXECUTION LOGIC (Blind Limit IOC)
-     */
-    async tryExecute(asset, divergence, imbalance, fairValue) {
-        // Cooldown
+    async tryExecute(asset, divergence, fairValue, referencePrice) {
         const now = Date.now();
         if (this.lastTriggerTime[asset] && (now - this.lastTriggerTime[asset] < this.COOLDOWN_MS)) return;
-
-        // Check Open Position (Don't double up)
         if (this.bot.hasOpenPosition(asset)) return;
 
         const spec = this.assets[asset];
         let side = null;
         let limitPrice = 0;
 
-        // BUY SIGNAL: Leader is Higher AND Book supports it
-        if (divergence > 0 && imbalance > this.IMBALANCE_FILTER) {
+        if (divergence > 0) {
             side = 'buy';
-            limitPrice = fairValue * (1 - this.PROFIT_MARGIN);
-        } 
-        // SELL SIGNAL: Leader is Lower AND Book supports it
-        else if (divergence < 0 && imbalance < -this.IMBALANCE_FILTER) {
+            limitPrice = referencePrice * (1 + this.PROFIT_MARGIN); 
+        } else if (divergence < 0) {
             side = 'sell';
-            limitPrice = fairValue * (1 + this.PROFIT_MARGIN);
+            limitPrice = referencePrice * (1 - this.PROFIT_MARGIN);
         }
 
         if (side) {
             this.lastTriggerTime[asset] = now;
-            
-            // Format Price
             const pScale = Math.pow(10, spec.precision);
             const finalPrice = (Math.floor(limitPrice * pScale) / pScale).toFixed(spec.precision);
 
@@ -176,23 +259,17 @@ class LeadStrategy {
                 size: process.env.ORDER_SIZE || "10",
                 order_type: 'limit_order',
                 limit_price: finalPrice,
-                time_in_force: 'ioc', // Sniping
+                time_in_force: 'ioc',
                 client_order_id: `k_${now}`
             };
-
-            this.logger.info(`[Sniper] 🔫 ${asset} ${side.toUpperCase()} | Div:${(divergence*100).toFixed(3)}% | OBI:${imbalance.toFixed(2)} | Target:${finalPrice}`);
             
+            this.logger.info(`[Sniper] 🔫 ${asset} ${side.toUpperCase()} | EMA:${referencePrice.toFixed(spec.precision)} | Div:${(divergence*100).toFixed(3)}%`);
             await this.bot.placeOrder(payload);
         }
     }
 
-    getName() { return "LeadStrategy (Kalman v2.1)"; }
-    
-    // Callback if position closes (reset cooldown/state if needed)
-    onPositionClose(asset) {
-        // Optional: clear memory or reset filter
-        // this.lastTriggerTime[asset] = 0; 
-    }
+    getName() { return "LeadStrategy (Adaptive v8.0)"; }
+    onPositionClose(asset) {}
 }
 
 module.exports = LeadStrategy;
