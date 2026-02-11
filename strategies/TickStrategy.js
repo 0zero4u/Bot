@@ -1,3 +1,4 @@
+
 /**
  * TickStrategy.js
  * v8.1 [CORRECTED & SAFE]
@@ -14,7 +15,7 @@ class TickStrategy {
         this.ENTRY_Z = 2.5;
         this.EXIT_Z = 0.5;
         this.MIN_NOISE_FLOOR = 0.05;
-        this.WARMUP_TICKS = 4000; // Reduced from 10k (too long) to 1k
+        this.WARMUP_TICKS = 1000; 
 
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
@@ -79,7 +80,6 @@ class TickStrategy {
             const size = parseFloat(levels[i][1]);
             if (isNaN(size) || isNaN(price)) continue;
 
-            // Distance calculation must remain neutral!
             const dist = Math.abs(price - pureMidPrice);
             const ticksAway = dist / tickSize;
             const weight = Math.exp(-this.DECAY_ALPHA * ticksAway);
@@ -133,7 +133,6 @@ class TickStrategy {
             const delta = currentOBI - asset.obiMean;
             asset.obiMean += this.WELFORD_ALPHA * delta;
             
-            // Standard EMA Variance
             asset.obiVariance =
                 (1 - this.WELFORD_ALPHA) * asset.obiVariance +
                 this.WELFORD_ALPHA * delta * delta;
@@ -183,7 +182,6 @@ class TickStrategy {
                     `[SNIPER] ${symbol} ${side.toUpperCase()} | Z: ${zScore.toFixed(2)}`
                 );
 
-                // Pass Bid/Ask to calculate aggressive limit price
                 this.executeTrade(symbol, side, bestBid, bestAsk, spread);
             }
         } else {
@@ -208,36 +206,29 @@ class TickStrategy {
             const asset = this.assets[symbol];
             const clientOid = `${symbol}_${Date.now()}`;
 
-            // [FIX 2] AGGRESSIVE LIMIT ORDER
-            // We set price *through* the spread to act like a Market Order,
-            // but this allows us to attach a Trailing Stop (Bracket).
-            
+            // AGGRESSIVE LIMIT ORDER
             let limitPrice;
             if (side === 'buy') {
-                // Buy at Ask + Slippage Tolerance
                 limitPrice = bestAsk + (asset.config.tickSize * 5); 
             } else {
-                // Sell at Bid - Slippage Tolerance
                 limitPrice = bestBid - (asset.config.tickSize * 5);
             }
             
             limitPrice = parseFloat(limitPrice.toFixed(asset.config.precision));
 
-            // [FIX 3] Restore Trailing Stop
             let trail = spread * 3; 
             const minTrail = asset.config.tickSize * 10;
             if (trail < minTrail) trail = minTrail;
-            if (side === 'buy') trail = -trail; // Delta requires negative for Buy trails
+            if (side === 'buy') trail = -trail; 
 
             await this.bot.placeOrder({
                 product_id: asset.config.deltaId.toString(),
                 side: side,
                 size: process.env.ORDER_SIZE || "1",
                 order_type: 'limit_order',
-                time_in_force: 'ioc', // Immediate or Cancel (Acts like Market)
+                time_in_force: 'ioc', 
                 limit_price: limitPrice.toString(),
                 client_order_id: clientOid,
-                // These brackets keep us safe:
                 bracket_trail_amount: trail.toFixed(asset.config.precision),
                 bracket_stop_trigger_method: 'mark_price'
             });
@@ -251,3 +242,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
+            
