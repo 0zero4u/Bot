@@ -1,9 +1,6 @@
 /**
  * TickStrategy.js
- * v9.0 [FIXED & ALIGNED]
- * 1. Warmup reduced to 20 ticks.
- * 2. Uses Market Orders for guaranteed entry.
- * 3. Aligned with 'depthUpdate' protocol.
+ * v9.1 [MARKET ORDER ENABLED]
  */
 
 class TickStrategy {
@@ -17,8 +14,6 @@ class TickStrategy {
         this.ENTRY_Z = 3.0;
         this.EXIT_Z = 0.5;
         this.MIN_NOISE_FLOOR = 0.05;
-        
-        // [FIX] Fast Warmup
         this.WARMUP_TICKS = 600; 
 
         const MASTER_CONFIG = {
@@ -51,7 +46,7 @@ class TickStrategy {
     }
 
     getName() {
-        return "TickStrategy v9.0 (Market Order Fix)";
+        return "TickStrategy v9.1 (Market Order)";
     }
 
     onPositionClose(symbol) {
@@ -121,7 +116,6 @@ class TickStrategy {
 
         const currentOBI = (wBidVol - wAskVol) / (wBidVol + wAskVol);
 
-        // --- VARIANCE UPDATE ---
         if (asset.obiCount === 0) {
             asset.obiMean = currentOBI;
             asset.obiVariance = 0;
@@ -137,9 +131,8 @@ class TickStrategy {
             asset.obiCount++;
         }
 
-        // [FIX] Warmup Visibility
         if (asset.obiCount < this.WARMUP_TICKS) {
-            if (asset.obiCount % 5 === 0) {
+            if (asset.obiCount % 50 === 0) {
                 this.logger.info(`[WARMUP] ${symbol} Gathering Data: ${asset.obiCount}/${this.WARMUP_TICKS}`);
             }
             return;
@@ -199,8 +192,7 @@ class TickStrategy {
             const asset = this.assets[symbol];
             const clientOid = `${symbol}_${Date.now()}`;
             
-            // [FIX] Market Order Logic
-            const entryPrice = side === 'buy' ? bestAsk : bestBid;
+            // Calculate Trail for bracket order
             let trail = spread * 3; 
             const minTrail = asset.config.tickSize * 10;
             if (trail < minTrail) trail = minTrail;
@@ -208,15 +200,17 @@ class TickStrategy {
             const trailAmount = trail.toFixed(asset.config.precision);
             this.bot.recordOrderPunch(clientOid);
 
+            // [CHANGED] Market Order Execution
             await this.bot.placeOrder({
                 product_id: asset.config.deltaId.toString(),
                 side: side,
                 size: process.env.ORDER_SIZE || "1",
-                order_type: 'market_order', // GUARANTEED EXECUTION
+                order_type: 'market_order', // Changed from limit_order
                 time_in_force: 'ioc', 
                 client_order_id: clientOid,
                 bracket_trail_amount: trailAmount,
                 bracket_stop_trigger_method: 'mark_price'
+                // limit_price removed
             });
 
             this.logger.info(`[EXECUTE] ${side.toUpperCase()} MARKET ORDER (Z-Score Trigger)`);
@@ -228,4 +222,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-    
+        
