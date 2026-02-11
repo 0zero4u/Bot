@@ -1,11 +1,10 @@
 
-
 const WebSocket = require('ws');
 const winston = require('winston');
 const crypto = require('crypto');
 require('dotenv').config();
 
-// --- Rust Native Client ---
+// --- [CHANGED] Use Rust Native Client ---
 const { DeltaNativeClient } = require('fast-client');
 const DeltaClient = DeltaNativeClient; 
 
@@ -407,6 +406,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-
-
-            
+    
