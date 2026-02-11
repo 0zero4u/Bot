@@ -1,6 +1,6 @@
 /**
  * TickStrategy.js
- * v7.2 [ALIGNED]
+ * v8.1 [CORRECTED & SAFE]
  */
 
 class TickStrategy {
@@ -9,12 +9,12 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- STRATEGY PARAMETERS ---
-        this.DECAY_ALPHA = 0.5;      
-        this.WELFORD_ALPHA = 0.02;   
-        this.ENTRY_Z = 2.5;          
-        this.EXIT_Z = 0.5;           
-        this.MIN_NOISE_FLOOR = 0.05; 
-        this.WARMUP_TICKS = 10000; // Adjusted for safer startup
+        this.DECAY_ALPHA = 0.5;
+        this.WELFORD_ALPHA = 0.02;
+        this.ENTRY_Z = 2.5;
+        this.EXIT_Z = 0.5;
+        this.MIN_NOISE_FLOOR = 0.05;
+        this.WARMUP_TICKS = 4000; // Reduced from 10k (too long) to 1k
 
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
@@ -24,10 +24,9 @@ class TickStrategy {
         };
 
         this.assets = {};
-        
+
         const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
         targets.forEach(symbol => {
-            // Ensure symbol matches what comes from market_listener (no _USDT)
             const cleanSymbol = symbol.replace('_USDT', '');
             if (MASTER_CONFIG[cleanSymbol]) {
                 this.assets[cleanSymbol] = {
@@ -35,24 +34,25 @@ class TickStrategy {
                     obiMean: 0,
                     obiVariance: 0,
                     obiCount: 0,
-                    currentRegime: 0, 
-                    midPrice: 0,      
-                    avgSpread: 0,     
-                    lastZ: 0,   
-                    lastLogTime: 0 
+                    currentRegime: 0,
+                    regimeSide: null,
+                    midPrice: 0,
+                    avgSpread: 0,
+                    lastZ: 0,
+                    lastLogTime: 0
                 };
             }
         });
     }
 
     getName() {
-        return "TickStrategy v7.2";
+        return "TickStrategy v8.1";
     }
 
-    // Called when a position closes (added to Trader.js logic)
     onPositionClose(symbol) {
         if (this.assets[symbol]) {
             this.assets[symbol].currentRegime = 0;
+            this.assets[symbol].regimeSide = null;
             this.logger.info(`[STRATEGY] ${symbol} Position Closed -> Regime Reset.`);
         }
     }
@@ -61,32 +61,32 @@ class TickStrategy {
         if (!data || !data.type) return;
         try {
             if (data.type === 'depthUpdate') {
-                // market_listener sends 's' as cleaned symbol (e.g., 'XRP')
-                // but we run replace just in case.
                 const cleanSymbol = data.s.replace('_USDT', '');
                 await this.onDepthUpdate(cleanSymbol, data);
-            } 
+            }
         } catch (e) {
             this.logger.error(`[STRATEGY] Execution Error: ${e.message}`);
         }
     }
 
-    calcNormalizedVol(levels, midPrice, tickSize) {
+    // [FIX 1] Use Pure MidPrice for Distance to prevent Feedback Loop
+    calcNormalizedVol(levels, pureMidPrice, tickSize) {
         let weightedTotal = 0;
-        const limit = Math.min(levels.length, 10); 
+        const limit = Math.min(levels.length, 10);
 
         for (let i = 0; i < limit; i++) {
             const price = parseFloat(levels[i][0]);
             const size = parseFloat(levels[i][1]);
-            
             if (isNaN(size) || isNaN(price)) continue;
 
-            const dist = Math.abs(price - midPrice);
+            // Distance calculation must remain neutral!
+            const dist = Math.abs(price - pureMidPrice);
             const ticksAway = dist / tickSize;
             const weight = Math.exp(-this.DECAY_ALPHA * ticksAway);
-            
+
             weightedTotal += size * weight;
         }
+
         return weightedTotal;
     }
 
@@ -94,35 +94,50 @@ class TickStrategy {
         const asset = this.assets[symbol];
         if (!asset) return;
         if (!depth.bids.length || !depth.asks.length) return;
-        
+
         const bestBid = parseFloat(depth.bids[0][0]);
         const bestAsk = parseFloat(depth.asks[0][0]);
-        
-        if (bestBid >= bestAsk) return; 
+        if (bestBid >= bestAsk) return;
 
-        const midPrice = (bestBid + bestAsk) / 2;
+        const bestBidSize = parseFloat(depth.bids[0][1]);
+        const bestAskSize = parseFloat(depth.asks[0][1]);
+
+        // Standard Mid (For Math)
+        const pureMid = (bestBid + bestAsk) / 2;
+        
+        // Microprice (For Signal)
+        const microprice =
+            (bestAsk * bestBidSize + bestBid * bestAskSize) /
+            (bestBidSize + bestAskSize);
+
         const spread = bestAsk - bestBid;
-        asset.midPrice = midPrice;
+        asset.midPrice = microprice; // Store microprice for display/logging
 
         if (asset.avgSpread === 0) asset.avgSpread = spread;
         else asset.avgSpread = (asset.avgSpread * 0.99) + (spread * 0.01);
 
-        const wBidVol = this.calcNormalizedVol(depth.bids, midPrice, asset.config.tickSize);
-        const wAskVol = this.calcNormalizedVol(depth.asks, midPrice, asset.config.tickSize);
+        // [FIX 1 Applied] Pass pureMid, not microprice
+        const wBidVol = this.calcNormalizedVol(depth.bids, pureMid, asset.config.tickSize);
+        const wAskVol = this.calcNormalizedVol(depth.asks, pureMid, asset.config.tickSize);
 
         if (wBidVol + wAskVol === 0) return;
 
         const currentOBI = (wBidVol - wAskVol) / (wBidVol + wAskVol);
 
-        // --- Welford Updates ---
+        // --- FIXED EMA VARIANCE UPDATE ---
         if (asset.obiCount === 0) {
             asset.obiMean = currentOBI;
             asset.obiVariance = 0;
             asset.obiCount = 1;
         } else {
             const delta = currentOBI - asset.obiMean;
-            asset.obiMean = asset.obiMean + (this.WELFORD_ALPHA * delta);
-            asset.obiVariance = (1 - this.WELFORD_ALPHA) * (asset.obiVariance + this.WELFORD_ALPHA * delta * delta);
+            asset.obiMean += this.WELFORD_ALPHA * delta;
+            
+            // Standard EMA Variance
+            asset.obiVariance =
+                (1 - this.WELFORD_ALPHA) * asset.obiVariance +
+                this.WELFORD_ALPHA * delta * delta;
+
             asset.obiCount++;
         }
 
@@ -134,83 +149,100 @@ class TickStrategy {
 
         const now = Date.now();
         if (now - asset.lastLogTime > 4000) {
-            this.logger.info(`[HEARTBEAT] ${symbol} | Z: ${zScore.toFixed(2)} | OBI: ${currentOBI.toFixed(3)} | Vol: ${effectiveStdDev.toFixed(4)}`);
+            this.logger.info(
+                `[HEARTBEAT] ${symbol} | Z: ${zScore.toFixed(2)} | OBI: ${currentOBI.toFixed(3)} | Vol: ${effectiveStdDev.toFixed(4)}`
+            );
             asset.lastLogTime = now;
         }
 
-        this.handleRegime(symbol, zScore, spread, asset.avgSpread, currentOBI);
-        asset.lastZ = zScore; 
+        this.handleRegime(symbol, zScore, spread, asset.avgSpread, currentOBI, bestBid, bestAsk);
+        asset.lastZ = zScore;
     }
 
-    handleRegime(symbol, zScore, spread, avgSpread, currentOBI) {
+    handleRegime(symbol, zScore, spread, avgSpread, currentOBI, bestBid, bestAsk) {
         const asset = this.assets[symbol];
         const absZ = Math.abs(zScore);
 
         let dynamicEntry = this.ENTRY_Z;
         if (spread > avgSpread * 2) {
-             dynamicEntry = this.ENTRY_Z * 1.5;
+            dynamicEntry = this.ENTRY_Z * 1.5;
         }
+
+        const signFlipped =
+            asset.lastZ !== 0 &&
+            Math.sign(zScore) !== Math.sign(asset.lastZ);
 
         if (asset.currentRegime === 0) {
             if (absZ > dynamicEntry) {
-                asset.currentRegime = 1;
                 const side = zScore > 0 ? 'buy' : 'sell';
-                this.logger.info(`[SNIPER] ${symbol} ${side.toUpperCase()} | Z: ${zScore.toFixed(2)} (Req: ${dynamicEntry.toFixed(1)})`);
-                this.executeTrade(symbol, side, spread, currentOBI);
+
+                asset.currentRegime = 1;
+                asset.regimeSide = side;
+
+                this.logger.info(
+                    `[SNIPER] ${symbol} ${side.toUpperCase()} | Z: ${zScore.toFixed(2)}`
+                );
+
+                // Pass Bid/Ask to calculate aggressive limit price
+                this.executeTrade(symbol, side, bestBid, bestAsk, spread);
             }
         } else {
-            if (absZ < this.EXIT_Z) {
+            if (absZ < this.EXIT_Z || signFlipped) {
                 asset.currentRegime = 0;
-                this.logger.info(`[COOLDOWN] ${symbol} | Z-Score normalized.`);
+                asset.regimeSide = null;
+
+                this.logger.info(
+                    `[COOLDOWN] ${symbol} | Regime Reset (Exit or Flip)`
+                );
             }
         }
     }
 
-    async executeTrade(symbol, side, spread, obiSignal) {
+    async executeTrade(symbol, side, bestBid, bestAsk, spread) {
         if (this.bot.isOrderInProgress) return;
-        
-        // This now calls the ALIAS method we added to trader.js
+
         const pos = this.bot.getPosition(symbol);
-        
-        // If pos is true (meaning open position exists), we abort.
-        // trader.js uses boolean, so checking `if (pos)` is sufficient.
         if (pos) return;
 
         try {
             const asset = this.assets[symbol];
-            const price = asset.midPrice;
+            const clientOid = `${symbol}_${Date.now()}`;
+
+            // [FIX 2] AGGRESSIVE LIMIT ORDER
+            // We set price *through* the spread to act like a Market Order,
+            // but this allows us to attach a Trailing Stop (Bracket).
             
-            const halfSpread = spread / 2;
-            const fairValueOffset = halfSpread * obiSignal; 
-            let limitPrice = price + fairValueOffset;
-
-            if (side === 'buy') limitPrice += asset.config.tickSize;
-            else limitPrice -= asset.config.tickSize;
-
+            let limitPrice;
+            if (side === 'buy') {
+                // Buy at Ask + Slippage Tolerance
+                limitPrice = bestAsk + (asset.config.tickSize * 5); 
+            } else {
+                // Sell at Bid - Slippage Tolerance
+                limitPrice = bestBid - (asset.config.tickSize * 5);
+            }
+            
             limitPrice = parseFloat(limitPrice.toFixed(asset.config.precision));
 
-            let trail = spread * 2.5; 
-            const minTrail = asset.config.tickSize * 5;
+            // [FIX 3] Restore Trailing Stop
+            let trail = spread * 3; 
+            const minTrail = asset.config.tickSize * 10;
             if (trail < minTrail) trail = minTrail;
-            
-            if (side === 'buy') trail = -trail;
-            
-            // Client Order ID for Latency Tracking
-            const clientOid = `${symbol}_${Date.now()}`;
+            if (side === 'buy') trail = -trail; // Delta requires negative for Buy trails
 
             await this.bot.placeOrder({
                 product_id: asset.config.deltaId.toString(),
                 side: side,
                 size: process.env.ORDER_SIZE || "1",
                 order_type: 'limit_order',
-                time_in_force: 'ioc', 
+                time_in_force: 'ioc', // Immediate or Cancel (Acts like Market)
                 limit_price: limitPrice.toString(),
+                client_order_id: clientOid,
+                // These brackets keep us safe:
                 bracket_trail_amount: trail.toFixed(asset.config.precision),
-                bracket_stop_trigger_method: 'mark_price',
-                client_order_id: clientOid
+                bracket_stop_trigger_method: 'mark_price'
             });
 
-            this.logger.info(`[EXECUTE] ${side} @ ${limitPrice} | OBI: ${obiSignal.toFixed(2)}`);
+            this.logger.info(`[EXECUTE] ${side.toUpperCase()} AGGRESSIVE LIMIT @ ${limitPrice}`);
 
         } catch (e) {
             this.logger.error(`[EXEC_ERROR] ${symbol}: ${e.message}`);
@@ -219,4 +251,3 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-            
