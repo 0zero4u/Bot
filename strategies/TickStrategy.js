@@ -19,7 +19,7 @@ class TickStrategy {
         this.MIN_NOISE_FLOOR = 0.05;
         
         // [FIX] Fast Warmup
-        this.WARMUP_TICKS = 4020; 
+        this.WARMUP_TICKS = 600; 
 
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
