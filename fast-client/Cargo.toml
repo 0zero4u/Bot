@@ -8,7 +8,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Node.js Interface
-napi = { version = "2.14", features = ["async", "napi4"] }
+# [FIX] Added "serde-json" feature here so we can return JSON objects to JS
+napi = { version = "2.14", features = ["async", "napi4", "serde-json"] }
 napi-derive = "2.14"
 
 # Async Runtime (The engine)
@@ -35,4 +36,3 @@ lto = true             # Link Time Optimization (Makes code faster)
 strip = true           # Removes symbols (Makes binary smaller)
 codegen-units = 1      # Optimizes better at cost of compile time
 panic = 'abort'        # If it crashes, it crashes instantly (no unwinding overhead)
- 
