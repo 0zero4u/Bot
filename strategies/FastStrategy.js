@@ -18,8 +18,8 @@ class FastStrategy {
         this.LOG_FREQ_MS = 5000;
         
         // --- TIERED ENTRY THRESHOLDS ---
-        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '80');
-        this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '95');
+        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '60');
+        this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '75');
         this.LOCK_DURATION_MS = 2000; 
         
         // --- VIP 0ms FILTERS (Noise Reduction) ---
