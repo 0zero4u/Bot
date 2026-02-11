@@ -14,12 +14,12 @@ class TickStrategy {
         // --- STRATEGY PARAMETERS ---
         this.DECAY_ALPHA = 0.5;
         this.WELFORD_ALPHA = 0.02;
-        this.ENTRY_Z = 2.5;
+        this.ENTRY_Z = 5.5;
         this.EXIT_Z = 0.5;
         this.MIN_NOISE_FLOOR = 0.05;
         
         // [FIX] Fast Warmup
-        this.WARMUP_TICKS = 20; 
+        this.WARMUP_TICKS = 4020; 
 
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
