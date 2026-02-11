@@ -20,7 +20,7 @@ class FastStrategy {
         
         // --- TIERED ENTRY THRESHOLDS ---
         this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '75');
-        this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '40');
+        this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '70');
         this.LOCK_DURATION_MS = 2000; 
         
         // --- DUST FILTER (THE FIX) ---
@@ -32,10 +32,10 @@ class FastStrategy {
 
         // --- PREDICTIVE SCORING WEIGHTS ---
         this.WEIGHTS = {
-            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '30'),      // Baseline Pressure
-            GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '20'),  // Lagging Velocity
-            GATE3_SHIFT: parseInt(process.env.W_SHIFT || '35'),        // Reactive Gravity
-            GATE4_PULL: parseInt(process.env.W_PULL || '15')           // Predictive Intent
+            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '35'),      // Baseline Pressure
+            GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '25'),  // Lagging Velocity
+            GATE3_SHIFT: parseInt(process.env.W_SHIFT || '10'),        // Reactive Gravity
+            GATE4_PULL: parseInt(process.env.W_PULL || '20')           // Predictive Intent
         };
         
         // --- EXIT CONFIGURATION ---
@@ -52,7 +52,7 @@ class FastStrategy {
 
         const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
         this.assets = {};
-
+,
         targets.forEach(asset => {
             const cleanKey = asset.replace('_USDT', '');
             if (MASTER_CONFIG[cleanKey]) {
