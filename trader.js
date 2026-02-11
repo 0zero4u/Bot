@@ -1,5 +1,4 @@
-// trader.js
-// v67.4 - Fixed "getName" Crash & Added Backward Compatibility
+
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -12,7 +11,7 @@ const DeltaClient = DeltaNativeClient;
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Tick', 
+    strategy: process.env.STRATEGY || 'Tick',
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
@@ -74,10 +73,12 @@ class TradingBot {
         this.ws = null; 
         this.authenticated = false;
         this.isOrderInProgress = false;
+
         this.activePositions = {};
         this.orderLatencies = new Map(); 
 
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
+        
         this.targetAssets.forEach(asset => {
             this.activePositions[asset] = false;
         });
@@ -87,26 +88,23 @@ class TradingBot {
         this.heartbeatTimeout = null;
         this.restKeepAliveInterval = null;
 
+        // [FIX] Safe Strategy Loader (Prevents "Double Strategy" & "getName" crashes)
         try {
-            // Robust Strategy Loading
             const cleanName = this.config.strategy
                 .trim()
                 .replace(/Strategy(\.js)?$/i, '') 
                 .replace(/\.js$/i, '');
 
             const strategyPath = `./strategies/${cleanName}Strategy.js`;
-            
             this.logger.info(`Loading Strategy from: ${strategyPath}`);
-            const StrategyClass = require(strategyPath);
             
+            const StrategyClass = require(strategyPath);
             this.strategy = new StrategyClass(this);
 
-            // [FIXED] SAFE NAME CHECK
             let strategyName = cleanName;
             if (this.strategy && typeof this.strategy.getName === 'function') {
                 strategyName = this.strategy.getName();
             }
-
             this.logger.info(`✅ Successfully loaded strategy: ${strategyName}`);
 
         } catch (e) {
@@ -115,6 +113,7 @@ class TradingBot {
         }
     }
 
+    // [REQUIRED BY v8.1] Latency Helper
     recordOrderPunch(clientOrderId) {
         this.orderLatencies.set(clientOrderId, Date.now());
         setTimeout(() => {
@@ -125,8 +124,9 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v67.4 - Safe Mode) ---`);
+        this.logger.info(`--- Bot Initializing (v68.0 - Stable Hybrid) ---`);
 
+        this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
             this.logger.info("🔥 Connection Warmed. Native Socket is open.");
@@ -274,7 +274,6 @@ class TradingBot {
             const latency = t1 - t0;
 
             let logMsg = `[LATENCY] ⚡ ${trade.symbol} | OID:${clientOid} | Delay: ${latency.toFixed(2)}ms`;
-            
             if (latency < 0) logMsg += " ⚠️ (Clock Drift)";
             else if (latency < 60) logMsg += " 🚀 (Fast)";
             else if (latency > 250) logMsg += " 🐢 (Slow)";
@@ -297,8 +296,7 @@ class TradingBot {
             if (this.activePositions[asset] !== isOpen) {
                 this.activePositions[asset] = isOpen;
 
-                // Reset strategy cooldown if closed
-                if (this.strategy && typeof this.strategy.onPositionClose === 'function') {
+                if (!isOpen && this.strategy.onPositionClose) {
                     this.strategy.onPositionClose(asset);
                 }
 
@@ -332,6 +330,7 @@ class TradingBot {
         }
     }
 
+    // [REQUIRED BY v8.1] Alias for hasOpenPosition
     getPosition(symbol) {
         return this.activePositions[symbol];
     }
@@ -341,17 +340,20 @@ class TradingBot {
         return Object.values(this.activePositions).some(status => status === true);
     }
 
+    // --- External Feed Handler (Gate.io / Local Listener) ---
     async handleSignalMessage(message) {
         if (!this.authenticated) return;
 
         try {
             const data = JSON.parse(message.toString());
             
+            // [FIXED] Compatible with Listener v4.0 (Gate.io format)
             if (data.type === 'depthUpdate') {
-                if (this.strategy && this.strategy.execute) {
+                if (this.strategy && typeof this.strategy.execute === 'function') {
                     await this.strategy.execute(data);
                 }
             }
+            // [LEGACY] Compatible with old Binance format (Just in case)
             else if (data.type === 'B') {
                 const asset = data.s;
                 const depthPayload = {
@@ -405,4 +407,5 @@ class TradingBot {
         process.exit(1);
     }
 })();
-            
+
+    
