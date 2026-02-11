@@ -1,15 +1,10 @@
 /**
- * *
  * Strategy: Volume-Weighted Microprice (VWM)
- * with Directional Velocity Confirmation & Server-Side Trailing Stop.
- *
- * CORE LOGIC:
- * 1. Normalized Liquidity (filters dust)
- * 2. Velocity MUST be increasing
- * 3. Microprice confirms dominance
- * 4. Spread stable or tightening
- * 5. Abort immediately if pressure shows failure
- * 6. Market IOC with Server-Side Trailing Stop
+ * FIXED VERSION:
+ * 1. Window maintained at 30ms (User Requirement)
+ * 2. Removed "Acceleration Trap" (Allows sustained high velocity)
+ * 3. Fixed "Liquidity Laddering" bug (Uses Imbalance instead of raw volume history)
+ * 4. Fixed API Payload (Removed limit_price from market_order)
  */
 
 class MicroStrategy {
@@ -20,12 +15,12 @@ class MicroStrategy {
         // --- CONFIGURATION ---
         this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.60');
         this.MIN_NOTIONAL_VALUE = parseFloat(process.env.MIN_NOTIONAL || '2000');
-        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.05'); // wider for continuation
+        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.05');
         this.COOLDOWN_MS = 2000;
 
         // --- VELOCITY CONFIG ---
-        this.SPIKE_PERCENT = 0.0000017;   // 0.017%
-        this.SPIKE_WINDOW_MS = 30;
+        this.SPIKE_PERCENT = 0.0000012;   
+        this.SPIKE_WINDOW_MS = 30; // KEPT AT 30ms PER REQUEST
 
         this.assets = {};
 
@@ -44,32 +39,25 @@ class MicroStrategy {
                 lastLogTime: 0,
                 priceHistory: [],
                 prevVelocity: null,
-                prevHalfSpread: null,
-                prevBidVol: null,
-                prevAskVol: null
+                prevHalfSpread: null
             };
         });
     }
 
-    // REQUIRED BY LOADER
     getName() {
-        return `MicroStrategy (VWM + Continuation + ${this.TRAILING_PERCENT}% Server-Trail)`;
+        return `MicroStrategy (VWM + 30ms Tick + Corrected Logic)`;
     }
 
     /**
-     * [NEW] Immediate Reset Hook
      * Called by Trader when a position closes to bypass COOLDOWN_MS
      */
     onPositionClose(symbol) {
         if (this.assets[symbol]) {
             this.assets[symbol].lastTriggerTime = 0;
-            // Optional: this.logger.info(`[STRATEGY] ${symbol} Timer reset. Ready for immediate entry.`);
+            this.logger.info(`[STRATEGY] ${symbol} Timer reset. Ready for immediate entry.`);
         }
     }
 
-    /**
-     * Runs on every order book update
-     */
     async onDepthUpdate(symbol, depth) {
         const asset = this.assets[symbol];
         if (!asset) return;
@@ -84,56 +72,59 @@ class MicroStrategy {
         const Va = parseFloat(depth.asks[0][1]);
 
         const midPrice = (Pa + Pb) / 2;
-        const totalNotional = (Vb * Pb) + (Va * Pa);
-        if (totalNotional < this.MIN_NOTIONAL_VALUE) return;
+        
+        // 1. Notional Filter
+        if ((Vb * Pb) + (Va * Pa) < this.MIN_NOTIONAL_VALUE) return;
 
-        // --- Velocity Buffer ---
+        // --- Velocity Calculation (Strict 30ms Window) ---
         asset.priceHistory.push({ price: midPrice, time: now });
-        while (
-            asset.priceHistory.length > 2 &&
-            now - asset.priceHistory[0].time > this.SPIKE_WINDOW_MS + 1
-        ) {
+        
+        // Cleanup old ticks (> 2x Window to be safe)
+        while (asset.priceHistory.length > 0 && now - asset.priceHistory[0].time > this.SPIKE_WINDOW_MS * 2) {
             asset.priceHistory.shift();
         }
 
-        // Baseline aligned to window
+        // Find baseline tick (approx 30ms ago)
         let baselineTick = null;
-        for (let i = asset.priceHistory.length - 1; i >= 0; i--) {
-            if (now - asset.priceHistory[i].time >= this.SPIKE_WINDOW_MS) {
-                baselineTick = asset.priceHistory[i];
-                break;
-            }
+        for (let i = 0; i < asset.priceHistory.length; i++) {
+             if (now - asset.priceHistory[i].time <= this.SPIKE_WINDOW_MS) {
+                 baselineTick = asset.priceHistory[i];
+                 break;
+             }
         }
+        
         if (!baselineTick) return;
 
         const signedChange = (midPrice - baselineTick.price) / baselineTick.price;
         const absChange = Math.abs(signedChange);
+
+        // 2. Minimum Velocity Threshold
         if (absChange < this.SPIKE_PERCENT) return;
 
         const isVelocityUp = signedChange > 0;
         const isVelocityDown = signedChange < 0;
 
-        // --- Velocity MUST be increasing ---
-        if (asset.prevVelocity !== null) {
-            if (absChange <= Math.abs(asset.prevVelocity)) return;
-        }
+        // [CORRECTION 1] Removed "Acceleration Trap"
+        // We track velocity, but we DO NOT require it to be higher than the previous tick.
+        // As long as it is above SPIKE_PERCENT, it is valid.
         asset.prevVelocity = signedChange;
 
-        // --- Microprice ---
+        // --- Microprice & Imbalance ---
         const microPrice = ((Vb * Pa) + (Va * Pb)) / (Vb + Va);
         const halfSpread = (Pa - Pb) / 2;
+        
+        // Filter crossed books or zero spread errors
         if (halfSpread <= 1e-8) return;
 
-        // --- Spread must be stable or tightening ---
+        // 3. Spread Stability
         if (asset.prevHalfSpread !== null) {
-            if (halfSpread > asset.prevHalfSpread * 1.02) return;
+            if (halfSpread > asset.prevHalfSpread * 1.05) return; // Allow 5% breath
         }
         asset.prevHalfSpread = halfSpread;
 
-        // --- Signal Strength ---
         const signalStrength = (microPrice - midPrice) / halfSpread;
 
-        // --- Pressure failure kill-switch ---
+        // 4. Pressure Confirmation
         const pressureFailing =
             (isVelocityUp && signalStrength < 0) ||
             (isVelocityDown && signalStrength > 0);
@@ -142,41 +133,39 @@ class MicroStrategy {
 
         let side = null;
 
-        // --- Directional Liquidity Persistence ---
+        // [CORRECTION 2] Liquidity Logic (Imbalance vs Raw Volume)
+        // Check if the Order Book supports the move (Ratio) rather than raw volume history
+        const totalL1Vol = Vb + Va;
+        const bidRatio = Vb / totalL1Vol;
+
         if (signalStrength > this.TRIGGER_THRESHOLD && isVelocityUp) {
-            if (asset.prevBidVol !== null && Vb < asset.prevBidVol * 0.9) return;
+            // If buying, we want decent bid support (not < 30%)
+            if (bidRatio < 0.3) return; 
             side = 'buy';
         }
 
         if (signalStrength < -this.TRIGGER_THRESHOLD && isVelocityDown) {
-            if (asset.prevAskVol !== null && Va < asset.prevAskVol * 0.9) return;
+            // If selling, we want decent ask support (bid ratio shouldn't be huge > 70%)
+            if (bidRatio > 0.7) return; 
             side = 'sell';
         }
 
-        asset.prevBidVol = Vb;
-        asset.prevAskVol = Va;
-
+        // Logging (Throttled)
         if (now - asset.lastLogTime > 5000) {
             this.logger.info(
-                `[CONT] ${symbol} | Vel:${(signedChange * 100).toFixed(4)}% | Sig:${signalStrength.toFixed(2)}`
+                `[CONT] ${symbol} | Vel:${(signedChange * 100).toFixed(4)}% | Sig:${signalStrength.toFixed(2)} | Ratio:${bidRatio.toFixed(2)}`
             );
             asset.lastLogTime = now;
         }
 
-        if (
-            side &&
-            !this.bot.hasOpenPosition(symbol) &&
-            !this.bot.isOrderInProgress
-        ) {
+        // Execution Trigger
+        if (side && !this.bot.hasOpenPosition(symbol) && !this.bot.isOrderInProgress) {
             if (now - asset.lastTriggerTime < this.COOLDOWN_MS) return;
             asset.lastTriggerTime = now;
             await this.executeTrade(symbol, side, Pa, Pb);
         }
     }
 
-    /**
-     * Execution Logic
-     */
     async executeTrade(symbol, side, bestAsk, bestBid) {
         this.bot.isOrderInProgress = true;
         try {
@@ -187,19 +176,20 @@ class MicroStrategy {
             const tickSize = 1 / Math.pow(10, spec.precision);
             if (trailDistance < tickSize) trailDistance = tickSize;
 
-            const signedTrailAmount =
-                side === 'buy' ? -trailDistance : trailDistance;
+            // Delta expects positive integer for trail amount usually, but string for API
+            const trailAmount = trailDistance.toFixed(spec.precision);
 
             const clientOid = `c_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
             this.bot.recordOrderPunch(clientOid);
 
+            // [CORRECTION 3] Cleaned Market Order Payload
+            // Removed 'limit_price' (invalid for market_order)
             const payload = {
                 product_id: spec.deltaId.toString(),
                 size: process.env.ORDER_SIZE || "1",
                 side: side,
                 order_type: 'market_order',
-                limit_price: entryPrice.toFixed(spec.precision),
-                bracket_trail_amount: signedTrailAmount.toFixed(spec.precision),
+                bracket_trail_amount: trailAmount,
                 bracket_stop_trigger_method: 'mark_price',
                 client_order_id: clientOid
             };
@@ -207,7 +197,7 @@ class MicroStrategy {
             await this.bot.placeOrder(payload);
 
             this.logger.info(
-                `[EXEC_CONT] ${symbol} ${side} @ ${entryPrice} | Trail:${signedTrailAmount.toFixed(spec.precision)} | OID:${clientOid}`
+                `[EXEC_CONT] ${symbol} ${side} @ ${entryPrice} | Trail:${trailAmount} | OID:${clientOid}`
             );
         } catch (e) {
             this.logger.error(`[EXEC_FAIL] ${e.message}`);
@@ -218,4 +208,4 @@ class MicroStrategy {
 }
 
 module.exports = MicroStrategy;
-                
+    
