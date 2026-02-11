@@ -312,6 +312,12 @@ class TradingBot {
 
             if (this.activePositions[asset] !== isOpen) {
                 this.activePositions[asset] = isOpen;
+
+                // [FIX] IMMEDIATELY RESET STRATEGY COOLDOWN IF CLOSED
+                if (!isOpen && this.strategy.onPositionClose) {
+                    this.strategy.onPositionClose(asset);
+                }
+
                 this.logger.info(`[POS UPDATE] ${asset} is now ${isOpen ? 'OPEN' : 'CLOSED'} (Size: ${size})`);
             }
         }
@@ -409,4 +415,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                   
+    
