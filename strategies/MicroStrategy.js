@@ -1,6 +1,5 @@
 /**
- * 
- *
+ * *
  * Strategy: Volume-Weighted Microprice (VWM)
  * with Directional Velocity Confirmation & Server-Side Trailing Stop.
  *
@@ -25,7 +24,7 @@ class MicroStrategy {
         this.COOLDOWN_MS = 2000;
 
         // --- VELOCITY CONFIG ---
-        this.SPIKE_PERCENT = 0.0000012;   // 0.017%
+        this.SPIKE_PERCENT = 0.0000015;   // 0.017%
         this.SPIKE_WINDOW_MS = 30;
 
         this.assets = {};
@@ -55,6 +54,17 @@ class MicroStrategy {
     // REQUIRED BY LOADER
     getName() {
         return `MicroStrategy (VWM + Continuation + ${this.TRAILING_PERCENT}% Server-Trail)`;
+    }
+
+    /**
+     * [NEW] Immediate Reset Hook
+     * Called by Trader when a position closes to bypass COOLDOWN_MS
+     */
+    onPositionClose(symbol) {
+        if (this.assets[symbol]) {
+            this.assets[symbol].lastTriggerTime = 0;
+            // Optional: this.logger.info(`[STRATEGY] ${symbol} Timer reset. Ready for immediate entry.`);
+        }
     }
 
     /**
@@ -208,4 +218,4 @@ class MicroStrategy {
 }
 
 module.exports = MicroStrategy;
-        
+                
