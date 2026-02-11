@@ -47,7 +47,6 @@ function connectToInternal() {
 // --- 2. CONNECT TO BINANCE (FAST FEED) ---
 function connectBinance() {
     // bookTicker is the fastest L1 update (Best Bid/Ask only)
-    // Perfect for MicroStrategy
     const streams = config.assets
         .map(a => `${a.toLowerCase()}usdt@bookTicker`)
         .join('/');
