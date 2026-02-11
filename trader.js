@@ -1,7 +1,8 @@
-
-// trader.js
-// v67.1 - Rust Native Client Integration
-// 
+/**
+ * trader.js
+ * v67.2 [ALIGNED]
+ * FIX: Added support for market_listener v4.0 'depthUpdate' protocol
+ */
 
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -120,7 +121,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v67.1 - Rust Native Client) ---`);
+        this.logger.info(`--- Bot Initializing (v67.2 - Rust Native Client) ---`);
 
         // --- 1. WARM UP CONNECTION ---
         // Forces SSL handshake and DNS lookup before first trade
@@ -356,13 +357,24 @@ class TradingBot {
         return Object.values(this.activePositions).some(status => status === true);
     }
 
-    // --- External Feed Handler (Binance) ---
+    // --- External Feed Handler (UPDATED) ---
     async handleSignalMessage(message) {
         if (!this.authenticated) return;
 
         try {
             const data = JSON.parse(message.toString());
             
+            // [FIXED] Handler for market_listener v4.0
+            if (data.type === 'depthUpdate') {
+                // Route directly to TickStrategy.execute
+                // TickStrategy.execute handles parsing, symbol stripping, and validation.
+                if (this.strategy.execute) {
+                    await this.strategy.execute(data);
+                }
+                return;
+            }
+
+            // [Legacy] Handler for old signals (kept for safety)
             if (data.type === 'B') {
                 const asset = data.s;
                 if (!this.targetAssets.includes(asset)) return;
@@ -384,7 +396,7 @@ class TradingBot {
     setupHttpServer() {
         const httpServer = new WebSocket.Server({ port: this.config.port });
         httpServer.on('connection', ws => {
-            this.logger.info('External Data Feed Connected (Binance)');
+            this.logger.info('External Data Feed Connected (Gate.io Listener)');
             ws.on('message', m => this.handleSignalMessage(m));
             ws.on('close', () => this.logger.warn('External Feed Disconnected'));
             ws.on('error', (err) => this.logger.error('Signal listener error:', err));
@@ -416,5 +428,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-
         
