@@ -1,6 +1,7 @@
+
 /**
  * LeadStrategy.js
- * v2.0 [KALMAN FILTER + LEADER IMBALANCE + DRIFT PROTECTION]
+ * v2.1 [KALMAN FILTER + LEADER IMBALANCE + DRIFT PROTECTION]
  * * Concept:
  * 1. Prediction: Driven by Binance BookTicker (via market_listener type 'B')
  * 2. Correction: Driven by Delta Public Trades (via 'all_trades')
@@ -21,7 +22,7 @@ class LeadStrategy {
         this.BETA = 1.0;
 
         // --- TRADING TRIGGERS ---
-        this.ENTRY_THRESHOLD = 0.0006; // 0.06% Divergence ( Conservative)
+        this.ENTRY_THRESHOLD = 0.0006; // 0.06% Divergence (Conservative)
         this.PROFIT_MARGIN = 0.0003;   // 0.03% Markup
         this.IMBALANCE_FILTER = 0.35;  // Requires 35% Order Book Imbalance to confirm
         this.COOLDOWN_MS = 400;        
@@ -30,7 +31,7 @@ class LeadStrategy {
         this.filters = {};
         this.lastTriggerTime = {};
         
-        // Asset Config
+        // Asset Config - Mapped to Delta Product IDs
         this.assets = {
             'XRP': { deltaId: 14969, precision: 4 },
             'BTC': { deltaId: 27,    precision: 1 },
@@ -53,7 +54,7 @@ class LeadStrategy {
 
     /**
      * PREDICTION STEP (Driven by Binance)
-     * Aligned with trader.js 'onDepthUpdate' call
+     * Aligned with trader.js 'handleSignalMessage' type 'B'
      */
     async onDepthUpdate(asset, depth) {
         if (!this.assets[asset]) return;
@@ -104,16 +105,20 @@ class LeadStrategy {
 
     /**
      * CORRECTION STEP (Driven by Delta Trades)
-     * Requires 'all_trades' in trader.js
+     * Now correctly called by trader.js 'all_trades'
      */
     onLaggerTrade(trade) {
         const rawSymbol = trade.symbol || trade.product_symbol;
-        // Map "XRPUSD" -> "XRP"
+        if (!rawSymbol) return;
+
+        // Map "XRPUSD" or "XRP" -> "XRP"
         const asset = Object.keys(this.assets).find(k => rawSymbol.startsWith(k));
         
         if (!asset || !this.filters[asset]) return;
 
         const tradePrice = parseFloat(trade.price);
+        if (isNaN(tradePrice)) return;
+
         const filter = this.filters[asset];
 
         // KALMAN CORRECTION
@@ -126,7 +131,7 @@ class LeadStrategy {
         // Reduce Uncertainty
         filter.P = (1 - K) * filter.P;
 
-        // Debug Log (Occasional)
+        // Debug Log (Occasional: 1% sample)
         if (Math.random() < 0.01) {
             this.logger.info(`[Kalman] ${asset} Trade:${tradePrice} Est:${filter.x.toFixed(4)} Gap:${(filter.x - tradePrice).toFixed(4)}`);
         }
@@ -181,8 +186,14 @@ class LeadStrategy {
         }
     }
 
-    getName() { return "LeadStrategy (Kalman v2)"; }
+    getName() { return "LeadStrategy (Kalman v2.1)"; }
+    
+    // Callback if position closes (reset cooldown/state if needed)
+    onPositionClose(asset) {
+        // Optional: clear memory or reset filter
+        // this.lastTriggerTime[asset] = 0; 
+    }
 }
 
 module.exports = LeadStrategy;
-  
+                
