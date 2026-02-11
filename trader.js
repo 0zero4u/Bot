@@ -1,4 +1,8 @@
 
+// trader.js
+// v67.1 - Rust Native Client Integration
+// 
+
 const WebSocket = require('ws');
 const winston = require('winston');
 const crypto = require('crypto');
@@ -6,11 +10,11 @@ require('dotenv').config();
 
 // --- [CHANGED] Use Rust Native Client ---
 const { DeltaNativeClient } = require('fast-client');
-const DeltaClient = DeltaNativeClient; 
+const DeltaClient = DeltaNativeClient; // Alias to keep existing code working
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Tick',
+    strategy: process.env.STRATEGY || 'Micro',
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
@@ -63,6 +67,7 @@ class TradingBot {
         this.config = { ...botConfig };
         this.logger = logger;
         
+        // Initialize Rust Client
         this.client = new DeltaClient(
             this.config.apiKey, 
             this.config.apiSecret, 
@@ -73,11 +78,15 @@ class TradingBot {
         this.authenticated = false;
         this.isOrderInProgress = false;
 
+        // [CRITICAL] Per-Asset Position Tracking
         this.activePositions = {};
+
+        // [NEW] Latency Analysis Storage
         this.orderLatencies = new Map(); 
 
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         
+        // Initialize State
         this.targetAssets.forEach(asset => {
             this.activePositions[asset] = false;
         });
@@ -87,34 +96,22 @@ class TradingBot {
         this.heartbeatTimeout = null;
         this.restKeepAliveInterval = null;
 
-        // [FIX] Safe Strategy Loader (Prevents "Double Strategy" & "getName" crashes)
         try {
-            const cleanName = this.config.strategy
-                .trim()
-                .replace(/Strategy(\.js)?$/i, '') 
-                .replace(/\.js$/i, '');
-
-            const strategyPath = `./strategies/${cleanName}Strategy.js`;
-            this.logger.info(`Loading Strategy from: ${strategyPath}`);
-            
-            const StrategyClass = require(strategyPath);
+            const StrategyClass = require(`./strategies/${this.config.strategy}Strategy.js`);
             this.strategy = new StrategyClass(this);
-
-            let strategyName = cleanName;
-            if (this.strategy && typeof this.strategy.getName === 'function') {
-                strategyName = this.strategy.getName();
-            }
-            this.logger.info(`✅ Successfully loaded strategy: ${strategyName}`);
-
+            this.logger.info(`Successfully loaded strategy: ${this.strategy.getName()}`);
         } catch (e) {
             this.logger.error(`FATAL: Could not load strategy: ${e.message}`);
             process.exit(1);
         }
     }
 
-    // [REQUIRED BY v8.1] Latency Helper
+    // --- [NEW] Latency Helper ---
     recordOrderPunch(clientOrderId) {
+        // Record T0: The moment we decided to send
         this.orderLatencies.set(clientOrderId, Date.now());
+        
+        // Auto-cleanup after 60s
         setTimeout(() => {
             if (this.orderLatencies.has(clientOrderId)) {
                 this.orderLatencies.delete(clientOrderId);
@@ -123,10 +120,13 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v68.0 - Stable Hybrid) ---`);
+        this.logger.info(`--- Bot Initializing (v67.1 - Rust Native Client) ---`);
 
+        // --- 1. WARM UP CONNECTION ---
+        // Forces SSL handshake and DNS lookup before first trade
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
+            // Note: Rust client handles its own connection pooling, but this ensures DNS is resolved
             await this.client.getWalletBalance();
             this.logger.info("🔥 Connection Warmed. Native Socket is open.");
         } catch (e) {
@@ -143,8 +143,10 @@ class TradingBot {
         if (this.restKeepAliveInterval) clearInterval(this.restKeepAliveInterval);
         this.restKeepAliveInterval = setInterval(async () => {
             try {
+                // Periodically fetch balance to keep Rust TCP pool active
                 await this.client.getWalletBalance();
             } catch (error) {
+                // Rust errors come as strings usually, but we log safely
                 this.logger.warn(`[Keep-Alive] Check Failed: ${error}`);
             }
         }, 29000);
@@ -219,11 +221,13 @@ class TradingBot {
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
             { name: 'all_trades', symbols: symbols },
+            // ✅ Subscribe to user_trades for latency tracking
             { name: 'user_trades', symbols: ['all'] } 
         ]}}));
     }
 
     handleWebSocketMessage(message) {
+        // 1. Auth Handling
         if (
             (message.type === 'success' && message.message === 'Authenticated') ||
             (message.type === 'key-auth' && message.status === 'authenticated') ||
@@ -246,6 +250,7 @@ class TradingBot {
             return;
         }
 
+        // 2. Data Handling
         switch (message.type) {
             case 'orders':
                 if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
@@ -265,19 +270,33 @@ class TradingBot {
         }
     }
 
+    // --- [NEW] Latency Calculation Logic ---
     measureLatency(trade) {
         const clientOid = trade.client_order_id;
+        
+        // Only track if it's OUR order
         if (clientOid && this.orderLatencies.has(clientOid)) {
-            const t0 = this.orderLatencies.get(clientOid);
-            const t1 = parseInt(trade.timestamp) / 1000;
+            const t0 = this.orderLatencies.get(clientOid); // Punch Time (Local)
+            
+            // Delta timestamp is in MICROSECONDS. Convert to Milliseconds.
+            const t1 = parseInt(trade.timestamp) / 1000;   // Engine Time (Exchange)
+            
             const latency = t1 - t0;
 
-            let logMsg = `[LATENCY] ⚡ ${trade.symbol} | OID:${clientOid} | Delay: ${latency.toFixed(2)}ms`;
-            if (latency < 0) logMsg += " ⚠️ (Clock Drift)";
-            else if (latency < 60) logMsg += " 🚀 (Fast)";
-            else if (latency > 250) logMsg += " 🐢 (Slow)";
+            let logMsg = `[LATENCY] ⚡ ${trade.symbol} | OID:${clientOid} | T0:${t0} | T1:${t1.toFixed(0)} | Delay: ${latency.toFixed(2)}ms`;
+            
+            // Visual indicators
+            if (latency < 0) {
+                logMsg += " ⚠️ (Clock Drift Detected!)";
+            } else if (latency < 60) {
+                logMsg += " 🚀 (Fast)";
+            } else if (latency > 250) {
+                logMsg += " 🐢 (Slow)";
+            }
 
             this.logger.info(logMsg);
+            
+            // Cleanup
             this.orderLatencies.delete(clientOid);
         }
     }
@@ -295,6 +314,7 @@ class TradingBot {
             if (this.activePositions[asset] !== isOpen) {
                 this.activePositions[asset] = isOpen;
 
+                // [FIX] IMMEDIATELY RESET STRATEGY COOLDOWN IF CLOSED
                 if (!isOpen && this.strategy.onPositionClose) {
                     this.strategy.onPositionClose(asset);
                 }
@@ -329,37 +349,30 @@ class TradingBot {
         }
     }
 
-    // [REQUIRED BY v8.1] Alias for hasOpenPosition
-    getPosition(symbol) {
-        return this.activePositions[symbol];
-    }
-
     hasOpenPosition(symbol) {
-        if (symbol) return this.activePositions[symbol] === true;
+        if (symbol) {
+            return this.activePositions[symbol] === true;
+        }
         return Object.values(this.activePositions).some(status => status === true);
     }
 
-    // --- External Feed Handler (Gate.io / Local Listener) ---
+    // --- External Feed Handler (Binance) ---
     async handleSignalMessage(message) {
         if (!this.authenticated) return;
 
         try {
             const data = JSON.parse(message.toString());
             
-            // [FIXED] Compatible with Listener v4.0 (Gate.io format)
-            if (data.type === 'depthUpdate') {
-                if (this.strategy && typeof this.strategy.execute === 'function') {
-                    await this.strategy.execute(data);
-                }
-            }
-            // [LEGACY] Compatible with old Binance format (Just in case)
-            else if (data.type === 'B') {
+            if (data.type === 'B') {
                 const asset = data.s;
+                if (!this.targetAssets.includes(asset)) return;
+
                 const depthPayload = {
                     bids: [[ data.bb, data.bq ]], 
                     asks: [[ data.ba, data.aq ]]  
                 };
-                if (this.strategy && typeof this.strategy.onDepthUpdate === 'function') {
+
+                if (this.strategy.onDepthUpdate) {
                     await this.strategy.onDepthUpdate(asset, depthPayload);
                 }
             }
@@ -371,7 +384,7 @@ class TradingBot {
     setupHttpServer() {
         const httpServer = new WebSocket.Server({ port: this.config.port });
         httpServer.on('connection', ws => {
-            this.logger.info(`External Data Feed Connected (Port ${this.config.port})`);
+            this.logger.info('External Data Feed Connected (Binance)');
             ws.on('message', m => this.handleSignalMessage(m));
             ws.on('close', () => this.logger.warn('External Feed Disconnected'));
             ws.on('error', (err) => this.logger.error('Signal listener error:', err));
@@ -380,9 +393,6 @@ class TradingBot {
     }
     
     async placeOrder(orderData) {
-        if (orderData.client_order_id) {
-            this.recordOrderPunch(orderData.client_order_id);
-        }
         return this.client.placeOrder(orderData);
     }
     
@@ -406,4 +416,5 @@ class TradingBot {
         process.exit(1);
     }
 })();
-    
+
+        
