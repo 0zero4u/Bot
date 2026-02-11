@@ -14,7 +14,7 @@ class TickStrategy {
         this.ENTRY_Z = 2.5;          
         this.EXIT_Z = 0.5;           
         this.MIN_NOISE_FLOOR = 0.05; 
-        this.WARMUP_TICKS = 100; // Adjusted for safer startup
+        this.WARMUP_TICKS = 10000; // Adjusted for safer startup
 
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
