@@ -1,7 +1,10 @@
+
 /**
  * trader.js
- * v67.2 [ALIGNED]
- * FIX: Added support for market_listener v4.0 'depthUpdate' protocol
+ * v67.2 [ALIGNED & FIXED]
+ * 1. Protocol: Supports market_listener v4.0 'depthUpdate'
+ * 2. Execution: Uses Rust Native Client for low-latency orders
+ * 3. Latency: Tracks user_trades for performance monitoring
  */
 
 const WebSocket = require('ws');
@@ -9,13 +12,13 @@ const winston = require('winston');
 const crypto = require('crypto');
 require('dotenv').config();
 
-// --- [CHANGED] Use Rust Native Client ---
+// --- Rust Native Client Integration ---
 const { DeltaNativeClient } = require('fast-client');
-const DeltaClient = DeltaNativeClient; // Alias to keep existing code working
+const DeltaClient = DeltaNativeClient; 
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Micro',
+    strategy: process.env.STRATEGY || 'Tick', // Default to Tick Strategy
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
@@ -52,6 +55,7 @@ const logger = winston.createLogger({
     ]
 });
 
+// --- Validation ---
 function validateConfig() {
     const required = ['apiKey', 'apiSecret', 'leverage'];
     const missing = required.filter(key => !config[key]);
@@ -79,10 +83,8 @@ class TradingBot {
         this.authenticated = false;
         this.isOrderInProgress = false;
 
-        // [CRITICAL] Per-Asset Position Tracking
+        // Position & Latency Tracking
         this.activePositions = {};
-
-        // [NEW] Latency Analysis Storage
         this.orderLatencies = new Map(); 
 
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
@@ -97,6 +99,7 @@ class TradingBot {
         this.heartbeatTimeout = null;
         this.restKeepAliveInterval = null;
 
+        // Load Strategy
         try {
             const StrategyClass = require(`./strategies/${this.config.strategy}Strategy.js`);
             this.strategy = new StrategyClass(this);
@@ -107,7 +110,7 @@ class TradingBot {
         }
     }
 
-    // --- [NEW] Latency Helper ---
+    // --- Latency Helper ---
     recordOrderPunch(clientOrderId) {
         // Record T0: The moment we decided to send
         this.orderLatencies.set(clientOrderId, Date.now());
@@ -124,10 +127,9 @@ class TradingBot {
         this.logger.info(`--- Bot Initializing (v67.2 - Rust Native Client) ---`);
 
         // --- 1. WARM UP CONNECTION ---
-        // Forces SSL handshake and DNS lookup before first trade
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
-            // Note: Rust client handles its own connection pooling, but this ensures DNS is resolved
+            // Forces SSL handshake and DNS lookup before first trade
             await this.client.getWalletBalance();
             this.logger.info("🔥 Connection Warmed. Native Socket is open.");
         } catch (e) {
@@ -147,7 +149,6 @@ class TradingBot {
                 // Periodically fetch balance to keep Rust TCP pool active
                 await this.client.getWalletBalance();
             } catch (error) {
-                // Rust errors come as strings usually, but we log safely
                 this.logger.warn(`[Keep-Alive] Check Failed: ${error}`);
             }
         }, 29000);
@@ -271,7 +272,7 @@ class TradingBot {
         }
     }
 
-    // --- [NEW] Latency Calculation Logic ---
+    // --- Latency Calculation Logic ---
     measureLatency(trade) {
         const clientOid = trade.client_order_id;
         
@@ -315,7 +316,7 @@ class TradingBot {
             if (this.activePositions[asset] !== isOpen) {
                 this.activePositions[asset] = isOpen;
 
-                // [FIX] IMMEDIATELY RESET STRATEGY COOLDOWN IF CLOSED
+                // IMMEDIATELY RESET STRATEGY COOLDOWN IF CLOSED
                 if (!isOpen && this.strategy.onPositionClose) {
                     this.strategy.onPositionClose(asset);
                 }
@@ -364,17 +365,16 @@ class TradingBot {
         try {
             const data = JSON.parse(message.toString());
             
-            // [FIXED] Handler for market_listener v4.0
+            // [CRITICAL FIX] Handler for market_listener v4.0 (depthUpdate)
+            // This allows the TickStrategy to receive the Cleaned Book data
             if (data.type === 'depthUpdate') {
-                // Route directly to TickStrategy.execute
-                // TickStrategy.execute handles parsing, symbol stripping, and validation.
                 if (this.strategy.execute) {
                     await this.strategy.execute(data);
                 }
                 return;
             }
 
-            // [Legacy] Handler for old signals (kept for safety)
+            // [Legacy Support] Handler for old signals (optional)
             if (data.type === 'B') {
                 const asset = data.s;
                 if (!this.targetAssets.includes(asset)) return;
@@ -396,7 +396,7 @@ class TradingBot {
     setupHttpServer() {
         const httpServer = new WebSocket.Server({ port: this.config.port });
         httpServer.on('connection', ws => {
-            this.logger.info('External Data Feed Connected (Gate.io Listener)');
+            this.logger.info('External Data Feed Connected (Market Listener)');
             ws.on('message', m => this.handleSignalMessage(m));
             ws.on('close', () => this.logger.warn('External Feed Disconnected'));
             ws.on('error', (err) => this.logger.error('Signal listener error:', err));
@@ -415,17 +415,20 @@ class TradingBot {
     }
 }
 
+// --- Main Execution ---
 (async () => {
     try {
         const bot = new TradingBot(config);
         await bot.start();
+        
         process.on('uncaughtException', async (err) => {
             logger.error('Uncaught Exception:', err);
             process.exit(1);
         });
+        
     } catch (error) {
         logger.error("Failed to start bot:", error);
         process.exit(1);
     }
 })();
-        
+            
