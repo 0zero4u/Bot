@@ -1,7 +1,6 @@
-
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use reqwest::{Client, header};
+use reqwest::Client; // [FIX] Removed unused 'header'
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
@@ -144,4 +143,5 @@ impl DeltaNativeClient {
 
      Ok(json)
   }
-}
+             }
+  
