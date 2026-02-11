@@ -1,9 +1,9 @@
 /**
  * FastStrategy.js
- * v7.1.0 [CLEAN TAKER EDITION]
+ * v8.0.0 [DEEP LOGGER EDITION]
  * - Strategy: VAMP (Volume-Weighted Average Micro-Pressure)
- * - Market Orders: Standard (No IOC params needed)
- * - Limit Orders: Aggressive IOC (To ensure Taker execution)
+ * - Execution: PURE TAKER (Market = Standard, Limit = IOC)
+ * - Monitoring: Enhanced 10s Heartbeat with Order Book Snapshots
  */
 
 class FastStrategy {
@@ -13,10 +13,12 @@ class FastStrategy {
 
         // --- CORE STRATEGY CONFIG ---
         this.OBI_WINDOW = parseInt(process.env.OBI_WINDOW || '250'); 
-        this.LOG_FREQ_MS = 5000;
+        
+        // HEARTBEAT: Changed to 10s as requested
+        this.LOG_FREQ_MS = 10000;
         
         // --- TIERED ENTRY THRESHOLDS ---
-        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '70');
+        this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '80');
         this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '95');
         this.LOCK_DURATION_MS = 2000; 
         
@@ -62,7 +64,7 @@ class FastStrategy {
         this.bot.isOrderInProgress = false; 
     }
 
-    getName() { return "FastStrategy (Taker v7.1)"; }
+    getName() { return "FastStrategy (Deep Logger v8.0)"; }
 
     /**
      * MAIN ROUTER
@@ -84,7 +86,7 @@ class FastStrategy {
         const now = Date.now();
 
         try {
-            // --- 1. VAMP MATH ---
+            // --- 1. VAMP MATH & DATA EXTRACTION ---
             let totalBidQty = 0, totalAskQty = 0;
             let sumBidPQ = 0, sumAskPQ = 0;         
 
@@ -107,18 +109,22 @@ class FastStrategy {
             const vampEff = (pEffBid * totalAskQty + pEffAsk * totalBidQty) / (totalBidQty + totalAskQty);
             const currentPrice = vampEff;
 
-            // --- 2. SIGNALS ---
+            // --- 2. RAW SIGNAL CALCULATION ---
             const obi = (totalBidQty - totalAskQty) / (totalBidQty + totalAskQty);
             
+            // Store History
             asset.history.obi.push(obi);
             if (asset.history.obi.length > this.OBI_WINDOW) asset.history.obi.shift();
             
+            // Raw Metrics
             const rawZ = this.calculateZScore(asset.history.obi);
-            const rawDOBI = obi - asset.history.prevOBI;
+            const rawDOBI = obi - asset.history.prevOBI; // Momentum (Change in OBI)
             
+            // Shift Ticks (Order Book Imbalance Price vs Current Price)
             const wdobp = (sumBidPQ + sumAskPQ) / (totalBidQty + totalAskQty);
             const rawShiftTicks = (wdobp - currentPrice) / asset.config.tickSize;
             
+            // Pull Logic
             const askDelta = asset.history.prevAskQty - totalAskQty;
             const bidDelta = asset.history.prevBidQty - totalBidQty;
             const filteredAskPull = Math.abs(askDelta) >= this.MIN_PULL_QTY ? askDelta : 0;
@@ -126,39 +132,54 @@ class FastStrategy {
             const rawPull = filteredAskPull - filteredBidPull;
 
             // --- 3. SCORING ---
+            // BUY SCORE
             const b_Z = this.getScore(rawZ, 2.5, this.WEIGHTS.GATE1_ZSCORE);
             const b_M = this.getScore(rawDOBI, 0.4, this.WEIGHTS.GATE2_MOMENTUM);
             const b_S = this.getScore(rawShiftTicks, 2.0, this.WEIGHTS.GATE3_SHIFT);
             const b_P = this.getScore(rawPull, asset.config.saturationQty, this.WEIGHTS.GATE4_PULL);
             const buyScore = b_Z + b_M + b_S + b_P;
 
+            // SELL SCORE
             const s_Z = this.getScore(-rawZ, 2.5, this.WEIGHTS.GATE1_ZSCORE);
             const s_M = this.getScore(-rawDOBI, 0.4, this.WEIGHTS.GATE2_MOMENTUM);
             const s_S = this.getScore(-rawShiftTicks, 2.0, this.WEIGHTS.GATE3_SHIFT);
             const s_P = this.getScore(-rawPull, asset.config.saturationQty, this.WEIGHTS.GATE4_PULL);
             const sellScore = s_Z + s_M + s_S + s_P;
 
-            // --- 4. POSITIONS ---
+            // --- 4. DEEP LOGGING (Heartbeat 10s) ---
+            if (now - asset.lastLogTime > this.LOG_FREQ_MS) {
+                const isBuyStronger = buyScore >= sellScore;
+                const score = isBuyStronger ? buyScore : sellScore;
+                const sideTag = isBuyStronger ? '[BUY]' : '[SELL]';
+                
+                // Construct Breakdown String
+                const f = isBuyStronger ? 
+                    `Z:${b_Z.toFixed(0)} M:${b_M.toFixed(0)} S:${b_S.toFixed(0)} P:${b_P.toFixed(0)}` :
+                    `Z:${s_Z.toFixed(0)} M:${s_M.toFixed(0)} S:${s_S.toFixed(0)} P:${s_P.toFixed(0)}`;
+
+                this.logger.info(`-----------------------------------------------------------`);
+                this.logger.info(`[${symbol}] ${sideTag} TOTAL:${score.toFixed(0)} | Breakdown: (${f})`);
+                
+                // DEEP DIVE RAW VALUES (Why is it 0?)
+                this.logger.info(` > RAW MATH | Z-Score: ${rawZ.toFixed(3)} | Mom(dOBI): ${rawDOBI.toFixed(4)} | Shift: ${rawShiftTicks.toFixed(2)} | Pull: ${rawPull.toFixed(1)}`);
+                
+                // SNAPSHOT VERIFICATION (What is the bot seeing?)
+                const topB = depth.bids.slice(0, 2).map(b => `${b[0]}x${b[1]}`).join(' | ');
+                const topA = depth.asks.slice(0, 2).map(a => `${a[0]}x${a[1]}`).join(' | ');
+                this.logger.info(` > SNAPSHOT | Bids: [${topB}] vs Asks: [${topA}]`);
+                this.logger.info(` > PRICE    | VampEff: ${currentPrice.toFixed(asset.config.precision)}`);
+                this.logger.info(`-----------------------------------------------------------`);
+
+                asset.lastLogTime = now;
+            }
+
+            // --- 5. POSITIONS ---
             const hasPosition = (this.bot.activePositions && this.bot.activePositions[symbol]) || asset.position;
 
             if (hasPosition) { 
                 this.manageExits(symbol, asset, buyScore, sellScore);
                 this.updateHistory(asset, obi, totalBidQty, totalAskQty);
                 return; 
-            }
-
-            // --- 5. LOGS ---
-            if (now - asset.lastLogTime > this.LOG_FREQ_MS) {
-                const isBuyStronger = buyScore >= sellScore;
-                const score = isBuyStronger ? buyScore : sellScore;
-                const sideTag = isBuyStronger ? '[BUY]' : '[SELL]';
-                
-                const f = isBuyStronger ? 
-                    `Z:${b_Z.toFixed(0)} M:${b_M.toFixed(0)} S:${b_S.toFixed(0)} P:${b_P.toFixed(0)}` :
-                    `Z:${s_Z.toFixed(0)} M:${s_M.toFixed(0)} S:${s_S.toFixed(0)} P:${s_P.toFixed(0)}`;
-
-                this.logger.info(`[${symbol}] ${sideTag} Sc:${score.toFixed(0)} (${f}) | Z:${rawZ.toFixed(2)} P:${currentPrice.toFixed(asset.config.precision)}`);
-                asset.lastLogTime = now;
             }
 
             // --- 6. EXECUTION ---
@@ -205,7 +226,7 @@ class FastStrategy {
     }
 
     /**
-     * ORDER EXECUTION
+     * ORDER EXECUTION - PURE TAKER
      */
     async placeEntry(symbol, side, orderType, price) {
         const asset = this.assets[symbol];
@@ -228,7 +249,7 @@ class FastStrategy {
             if (orderType === 'limit_order') {
                 const aggression = this.bot.config.priceAggressionOffset || 0.02;
                 
-                // Aggressive Limit: Buy HIGHER, Sell LOWER
+                // Aggressive Limit: Buy HIGHER, Sell LOWER (Cross the book)
                 const limitPriceNum = (side === 'buy') 
                     ? price * (1 + aggression/100) 
                     : price * (1 - aggression/100);
@@ -238,14 +259,16 @@ class FastStrategy {
                     : limitPriceNum * (1 + this.slPercent/100);
                 
                 orderData.limit_price = limitPriceNum.toFixed(assetConfig.precision);
-                orderData.time_in_force = 'ioc'; // Taker requirement for Limit orders
+                
+                // Aggressive Limit MUST use IOC to ensure it acts as Taker
+                orderData.time_in_force = 'ioc'; 
+                
                 orderData.bracket_stop_loss_price = slPriceNum.toFixed(assetConfig.precision);
                 orderData.bracket_stop_trigger_method = 'mark_price';
                 
             } else {
                 // Market Order
-                // REMOVED 'time_in_force': 'ioc' based on user request.
-                // Market orders are implicitly Taker/Fill-or-Kill/IOC depending on exchange.
+                // NO IOC param needed for Standard Market Order
             }
             
             asset.lastTriggerTime = Date.now();
@@ -283,10 +306,10 @@ class FastStrategy {
             size: asset.position.size.toString(),
             side: side,
             order_type: 'market_order'
-            // No IOC here either
         });
         asset.position = null;
     }
 }
 
 module.exports = FastStrategy;
+                    
