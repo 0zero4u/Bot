@@ -28,12 +28,12 @@ class FastStrategy {
         // This prevents "1 XRP" orders from skewing the "Effective Price".
         this.MIN_MATH_QTY = 10.0; 
 
-        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '300.0'); 
+        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '500.0'); 
 
         // --- PREDICTIVE SCORING WEIGHTS ---
         this.WEIGHTS = {
-            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '35'),      // Baseline Pressure
-            GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '25'),  // Lagging Velocity
+            GATE1_ZSCORE: parseInt(process.env.W_ZSCORE || '40'),      // Baseline Pressure
+            GATE2_MOMENTUM: parseInt(process.env.W_MOMENTUM || '30'),  // Lagging Velocity
             GATE3_SHIFT: parseInt(process.env.W_SHIFT || '10'),        // Reactive Gravity
             GATE4_PULL: parseInt(process.env.W_PULL || '20')           // Predictive Intent
         };
