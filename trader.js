@@ -1,19 +1,18 @@
 // trader.js
-// v67.2 - Aligned with Market Listener v4.0 & TickStrategy v7.1
-// 
+// v67.3 - Fixed "Double Strategy" Suffix & Trailing Space Error
 
 const WebSocket = require('ws');
 const winston = require('winston');
 const crypto = require('crypto');
 require('dotenv').config();
 
-// --- [CHANGED] Use Rust Native Client ---
+// --- Rust Native Client ---
 const { DeltaNativeClient } = require('fast-client');
 const DeltaClient = DeltaNativeClient; 
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Tick', // Default to Tick strategy
+    strategy: process.env.STRATEGY || 'Tick', // Default to 'Tick'
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
@@ -76,16 +75,10 @@ class TradingBot {
         this.ws = null; 
         this.authenticated = false;
         this.isOrderInProgress = false;
-
-        // [CRITICAL] Per-Asset Position Tracking
         this.activePositions = {};
-
-        // [NEW] Latency Analysis Storage
         this.orderLatencies = new Map(); 
 
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
-        
-        // Initialize State
         this.targetAssets.forEach(asset => {
             this.activePositions[asset] = false;
         });
@@ -96,12 +89,28 @@ class TradingBot {
         this.restKeepAliveInterval = null;
 
         try {
-            // Updated to look for Strategy without 'Strategy.js' suffix duplication if handled by require
-            const StrategyClass = require(`./strategies/${this.config.strategy}Strategy.js`);
+            // [FIXED] Robust Strategy Loading
+            // 1. Trim whitespace (fixes "Tick ")
+            // 2. Remove 'Strategy' suffix if user included it (fixes "TickStrategy")
+            // 3. Remove '.js' if included
+            const cleanName = this.config.strategy
+                .trim()
+                .replace(/Strategy(\.js)?$/i, '') 
+                .replace(/\.js$/i, '');
+
+            // Result: "TickStrategy " -> "Tick"
+            // Result: "Tick" -> "Tick"
+            const strategyPath = `./strategies/${cleanName}Strategy.js`;
+            
+            this.logger.info(`Loading Strategy from: ${strategyPath}`);
+            const StrategyClass = require(strategyPath);
+            
             this.strategy = new StrategyClass(this);
-            this.logger.info(`Successfully loaded strategy: ${this.config.strategy}Strategy`);
+            this.logger.info(`✅ Successfully loaded strategy: ${this.strategy.getName ? this.strategy.getName() : cleanName}`);
+
         } catch (e) {
             this.logger.error(`FATAL: Could not load strategy: ${e.message}`);
+            this.logger.error(`Debug Info: Tried to load '${this.config.strategy}' -> Cleaned to '${this.config.strategy.trim().replace(/Strategy(\.js)?$/i, '')}'`);
             process.exit(1);
         }
     }
@@ -117,7 +126,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v67.2 - Aligned) ---`);
+        this.logger.info(`--- Bot Initializing (v67.3 - Robust Loader) ---`);
 
         // --- 1. WARM UP CONNECTION ---
         this.logger.info("🔥 Warming up Rust Native Connection...");
@@ -345,8 +354,6 @@ class TradingBot {
             
             // [FIXED] Aligned with market_listener.js "depthUpdate" format
             if (data.type === 'depthUpdate') {
-                // Pass the data directly to strategy
-                // data format: { s: 'XRP', bids: [[p,s],...], asks: [[p,s],...] }
                 if (this.strategy && this.strategy.execute) {
                     await this.strategy.execute(data);
                 }
@@ -405,4 +412,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-            
+    
