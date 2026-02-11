@@ -20,7 +20,7 @@ class FastStrategy {
         
         // --- TIERED ENTRY THRESHOLDS ---
         this.MIN_SCORE_LIMIT = parseInt(process.env.MIN_SCORE_LIMIT || '75');
-        this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '70');
+        this.MIN_SCORE_MARKET = parseInt(process.env.MIN_SCORE_MARKET || '60');
         this.LOCK_DURATION_MS = 2000; 
         
         // --- DUST FILTER (THE FIX) ---
