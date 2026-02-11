@@ -28,7 +28,7 @@ class FastStrategy {
         // This prevents "1 XRP" orders from skewing the "Effective Price".
         this.MIN_MATH_QTY = 10.0; 
 
-        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '1.0'); 
+        this.MIN_PULL_QTY = parseFloat(process.env.MIN_PULL_QTY || '300.0'); 
 
         // --- PREDICTIVE SCORING WEIGHTS ---
         this.WEIGHTS = {
