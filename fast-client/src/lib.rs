@@ -1,9 +1,10 @@
+
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use reqwest::{Client, header};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use serde_json::Value;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -23,11 +24,13 @@ impl DeltaNativeClient {
   pub fn new(api_key: String, api_secret: String, base_url: Option<String>) -> Result<Self> {
     let url = base_url.unwrap_or_else(|| "https://api.india.delta.exchange".to_string());
     
-    // High-Performance Client Configuration
+    // [FIX] Added Timeouts for Safety
     let client = Client::builder()
-        .tcp_nodelay(true) // Disable Nagle's algorithm (Lower Latency)
-        .pool_idle_timeout(None) // Keep connections open indefinitely
+        .tcp_nodelay(true) 
+        .pool_idle_timeout(None) 
         .pool_max_idle_per_host(10)
+        .connect_timeout(Duration::from_secs(5)) // Fail fast if Delta is down
+        .timeout(Duration::from_secs(5))         // Fail fast if request hangs
         .user_agent("Mozilla/5.0 (compatible; DeltaBot/Native)")
         .build()
         .map_err(|e| Error::new(Status::GenericFailure, format!("Client build failed: {}", e)))?;
@@ -40,8 +43,9 @@ impl DeltaNativeClient {
     })
   }
 
-  // --- Helper: Generate HMAC SHA256 Signature ---
+  // [FIX] Added 'query' support to signature generation
   fn sign(&self, method: &str, path: &str, query: &str, body: &str, timestamp: &str) -> Result<String> {
+    // Delta expects: method + timestamp + path + query_string + body
     let signature_data = format!("{}{}{}{}{}", method, timestamp, path, query, body);
     
     let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes())
@@ -52,7 +56,6 @@ impl DeltaNativeClient {
     Ok(hex::encode(result.into_bytes()))
   }
 
-  // --- Exported Method: Place Order ---
   #[napi]
   pub async fn place_order(&self, body: Value) -> Result<Value> {
     let path = "/v2/orders";
@@ -78,14 +81,12 @@ impl DeltaNativeClient {
         .await
         .map_err(|e| Error::new(Status::GenericFailure, format!("Request failed: {}", e)))?;
 
-    // Parse response
     let json: Value = res.json().await
         .map_err(|e| Error::new(Status::GenericFailure, format!("Parse failed: {}", e)))?;
         
     Ok(json)
   }
 
-  // --- Exported Method: Get Wallet Balance ---
   #[napi]
   pub async fn get_wallet_balance(&self) -> Result<Value> {
     let path = "/v2/wallet/balances";
@@ -115,7 +116,6 @@ impl DeltaNativeClient {
      Ok(json)
   }
 
-  // --- Exported Method: Get Positions ---
   #[napi]
   pub async fn get_positions(&self) -> Result<Value> {
     let path = "/v2/positions/margined";
@@ -145,4 +145,3 @@ impl DeltaNativeClient {
      Ok(json)
   }
 }
-
