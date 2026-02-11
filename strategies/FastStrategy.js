@@ -52,7 +52,7 @@ class FastStrategy {
 
         const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP').split(',');
         this.assets = {};
-,
+
         targets.forEach(asset => {
             const cleanKey = asset.replace('_USDT', '');
             if (MASTER_CONFIG[cleanKey]) {
