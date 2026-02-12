@@ -17,7 +17,7 @@ class LeadStrategy {
         this.IMBALANCE_THRESHOLD = 0.30; 
         
         // --- VOLATILITY CONFIG (Time Based) ---
-        this.VOL_HALF_LIFE_MS = 10000;    
+        this.VOL_HALF_LIFE_MS = 5000;    
         this.VOL_LAMBDA = Math.LN2 / this.VOL_HALF_LIFE_MS; 
         this.MAX_DT_MS = 100; // Clamp prevents volatility collapse on lag
 
