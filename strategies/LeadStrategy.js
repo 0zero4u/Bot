@@ -59,7 +59,7 @@ class LeadStrategy {
         this.BASE_Q = 0.0000001;    
         this.BASE_R = 0.001;        
         this.Q_SCALER = 50000;      
-        this.VAR_EMA_ALPHA = 0.05;  
+        this.VAR_EMA_ALPHA = 0.0005;  
 
         // --- TRIGGER THRESHOLDS ---
         this.Z_THRESHOLD = 0.6;     
