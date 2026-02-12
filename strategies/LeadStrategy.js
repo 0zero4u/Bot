@@ -260,5 +260,12 @@ class LeadStrategy {
     }
 }
 
+
+    // --- ---
+    onLaggerTrade(trade) {}
+    onPositionClose(asset) {}
+    getName() { return "LeadStrategy (Velocity )"; }
+}
+
 module.exports = LeadStrategy;
             
