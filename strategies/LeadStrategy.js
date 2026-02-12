@@ -1,8 +1,9 @@
+
 /**
  * ============================================================================
- * LEAD STRATEGY v11: FINAL REFINEMENT
- * * Fixes: zCount clamping (Log hygiene).
- * * Verified: Ring Buffer Set Theory (Validates O(1) insertion).
+ * LEAD STRATEGY v12: BRACKET ORDERS & NORMALIZED TICKS
+ * * Added: Bracket Orders (SL 0.03% / TP 0.08%)
+ * * Added: Tick Size Normalization to prevent API rejection
  * ============================================================================
  */
 
@@ -16,10 +17,14 @@ class LeadStrategy {
         this.WINDOW_MS = 20;             
         this.IMBALANCE_THRESHOLD = 0.50; 
         
+        // --- RISK MANAGEMENT (NORMALIZED) ---
+        this.SL_PCT = 0.0003; // 0.03% Stop Loss
+        this.TP_PCT = 0.0008; // 0.08% Take Profit
+        
         // --- VOLATILITY CONFIG (Time Based) ---
         this.VOL_HALF_LIFE_MS = 5000;    
         this.VOL_LAMBDA = Math.LN2 / this.VOL_HALF_LIFE_MS; 
-        this.MAX_DT_MS = 100; // Clamp prevents volatility collapse on lag
+        this.MAX_DT_MS = 100;
 
         // --- ADAPTIVE THRESHOLD ---
         this.QUANTILE_RANK = 0.9990;      
@@ -33,6 +38,14 @@ class LeadStrategy {
             'BTC': { deltaId: 27 },    
             'ETH': { deltaId: 299 },
             'SOL': { deltaId: 417 }
+        };
+
+        // Tick Sizes for Normalization (Crucial for Bracket Orders)
+        this.tickSizes = {
+            'BTC': 0.1,
+            'ETH': 0.01,
+            'SOL': 0.001,
+            'XRP': 0.0001
         };
 
         // --- STATE ---
@@ -62,32 +75,31 @@ class LeadStrategy {
             this.triggerState[a] = { isFiring: false, lastFire: 0 };
         });
 
-        this.logger.info(`[LeadStrategy v11] 🛡️ Ready. Buffer: ${this.BUFFER_SIZE} ticks.`);
+        this.logger.info(`[LeadStrategy v12] 🛡️ Ready with Brackets (SL: ${this.SL_PCT*100}%, TP: ${this.TP_PCT*100}%).`);
 
         setInterval(() => this.updateThresholds(), this.UPDATE_INTERVAL_MS);
         this.startHeartbeat();
     }
 
     /**
-     * 🐢 Update Thresholds
-     * Mathematical Note:
-     * A Ring Buffer of size N, once full, ALWAYS contains exactly the last N items.
-     * The order (chronological vs wrapped) DOES NOT affect the Percentile/Quantile.
-     * We do NOT need to reconstruct the array. Sorting the raw buffer is valid.
+     * Helper: Round price to nearest valid tick size
      */
+    roundToTick(price, tickSize) {
+        return (Math.round(price / tickSize) * tickSize).toFixed(this.getPrecision(tickSize));
+    }
+
+    getPrecision(tickSize) {
+        if (tickSize >= 1) return 0;
+        return -Math.floor(Math.log10(tickSize));
+    }
+
     updateThresholds() {
         Object.keys(this.assets).forEach(asset => {
             const count = this.zCount[asset];
             if (count < 500) return; 
 
-            // If count < BUFFER_SIZE, we take 0..count
-            // If count == BUFFER_SIZE, we take 0..BUFFER_SIZE (Whole Array)
-            // Note: zCount is now clamped, so it never exceeds BUFFER_SIZE
             const view = this.zBuffer[asset].subarray(0, count);
-            
-            // Create copy to sort (Float32Array.sort is optimized)
             const sorted = Float32Array.from(view).sort();
-            
             const index = Math.floor(sorted.length * this.QUANTILE_RANK);
             const newThreshold = sorted[index];
 
@@ -107,7 +119,7 @@ class LeadStrategy {
                      const vol = Math.sqrt(this.volState[asset].variance);
                      
                      this.logger.info(
-                        `[${asset}] ${status} | Z-Thresh: ${this.dynamicThresholds[asset].toFixed(2)}σ | Vol: ${(vol*100).toFixed(4)}% | N=${this.zCount[asset]}`
+                        `[${asset}] ${status} | Z-Thresh: ${this.dynamicThresholds[asset].toFixed(2)}σ | Vol: ${(vol*100).toFixed(4)}%`
                     );
                 }
             });
@@ -126,17 +138,15 @@ class LeadStrategy {
         history.push({ p: currentPrice, t: now });
         if (history.length > 250) history.shift(); 
 
-        // Scan backwards (Linear Scan - Fast for N=250)
         const targetTime = now - this.WINDOW_MS;
         let prevTick = null;
         for (let i = history.length - 1; i >= 0; i--) {
             if (history[i].t <= targetTime) {
                 prevTick = history[i];
-                break; // Found it, stop scanning
+                break; 
             }
         }
         
-        // If we don't have enough history yet, exit
         if (!prevTick) return;
 
         // --- TIME-BASED VOLATILITY ---
@@ -147,7 +157,6 @@ class LeadStrategy {
         volState.lastTime = now;
 
         if (dt > 0) {
-            // Clamp DT to prevent Volatility Collapse
             const clampedDt = Math.min(dt, this.MAX_DT_MS);
             const weight = Math.exp(-this.VOL_LAMBDA * clampedDt);
             volState.variance = (volState.variance * weight) + ((rawReturn ** 2) * (1 - weight));
@@ -162,11 +171,8 @@ class LeadStrategy {
         // --- RING BUFFER WRITE ---
         const ptr = this.zPointer[asset];
         this.zBuffer[asset][ptr] = absZ;
-        
-        // Advance Pointer
         this.zPointer[asset] = (ptr + 1) % this.BUFFER_SIZE;
         
-        // Clamp Count (Fixes "N never stops increasing")
         if (this.zCount[asset] < this.BUFFER_SIZE) {
             this.zCount[asset]++;
         }
@@ -190,7 +196,7 @@ class LeadStrategy {
                 else if (zScore < 0 && (askQty / totalQty) >= this.IMBALANCE_THRESHOLD) side = 'sell';
 
                 if (side) {
-                    const sigId = `z11_${now}`;
+                    const sigId = `z12_${now}`;
                     this.logger.info(`[SIGNAL ${asset}] ⚡ IMPULSE! Z=${zScore.toFixed(2)} > ${threshold.toFixed(2)}`);
                     
                     this.pendingSignals.push({
@@ -248,14 +254,35 @@ class LeadStrategy {
         this.triggerState[asset].lastFire = now;
 
         const spec = this.assets[asset];
+        const tickSize = this.tickSizes[asset] || 0.1; // Default to 0.1 if unknown
+
+        // --- CALCULATE BRACKETS ---
+        let slPrice, tpPrice;
+
+        if (side === 'buy') {
+            // Buy: Stop Loss is BELOW, Take Profit is ABOVE
+            slPrice = price * (1 - this.SL_PCT);
+            tpPrice = price * (1 + this.TP_PCT);
+        } else {
+            // Sell: Stop Loss is ABOVE, Take Profit is BELOW
+            slPrice = price * (1 + this.SL_PCT);
+            tpPrice = price * (1 - this.TP_PCT);
+        }
+
         const payload = {
             product_id: spec.deltaId.toString(),
             side: side,
             size: process.env.ORDER_SIZE || "1",
             order_type: 'market_order',
-            client_order_id: orderId
+            client_order_id: orderId,
+            
+            // --- BRACKET ORDERS ---
+            bracket_stop_loss_price: this.roundToTick(slPrice, tickSize),
+            bracket_take_profit_price: this.roundToTick(tpPrice, tickSize),
+            bracket_stop_trigger_method: 'mark_price' // Normalized trigger method
         };
-        this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} @ ${price}`);
+
+        this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} @ ${price} | TP: ${payload.bracket_take_profit_price} | SL: ${payload.bracket_stop_loss_price}`);
         
         try {
             await this.bot.placeOrder(payload);
@@ -267,8 +294,8 @@ class LeadStrategy {
     // --- INTERFACE METHODS ---
     onLaggerTrade(trade) {}
     onPositionClose(asset) {}
-    getName() { return "LeadStrategy (Velocity v11)"; }
+    getName() { return "LeadStrategy (Brackets v12)"; }
 }
 
 module.exports = LeadStrategy;
-                                          
+            
