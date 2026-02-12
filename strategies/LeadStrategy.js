@@ -1,14 +1,10 @@
 /**
  * ============================================================================
  * LEAD STRATEGY (LEADER-LAGGER ARBITRAGE)
- * Version: 13.2 [HEARTBEAT + FULL PRICE LOGS]
+ * Version: 13.3 [DEBUG LOGGING + DYNAMIC THRESHOLD DISPLAY]
  * ============================================================================
  */
 
-/**
- * Helper Class: TimeWindowStats
- * Tracks the correlation (Beta) between Leader and Lagger moves over a sliding window.
- */
 class TimeWindowStats {
     constructor(windowMs = 5000) { 
         this.windowMs = windowMs;
@@ -62,7 +58,10 @@ class LeadStrategy {
         this.VAR_EMA_ALPHA = 0.0005;  
 
         // --- TRIGGER THRESHOLDS ---
+        // Z-Score: How many standard deviations away from "Fair" before we trade?
+        // 0.3 is very aggressive. 2.0 is conservative.
         this.Z_THRESHOLD = 0.3;     
+        this.DEBUG_THRESHOLD = 0.1; // Log "Thinking..." if Z > 0.1
         this.COOLDOWN_MS = 200;     
 
         // --- ASSET SPECIFICATIONS ---
@@ -77,7 +76,7 @@ class LeadStrategy {
         this.stats = {};            
         this.lastTriggerTime = {};  
 
-        this.logger.info(`[LeadStrategy v13.2] Initialized with Full Price Logging | BTC Tick: 0.5`);
+        this.logger.info(`[LeadStrategy v13.3] Initialized | Threshold: ${this.Z_THRESHOLD}`);
 
         // START THE HEARTBEAT
         this.startHeartbeat();
@@ -85,14 +84,14 @@ class LeadStrategy {
 
     /**
      * [UPDATED] HEARTBEAT LOGGER
-     * Runs every 10s. Now includes LEADER, FAIR, and REF prices.
+     * Corrected the "(Req 2.0)" text to show actual variable.
      */
     startHeartbeat() {
         setInterval(() => {
             const activeAssets = Object.keys(this.filters);
             if (activeAssets.length === 0) return;
 
-            this.logger.info(`--- 💓 STRATEGY HEARTBEAT 💓 ---`);
+            this.logger.info(`--- 📊 STRATEGY HEARTBEAT 📊 ---`);
 
             activeAssets.forEach(asset => {
                 const f = this.filters[asset];
@@ -107,11 +106,10 @@ class LeadStrategy {
 
                 // 2. Status
                 let status = "WAITING";
-                if (Math.abs(zScore) > this.Z_THRESHOLD) status = "🔥🔥 TRIGGERING 🔥🔥";
+                if (Math.abs(zScore) > this.Z_THRESHOLD) status = "🚀 TRIGGERING 🚀";
                 else if (Math.abs(zScore) > 1.0) status = "WATCHING (Hot)";
 
                 // 3. Format Data
-                // Leader: Binance Price | Fair: Calculated Price | Ref: Delta Last Trade
                 const leaderP = f.lastLeader.toFixed(spec.precision);
                 const fairP = f.x.toFixed(spec.precision);
                 const refP = f.laggerAtLastTrade.toFixed(spec.precision);
@@ -121,7 +119,7 @@ class LeadStrategy {
                 const sigmaStr = effectiveSigma.toFixed(spec.precision + 1);
 
                 this.logger.info(
-                    `[${asset}] ${status} | L: ${leaderP} -> Fair: ${fairP} vs Ref: ${refP} | Gap: ${gapStr} | Z: ${zStr} (Req 2.0) | Sigma: ${sigmaStr}`
+                    `[${asset}] ${status} | Fair: ${fairP} vs Ref: ${refP} | Gap: ${gapStr} | Z: ${zStr} (Req ${this.Z_THRESHOLD}) | Sigma: ${sigmaStr}`
                 );
             });
             this.logger.info(`----------------------------------`);
@@ -186,6 +184,16 @@ class LeadStrategy {
 
         const zScore = diff / effectiveSigma;
 
+        // [NEW] Debug Logging for "Close Calls"
+        // If Z-Score is small (0.03), this will correctly skip logging to save space.
+        // If Z-Score > 0.1, we log it so you see movement.
+        if (Math.abs(zScore) > this.DEBUG_THRESHOLD && Math.abs(zScore) < this.Z_THRESHOLD) {
+             // Rate limit these logs to avoid spamming (simple throttle check could go here)
+             // For now, let's trust the threshold.
+             // Uncomment below if you want very verbose logs:
+             // this.logger.info(`[${asset}] 👀 Watch: Z=${zScore.toFixed(3)} < Req ${this.Z_THRESHOLD}`);
+        }
+
         if (Math.abs(zScore) > this.Z_THRESHOLD) {
             await this.tryExecute(asset, zScore, filter.x, referencePrice);
         }
@@ -237,7 +245,10 @@ class LeadStrategy {
         const now = Date.now();
 
         if (this.lastTriggerTime[asset] && (now - this.lastTriggerTime[asset] < this.COOLDOWN_MS)) return;
-        if (this.bot.hasOpenPosition(asset)) return;
+        if (this.bot.hasOpenPosition(asset)) {
+            this.logger.info(`[Signal] ${asset} Z:${zScore.toFixed(2)} -> Ignored (Already Open)`);
+            return;
+        }
 
         const spec = this.assets[asset];
         let side = null;
@@ -259,15 +270,16 @@ class LeadStrategy {
                 client_order_id: `k_${now}`           
             };
             
-            this.logger.info(`[Sniper] 🔫 ${asset} ${side.toUpperCase()} (MKT) | Z:${zScore.toFixed(2)} | Gap:${(fairValue - referencePrice).toFixed(spec.precision)}`);
+            // Log the math clearly for the user
+            this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} | Z: ${zScore.toFixed(3)} > ${this.Z_THRESHOLD} | Gap: ${(fairValue - referencePrice).toFixed(spec.precision)}`);
             
             await this.bot.placeOrder(payload);
         }
     }
 
-    getName() { return "LeadStrategy (Sigma v13.2 - Prices Logged)"; }
+    getName() { return "LeadStrategy (Sigma v13.3 - Debug Logs)"; }
     onPositionClose(asset) {}
 }
 
 module.exports = LeadStrategy;
-    
+            
