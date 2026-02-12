@@ -1,292 +1,185 @@
+
 /**
  * ============================================================================
- * LEAD STRATEGY (LEADER-LAGGER ARBITRAGE)
- * Version: 14.0 [CONFIGURABLE SIGMA + HYPERPARAMETERS]
+ * LEAD STRATEGY (GAP + IMBALANCE)
+ * Version: Simple v1.1 [WITH EXTENSIVE HEARTBEAT]
+ * Logic: 
+ * 1. Calculate Gap % between Binance (Leader) and Delta Last Trade (Lagger).
+ * 2. If Gap > 0.03% -> BUY | If Gap < -0.03% -> SELL.
+ * 3. Filter: Confirm Binance Order Book Imbalance supports the direction.
  * ============================================================================
  */
-
-class TimeWindowStats {
-    constructor(windowMs = 5000) { 
-        this.windowMs = windowMs;
-        this.data = []; 
-    }
-
-    add(x, y) {
-        const now = Date.now();
-        this.data.push({ x, y, t: now });
-        while (this.data.length > 0 && (now - this.data[0].t > this.windowMs)) {
-            this.data.shift();
-        }
-    }
-
-    getBeta() {
-        const n = this.data.length;
-        if (n < 5) return 1.0; 
-        
-        let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-        for (let i = 0; i < n; i++) {
-            const p = this.data[i];
-            sumX += p.x; sumY += p.y; sumXY += p.x * p.y; sumXX += p.x * p.x;
-        }
-        
-        const meanX = sumX / n; 
-        const meanY = sumY / n;
-        let varX = 0, covXY = 0;
-        
-        for (let i = 0; i < n; i++) {
-            const p = this.data[i];
-            covXY += (p.x - meanX) * (p.y - meanY);
-            varX += (p.x - meanX) * (p.x - meanX);
-        }
-        
-        if (varX < 1e-9) return 1.0;
-        
-        let beta = covXY / varX;
-        return Math.max(0.8, Math.min(1.2, beta));
-    }
-}
 
 class LeadStrategy {
     constructor(bot) {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- HYPERPARAMETERS (ENV CONFIGURABLE) ---
-        // 1. Trigger Sensitivity
-        this.Z_THRESHOLD = parseFloat(process.env.Z_THRESHOLD || '0.3');
-        
-        // 2. Sigma (Volatility) Tuning
-        // "Floor": Minimum sigma in ticks. Lowering this allows trading on quiet markets.
-        this.SIGMA_TICK_MULT = parseFloat(process.env.SIGMA_TICK_MULT || '0.0001'); 
-        // "Scale": Multiplier for the Kalman calculation. < 1.0 = More aggressive.
-        this.SIGMA_SCALE = parseFloat(process.env.SIGMA_SCALE || '1.0'); 
+        // --- CONFIGURATION ---
+        this.GAP_THRESHOLD = 0.0003;      // 0.03% target
+        this.IMBALANCE_RATIO = 0.6;       // 60% book dominance required
+        this.COOLDOWN_MS = 1000;          // 1s cooldown
 
-        // 3. Kalman Defaults
-        this.BASE_Q = 0.0000001;    
-        this.BASE_R = 0.001;        
-        this.Q_SCALER = 50000;      
-        this.VAR_EMA_ALPHA = 0.0005;  
-
-        this.DEBUG_THRESHOLD = 0.1; // Log "Thinking..." if Z > 0.1
-        this.COOLDOWN_MS = 200;     
-
-        // --- ASSET SPECIFICATIONS ---
+        // --- ASSET SPECS ---
         this.assets = {
-            'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 }, 
-            'BTC': { deltaId: 27, precision: 1, tickSize: 0.5 },    
-            'ETH': { deltaId: 299, precision: 2, tickSize: 0.05 },
-            'SOL': { deltaId: 417, precision: 3, tickSize: 0.01 }
+            'XRP': { deltaId: 14969, precision: 4 }, 
+            'BTC': { deltaId: 27, precision: 1 },    
+            'ETH': { deltaId: 299, precision: 2 },
+            'SOL': { deltaId: 417, precision: 3 }
         };
 
-        this.filters = {};          
-        this.stats = {};            
-        this.lastTriggerTime = {};  
+        // --- STATE ---
+        this.lastDeltaPrice = {};         
+        this.lastTriggerTime = {};        
+        
+        // Store latest calculations for the Heartbeat Logger
+        this.latestStats = {}; 
 
-        this.logger.info(`[LeadStrategy v14.0] Loaded.`);
-        this.logger.info(`> Config: Z_REQ=${this.Z_THRESHOLD} | SigmaMinTicks=${this.SIGMA_TICK_MULT} | SigmaScale=${this.SIGMA_SCALE}`);
+        this.logger.info(`[LeadStrategy Simple] Loaded.`);
+        this.logger.info(`> Config: Gap Req > ${this.GAP_THRESHOLD * 100}% | Imbalance Req > ${this.IMBALANCE_RATIO * 100}%`);
 
-        // START THE HEARTBEAT
+        // Start the 10s Monitor
         this.startHeartbeat();
     }
 
     /**
-     * [UPDATED] HEARTBEAT LOGGER
-     * Shows the dynamic Sigma and Z-Score status
+     * 🟢 HEARTBEAT LOGGER
+     * Runs every 10 seconds to show you exactly what the bot sees.
      */
     startHeartbeat() {
         setInterval(() => {
-            const activeAssets = Object.keys(this.filters);
-            if (activeAssets.length === 0) return;
-
-            this.logger.info(`--- 📊 STRATEGY HEARTBEAT 📊 ---`);
+            const activeAssets = Object.keys(this.assets);
+            this.logger.info(`--- 📊 STRATEGY SNAPSHOT (10s) 📊 ---`);
 
             activeAssets.forEach(asset => {
-                const f = this.filters[asset];
-                const spec = this.assets[asset];
+                const stats = this.latestStats[asset];
+                const deltaP = this.lastDeltaPrice[asset];
 
-                // 1. Re-calculate metrics
-                const gap = f.x - f.laggerAtLastTrade;
+                if (!stats || !deltaP) {
+                    this.logger.info(`[${asset}] Waiting for data...`);
+                    return;
+                }
+
+                // 1. Format Values
+                const gapPct = (stats.gap * 100).toFixed(4);
+                const reqGap = (this.GAP_THRESHOLD * 100).toFixed(3);
+                const imb = stats.imbalance.toFixed(2);
+                const reqImb = this.IMBALANCE_RATIO.toFixed(2);
                 
-                // --- SIGMA CALCULATION (Using Hyperparams) ---
-                const calculatedSigma = Math.sqrt(f.P + f.lastAnchorR) * this.SIGMA_SCALE;
-                const minSigma = f.tickSize * this.SIGMA_TICK_MULT; 
-                const effectiveSigma = Math.max(minSigma, calculatedSigma);
-                
-                const zScore = gap / effectiveSigma;
+                // 2. Determine Status
+                let status = "💤 IDLE";
+                if (Math.abs(stats.gap) > this.GAP_THRESHOLD) {
+                    if (stats.imbalance >= this.IMBALANCE_RATIO) {
+                        status = "🔥 TRIGGERING";
+                    } else {
+                        status = "⚠️ GAP OK / LOW IMBALANCE";
+                    }
+                } else if (Math.abs(stats.gap) > (this.GAP_THRESHOLD * 0.5)) {
+                    status = "👀 WARMING UP";
+                }
 
-                // 2. Status
-                let status = "WAITING";
-                if (Math.abs(zScore) > this.Z_THRESHOLD) status = "🚀 TRIGGERING 🚀";
-                else if (Math.abs(zScore) > 1.0) status = "WATCHING (Hot)";
-
-                // 3. Format Data
-                const fairP = f.x.toFixed(spec.precision);
-                const refP = f.laggerAtLastTrade.toFixed(spec.precision);
-                
-                const gapStr = gap.toFixed(spec.precision);
-                const zStr = zScore.toFixed(2);
-                const sigmaStr = effectiveSigma.toFixed(spec.precision + 2);
-
+                // 3. Log Line
                 this.logger.info(
-                    `[${asset}] ${status} | Fair: ${fairP} vs Ref: ${refP} | Gap: ${gapStr} | Z: ${zStr} (Req ${this.Z_THRESHOLD}) | Sigma: ${sigmaStr}`
+                    `[${asset}] ${status} | Gap: ${gapPct}% (Req ${reqGap}%) | Imb: ${imb} (Req ${reqImb}) | Bin: ${stats.binancePrice} vs Delta: ${deltaP}`
                 );
             });
-            this.logger.info(`----------------------------------`);
-        }, 10000); 
+            this.logger.info(`------------------------------------------`);
+        }, 10000); // 10,000 ms = 10 seconds
     }
 
-    initFilter(asset, initialPrice) {
-        const spec = this.assets[asset];
-        const tickSize = spec.tickSize || Math.pow(10, -spec.precision);
-
-        this.filters[asset] = {
-            x: initialPrice,             
-            P: 0.001,                    
-            lastLeader: initialPrice,    
-            leaderAtLastTrade: initialPrice,
-            laggerAtLastTrade: initialPrice,
-            innovationVar: 0, 
-            dynamicQ: this.BASE_Q,
-            lastAnchorR: this.BASE_R,    
-            tickSize: tickSize,
-            bounceThreshold: tickSize * 2, 
-            lastUpdateT: Date.now(),
-            beta: 1.0 
-        };
-        this.stats[asset] = new TimeWindowStats(10000); 
-    }
-
-    async onDepthUpdate(asset, depth) {
-        if (!this.assets[asset]) return;
-
-        const bestBid = parseFloat(depth.bids[0][0]);
-        const bestAsk = parseFloat(depth.asks[0][0]);
-        const leaderMid = (bestBid + bestAsk) / 2;
-        const now = Date.now();
-
-        if (!this.filters[asset]) {
-            this.initFilter(asset, leaderMid);
-            return;
-        }
-
-        const filter = this.filters[asset];
-        
-        let dt = (now - filter.lastUpdateT) / 1000;
-        if (dt < 0) dt = 0; if (dt > 5) dt = 5; 
-
-        const incrementalLeaderMove = leaderMid - filter.lastLeader;
-        
-        filter.x = filter.x + (incrementalLeaderMove * filter.beta);
-        filter.P = filter.P + (filter.dynamicQ * dt);
-
-        filter.lastLeader = leaderMid;
-        filter.lastUpdateT = now;
-
-        const referencePrice = filter.laggerAtLastTrade;
-        if (referencePrice === 0) return; 
-
-        const diff = filter.x - referencePrice;
-
-        // --- SIGMA CALCULATION (Using Hyperparams) ---
-        const calculatedSigma = Math.sqrt(filter.P + filter.lastAnchorR) * this.SIGMA_SCALE;
-        const minSigma = filter.tickSize * this.SIGMA_TICK_MULT; 
-        const effectiveSigma = Math.max(minSigma, calculatedSigma);
-
-        const zScore = diff / effectiveSigma;
-
-        // [Debug Logging]
-        // Show "thinking" logs if we are close (e.g. Z > 0.1 but < 0.3)
-        if (Math.abs(zScore) > this.DEBUG_THRESHOLD && Math.abs(zScore) < this.Z_THRESHOLD) {
-             // Optional: Uncomment to see close calls in real-time
-             // this.logger.info(`[${asset}] 👀 Watch: Z=${zScore.toFixed(3)} (Req ${this.Z_THRESHOLD})`);
-        }
-
-        if (Math.abs(zScore) > this.Z_THRESHOLD) {
-            await this.tryExecute(asset, zScore, filter.x, referencePrice);
-        }
-    }
-
+    /**
+     * Called when a public trade happens on Delta (The Lagger)
+     */
     onLaggerTrade(trade) {
         const rawSymbol = trade.symbol || trade.product_symbol;
         if (!rawSymbol) return;
         const asset = Object.keys(this.assets).find(k => rawSymbol.startsWith(k));
-        if (!asset || !this.filters[asset]) return;
+        if (!asset) return;
 
-        const tradePrice = parseFloat(trade.price);
-        const tradeSize = parseFloat(trade.size || 0);
-        if (isNaN(tradePrice)) return;
-
-        const filter = this.filters[asset];
-        const stat = this.stats[asset];
-
-        const effectiveSize = Math.max(1, tradeSize);
-        const dynamicR = this.BASE_R / Math.sqrt(effectiveSize);
-
-        const moveSize = Math.abs(tradePrice - filter.laggerAtLastTrade);
-        const isSignificant = moveSize >= filter.bounceThreshold;
-
-        if (isSignificant) {
-            const deltaLagger = tradePrice - filter.laggerAtLastTrade;
-            const deltaLeader = filter.lastLeader - filter.leaderAtLastTrade;
-            
-            stat.add(deltaLeader, deltaLagger);
-            filter.beta = stat.getBeta();
-
-            filter.laggerAtLastTrade = tradePrice;
-            filter.leaderAtLastTrade = filter.lastLeader;
-            filter.lastAnchorR = dynamicR;
-        } 
-
-        const K = filter.P / (filter.P + dynamicR); 
-        const innovation = tradePrice - filter.x;   
-
-        filter.x = filter.x + K * innovation;       
-        filter.P = (1 - K) * filter.P;              
-
-        const rawErrorSq = (innovation * innovation) / (tradePrice * tradePrice);
-        filter.innovationVar = (1 - this.VAR_EMA_ALPHA) * filter.innovationVar + (this.VAR_EMA_ALPHA * rawErrorSq);
-        filter.dynamicQ = this.BASE_Q * (1 + (filter.innovationVar * this.Q_SCALER));
+        const price = parseFloat(trade.price);
+        if (!isNaN(price)) {
+            this.lastDeltaPrice[asset] = price;
+        }
     }
 
-    async tryExecute(asset, zScore, fairValue, referencePrice) {
+    /**
+     * Called when Binance (Leader) updates (High Frequency)
+     */
+    async onDepthUpdate(asset, depth) {
+        if (!this.assets[asset]) return;
+        
+        const deltaPrice = this.lastDeltaPrice[asset];
+        if (!deltaPrice) return;
+
+        // 1. Extract Leader Metrics
+        const binanceBid = parseFloat(depth.bids[0][0]);
+        const binanceBidQty = parseFloat(depth.bids[0][1]);
+        const binanceAsk = parseFloat(depth.asks[0][0]);
+        const binanceAskQty = parseFloat(depth.asks[0][1]);
+        const binanceMid = (binanceBid + binanceAsk) / 2;
+
+        // 2. Calculate Gap & Imbalance
+        const gap = (binanceMid - deltaPrice) / deltaPrice;
+        
+        const totalQty = binanceBidQty + binanceAskQty;
+        const bidRatio = binanceBidQty / totalQty;
+        const askRatio = binanceAskQty / totalQty;
+
+        // 3. Store Stats for Heartbeat (regardless of trigger)
+        // We store the relevant imbalance based on direction of gap
+        // If Gap is positive (Buy), we care about Bid Ratio. If negative (Sell), Ask Ratio.
+        const relevantImbalance = gap > 0 ? bidRatio : askRatio;
+
+        this.latestStats[asset] = {
+            gap: gap,
+            imbalance: relevantImbalance,
+            binancePrice: binanceMid,
+            timestamp: Date.now()
+        };
+
+        // 4. Logic: Check Thresholds
+        if (Math.abs(gap) > this.GAP_THRESHOLD) {
+            
+            let side = null;
+
+            // BUY: Leader Higher + Heavy Bids
+            if (gap > 0 && bidRatio >= this.IMBALANCE_RATIO) {
+                side = 'buy';
+            }
+            // SELL: Leader Lower + Heavy Asks
+            else if (gap < 0 && askRatio >= this.IMBALANCE_RATIO) {
+                side = 'sell';
+            }
+
+            // 5. Execute
+            if (side) {
+                this.logger.info(`[Signal ${asset}] Gap: ${(gap*100).toFixed(3)}% | Imb: ${relevantImbalance.toFixed(2)} | Delta: ${deltaPrice} -> Bin: ${binanceMid}`);
+                await this.tryExecute(asset, side, deltaPrice);
+            }
+        }
+    }
+
+    async tryExecute(asset, side, currentPrice) {
         const now = Date.now();
-
         if (this.lastTriggerTime[asset] && (now - this.lastTriggerTime[asset] < this.COOLDOWN_MS)) return;
-        if (this.bot.hasOpenPosition(asset)) {
-            // Optional: Log ignored signals if you want to debug missed opportunities
-            // this.logger.info(`[Signal] ${asset} Z:${zScore.toFixed(2)} -> Ignored (Already Open)`);
-            return;
-        }
+        if (this.bot.hasOpenPosition(asset)) return;
 
+        this.lastTriggerTime[asset] = now;
         const spec = this.assets[asset];
-        let side = null;
 
-        if (zScore > this.Z_THRESHOLD) {
-            side = 'buy'; 
-        } else if (zScore < -this.Z_THRESHOLD) {
-            side = 'sell'; 
-        }
+        const payload = {
+            product_id: spec.deltaId.toString(),
+            side: side,
+            size: process.env.ORDER_SIZE || "1",
+            order_type: 'market_order',
+            client_order_id: `simp_${now}`
+        };
 
-        if (side) {
-            this.lastTriggerTime[asset] = now;
-            
-            const payload = {
-                product_id: spec.deltaId.toString(),
-                side: side,
-                size: process.env.ORDER_SIZE || "1", 
-                order_type: 'market_order',           
-                client_order_id: `k_${now}`           
-            };
-            
-            // Clear Log for action
-            const gap = (fairValue - referencePrice).toFixed(spec.precision);
-            this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} | Z: ${zScore.toFixed(3)} > ${this.Z_THRESHOLD} | Gap: ${gap}`);
-            
-            await this.bot.placeOrder(payload);
-        }
+        this.logger.info(`[Sniper] ⚡ FIRE ${asset} ${side.toUpperCase()} @ ${currentPrice}`);
+        await this.bot.placeOrder(payload);
     }
 
-    getName() { return "LeadStrategy (Sigma v14.0 - Tunable)"; }
+    getName() { return "LeadStrategy (Simple + Heartbeat)"; }
     onPositionClose(asset) {}
 }
 
