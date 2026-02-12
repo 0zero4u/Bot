@@ -318,7 +318,7 @@ class LeadStrategy {
             const payload = {
                 product_id: spec.deltaId.toString(),
                 side: side,
-                size: process.env.ORDER_SIZE || "10", // Default contract size
+                size: process.env.ORDER_SIZE || "1", // Default contract size
                 order_type: 'market_order',           // <--- TAKER MODE
                 client_order_id: `k_${now}`           // Unique ID for tracking
             };
