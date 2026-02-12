@@ -14,7 +14,7 @@ class LeadStrategy {
         // --- CONFIGURATION ---
         this.WARMUP_MS = 100000;
         this.WINDOW_MS = 20;             
-        this.IMBALANCE_THRESHOLD = 0.50; 
+        this.IMBALANCE_THRESHOLD = 0.40; 
         
         // --- RISK MANAGEMENT (PERCENTAGE BASED) ---
         // User Requirement: 0.03% SL, 0.08% TP
