@@ -14,7 +14,7 @@ class LeadStrategy {
         // --- CONFIGURATION ---
         this.WARMUP_MS = 100000;
         this.WINDOW_MS = 20;             
-        this.IMBALANCE_THRESHOLD = 0.65; 
+        this.IMBALANCE_THRESHOLD = 0.50; 
         
         // --- VOLATILITY CONFIG (Time Based) ---
         this.VOL_HALF_LIFE_MS = 5000;    
