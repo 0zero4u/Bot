@@ -1,64 +1,46 @@
 /**
  * LeadStrategy.js
- * Version: 8.0 [TIME-WINDOW BETA + SMOOTHED ADAPTIVE Q]
- * * CRITICAL UPGRADES:
- * 1. TIME-BASED BETA WINDOW:
- * - Replaced fixed trade count (20) with time window (e.g., 10 seconds).
- * - Ensures Beta represents the "Current Market Regime" regardless of volume.
- * - High Vol = High Data Density = Robust Beta.
- * 2. SMOOTHED ADAPTIVE Q:
- * - Replaced raw error feedback with EMA of Innovation Variance.
- * - Prevents Q from exploding due to single outlier trades.
- * - Q only expands if divergence is persistent.
+ * Version: 11.0 [ROBUST SIGMA FLOOR + ANCHOR TRUST]
+ * * CRITICAL FIXES:
+ * 1. SIGMA FLOOR (Anti-Smugness):
+ * - Problem: In calm markets, P -> 0. Sigma becomes tiny. 1 tick moves trigger Z > 2.0.
+ * - Fix: Sigma = Math.max(2 * TickSize, sqrt(P + LastAnchorR)).
+ * - Result: We never trigger on noise smaller than the minimum spread.
+ * 2. ANCHOR TRUST:
+ * - Problem: Z-Score used generic BASE_R.
+ * - Fix: We store the 'dynamicR' of the Last Anchor Trade.
+ * - Result: If Anchor was a Whale (Low R), we trigger sooner. If Anchor was Dust (High R), we wait for larger divergence.
  */
 
-// --- UTILITY: Time-Based Rolling Statistics ---
 class TimeWindowStats {
-    constructor(windowMs = 10000) { // Default 10 seconds lookback
+    constructor(windowMs = 10000) { 
         this.windowMs = windowMs;
-        this.data = []; // Stores { x, y, t }
+        this.data = []; 
     }
-
     add(x, y) {
         const now = Date.now();
         this.data.push({ x, y, t: now });
-
-        // Prune data older than windowMs
-        // Efficient enough for HFT (Array usually < 100 items)
         while (this.data.length > 0 && (now - this.data[0].t > this.windowMs)) {
             this.data.shift();
         }
     }
-
     getBeta() {
         const n = this.data.length;
-        // If data is sparse (quiet market), return 1.0 to be safe
         if (n < 5) return 1.0; 
-
         let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-        
         for (let i = 0; i < n; i++) {
             const p = this.data[i];
-            sumX += p.x;
-            sumY += p.y;
-            sumXY += p.x * p.y;
-            sumXX += p.x * p.x;
+            sumX += p.x; sumY += p.y; sumXY += p.x * p.y; sumXX += p.x * p.x;
         }
-
-        const meanX = sumX / n;
-        const meanY = sumY / n;
+        const meanX = sumX / n; const meanY = sumY / n;
         let varX = 0, covXY = 0;
-
         for (let i = 0; i < n; i++) {
             const p = this.data[i];
             covXY += (p.x - meanX) * (p.y - meanY);
             varX += (p.x - meanX) * (p.x - meanX);
         }
-
         if (varX < 1e-9) return 1.0;
-
         let beta = covXY / varX;
-        // Clamp Beta (0.8 to 1.2) - Crypto arbs are rarely outside this
         return Math.max(0.8, Math.min(1.2, beta));
     }
 }
@@ -68,24 +50,14 @@ class LeadStrategy {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- ADAPTIVE PARAMETERS ---
+        // --- FILTER PARAMETERS ---
         this.BASE_Q = 0.0000001; 
         this.BASE_R = 0.001;  
-        
-        // Q SCALER: Multiplier for the Innovation Variance.
-        // Higher = Faster adaptation to trend changes.
         this.Q_SCALER = 50000; 
-
-        // VARIANCE EMA ALPHA: Smoothing factor for error tracking.
-        // 0.05 means we need ~20 bad trades to fully shift the regime.
-        // This filters out "Shot Noise" (single outliers).
         this.VAR_EMA_ALPHA = 0.05;
 
-        // Lagger EMA: Smoothing the Divergence signal
-        this.EMA_ALPHA = 0.2; 
-
-        // --- TRADING TRIGGERS ---
-        this.ENTRY_THRESHOLD = 0.0005; 
+        // --- STATISTICAL TRIGGERS ---
+        this.Z_THRESHOLD = 2.0; 
         this.PROFIT_MARGIN = 0.0003;   
         this.COOLDOWN_MS = 200;        
 
@@ -100,35 +72,38 @@ class LeadStrategy {
         this.stats = {}; 
         this.lastTriggerTime = {};
 
-        this.logger.info(`[LeadStrategy v8.0] Time-Window Beta & Smoothed Q Loaded.`);
+        this.logger.info(`[LeadStrategy v11.0] Robust Sigma Floor & Anchor Trust.`);
     }
 
     initFilter(asset, initialPrice) {
+        const tickSize = Math.pow(10, -this.assets[asset].precision);
+
         this.filters[asset] = {
             x: initialPrice,             
             P: 0.001,                    
             lastLeader: initialPrice,    
             
-            // Smoothed States
-            laggerEMA: initialPrice, 
-            innovationVar: 0, // Variance of the prediction error
-            
             // Adaptive State
+            innovationVar: 0, 
             dynamicQ: this.BASE_Q,
 
-            // Snapshots
+            // Anchor States
             leaderAtLastTrade: initialPrice,
             laggerAtLastTrade: initialPrice,
+            lastAnchorR: this.BASE_R, // [NEW] Trust level of the current anchor
+            
+            // Micro-Bounce Config
+            tickSize: tickSize,
+            bounceThreshold: tickSize * 2, 
             
             lastUpdateT: Date.now(),
             beta: 1.0 
         };
-        // Use 10-second rolling window for Beta
         this.stats[asset] = new TimeWindowStats(10000); 
     }
 
     /**
-     * PREDICTION (Binance)
+     * PREDICTION STEP (Binance)
      */
     async onDepthUpdate(asset, depth) {
         if (!this.assets[asset]) return;
@@ -145,33 +120,39 @@ class LeadStrategy {
 
         const filter = this.filters[asset];
         
-        // 1. Time Scaling
         let dt = (now - filter.lastUpdateT) / 1000;
         if (dt < 0) dt = 0; if (dt > 5) dt = 5;
 
-        // 2. Prediction (State Extrapolation)
         const incrementalLeaderMove = leaderMid - filter.lastLeader;
         filter.x = filter.x + (incrementalLeaderMove * filter.beta);
-        
-        // 3. Uncertainty Update (Using Smoothed Dynamic Q)
         filter.P = filter.P + (filter.dynamicQ * dt);
 
         filter.lastLeader = leaderMid;
         filter.lastUpdateT = now;
 
-        // 4. Signal Check (EMA vs Fair Value)
-        const referencePrice = filter.laggerEMA;
+        // 3. ROBUST Z-SCORE SIGNAL
+        const referencePrice = filter.laggerAtLastTrade;
         if (referencePrice === 0) return;
 
-        const divergence = (filter.x - referencePrice) / referencePrice;
+        const diff = filter.x - referencePrice;
 
-        if (Math.abs(divergence) > this.ENTRY_THRESHOLD) {
-            await this.tryExecute(asset, divergence, filter.x, referencePrice);
+        // SIGMA CALCULATION [USER FIX]
+        // 1. Use lastAnchorR (Trust the specific trade we anchor to)
+        // 2. Floor the Sigma at 2x Tick Size to prevent "Smugness"
+        const calculatedSigma = Math.sqrt(filter.P + filter.lastAnchorR);
+        const minSigma = filter.tickSize * 2; // Hard floor (Spread Proxy)
+        
+        const effectiveSigma = Math.max(minSigma, calculatedSigma);
+
+        const zScore = diff / effectiveSigma;
+
+        if (Math.abs(zScore) > this.Z_THRESHOLD) {
+            await this.tryExecute(asset, zScore, filter.x, referencePrice);
         }
     }
 
     /**
-     * CORRECTION (Delta Trade)
+     * CORRECTION STEP (Delta Trade)
      */
     onLaggerTrade(trade) {
         const rawSymbol = trade.symbol || trade.product_symbol;
@@ -186,52 +167,47 @@ class LeadStrategy {
         const filter = this.filters[asset];
         const stat = this.stats[asset];
 
-        // 1. Update Lagger EMA (Signal Smoothing)
-        if (filter.laggerEMA === 0) filter.laggerEMA = tradePrice;
-        else {
-            filter.laggerEMA = (1 - this.EMA_ALPHA) * filter.laggerEMA + (this.EMA_ALPHA * tradePrice);
-        }
-
-        // 2. Update Beta (Time-Based Window)
-        const deltaLagger = tradePrice - filter.laggerAtLastTrade;
-        const deltaLeader = filter.lastLeader - filter.leaderAtLastTrade;
-
-        if (Math.abs(deltaLeader) > 1e-8 || Math.abs(deltaLagger) > 1e-8) {
-            stat.add(deltaLeader, deltaLagger);
-            filter.beta = stat.getBeta();
-        }
-
-        // 3. Kalman Correction
+        // 1. Calculate Dynamic R (Whale Trust)
         const effectiveSize = Math.max(1, tradeSize);
         const dynamicR = this.BASE_R / Math.sqrt(effectiveSize);
 
+        // 2. Micro-Bounce Rejection
+        const moveSize = Math.abs(tradePrice - filter.laggerAtLastTrade);
+        const isSignificant = moveSize >= filter.bounceThreshold;
+
+        if (isSignificant) {
+            const deltaLagger = tradePrice - filter.laggerAtLastTrade;
+            const deltaLeader = filter.lastLeader - filter.leaderAtLastTrade;
+            
+            stat.add(deltaLeader, deltaLagger);
+            filter.beta = stat.getBeta();
+
+            // UPDATE ANCHOR & TRUST
+            filter.laggerAtLastTrade = tradePrice;
+            filter.leaderAtLastTrade = filter.lastLeader;
+            filter.lastAnchorR = dynamicR; // Store the R of this anchor
+        } 
+
+        // 3. Kalman Update (Always absorb info)
         const K = filter.P / (filter.P + dynamicR);
         const innovation = tradePrice - filter.x; 
 
         filter.x = filter.x + K * innovation;
         filter.P = (1 - K) * filter.P;
 
-        // 4. ADAPTIVE Q (Smoothed Variance) [USER FIX]
-        // Calculate raw normalized squared error
+        // 4. Adaptive Q
         const rawErrorSq = (innovation * innovation) / (tradePrice * tradePrice);
-        
-        // Update Variance EMA
-        // If rawErrorSq is high, innovationVar rises slowly.
         filter.innovationVar = (1 - this.VAR_EMA_ALPHA) * filter.innovationVar + (this.VAR_EMA_ALPHA * rawErrorSq);
-        
-        // Calculate Q based on SMOOTHED Variance
         filter.dynamicQ = this.BASE_Q * (1 + (filter.innovationVar * this.Q_SCALER));
 
-        // 5. Snapshots
-        filter.laggerAtLastTrade = tradePrice;
-        filter.leaderAtLastTrade = filter.lastLeader; 
-
         if (Math.random() < 0.05) {
-            this.logger.info(`[Kalman] ${asset} β:${filter.beta.toFixed(3)} | Q:${filter.dynamicQ.toExponential(2)} | Var:${filter.innovationVar.toExponential(2)}`);
+            const sigma = Math.sqrt(filter.P + dynamicR);
+            const z = innovation / sigma;
+            this.logger.info(`[Kalman] ${asset} β:${filter.beta.toFixed(3)} | Z_inov:${z.toFixed(2)} | Sig:${isSignificant?'Y':'n'}`);
         }
     }
 
-    async tryExecute(asset, divergence, fairValue, referencePrice) {
+    async tryExecute(asset, zScore, fairValue, referencePrice) {
         const now = Date.now();
         if (this.lastTriggerTime[asset] && (now - this.lastTriggerTime[asset] < this.COOLDOWN_MS)) return;
         if (this.bot.hasOpenPosition(asset)) return;
@@ -240,10 +216,11 @@ class LeadStrategy {
         let side = null;
         let limitPrice = 0;
 
-        if (divergence > 0) {
+        // Z-Score triggers
+        if (zScore > this.Z_THRESHOLD) {
             side = 'buy';
             limitPrice = referencePrice * (1 + this.PROFIT_MARGIN); 
-        } else if (divergence < 0) {
+        } else if (zScore < -this.Z_THRESHOLD) {
             side = 'sell';
             limitPrice = referencePrice * (1 - this.PROFIT_MARGIN);
         }
@@ -263,14 +240,14 @@ class LeadStrategy {
                 client_order_id: `k_${now}`
             };
             
-            this.logger.info(`[Sniper] 🔫 ${asset} ${side.toUpperCase()} | EMA:${referencePrice.toFixed(spec.precision)} | Div:${(divergence*100).toFixed(3)}%`);
+            this.logger.info(`[Sniper] 🔫 ${asset} ${side.toUpperCase()} | Z:${zScore.toFixed(2)} | Ref:${referencePrice}`);
             await this.bot.placeOrder(payload);
         }
     }
 
-    getName() { return "LeadStrategy (Adaptive v8.0)"; }
+    getName() { return "LeadStrategy (Sigma Floor v11.0)"; }
     onPositionClose(asset) {}
 }
 
 module.exports = LeadStrategy;
-                
+            
