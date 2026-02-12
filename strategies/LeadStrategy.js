@@ -23,7 +23,7 @@ class LeadStrategy {
 
         // --- ADAPTIVE THRESHOLD ---
         this.QUANTILE_RANK = 0.9995;      
-        this.BUFFER_SIZE = 20000;        
+        this.BUFFER_SIZE = 30000;        
         this.UPDATE_INTERVAL_MS = 3000;  
         this.MIN_THRESHOLD_FLOOR = 4.0;  
         this.RESET_THRESHOLD_RATIO = 0.8; 
