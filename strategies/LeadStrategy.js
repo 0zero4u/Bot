@@ -26,7 +26,7 @@ class LeadStrategy {
         this.BUFFER_SIZE = 90000;        
         this.UPDATE_INTERVAL_MS = 10000;  
         this.MIN_THRESHOLD_FLOOR = 4.0;  
-        this.RESET_THRESHOLD_RATIO = 0.8; 
+        this.RESET_THRESHOLD_RATIO = 1.8; 
 
         this.assets = {
             'XRP': { deltaId: 14969 }, 
