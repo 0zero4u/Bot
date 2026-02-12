@@ -1,8 +1,8 @@
 /**
  * ============================================================================
- * LEAD STRATEGY v12: FIXED BRACKET PRECISION
- * * Fixes: API rejection due to invalid decimal precision on Bracket Orders.
- * * Feature: Auto TP (0.01%) / SL (0.03%) with correct asset formatting.
+ * LEAD STRATEGY v12: BRACKET ORDERS & NORMALIZED TICKS
+ * * Fix: SL/TP calculated from Bid/Ask (not Mid-Price) for accuracy.
+ * * Refactor: Uses 'specs' pattern from MicroStrategy for handling precision.
  * ============================================================================
  */
 
@@ -16,10 +16,10 @@ class LeadStrategy {
         this.WINDOW_MS = 20;             
         this.IMBALANCE_THRESHOLD = 0.50; 
         
-        // --- RISK CONFIG (Bracket Orders) ---
-        this.TP_PCT = 0.0001; // 0.01%
-        this.SL_PCT = 0.0003; // 0.03%
-
+        // --- RISK MANAGEMENT (NORMALIZED) ---
+        this.SL_PCT = 0.0005; // 0.03% Stop Loss
+        this.TP_PCT = 0.0009; // 0.08% Take Profit
+        
         // --- VOLATILITY CONFIG (Time Based) ---
         this.VOL_HALF_LIFE_MS = 10000;    
         this.VOL_LAMBDA = Math.LN2 / this.VOL_HALF_LIFE_MS; 
@@ -32,12 +32,13 @@ class LeadStrategy {
         this.MIN_THRESHOLD_FLOOR = 3.0;  
         this.RESET_THRESHOLD_RATIO = 1.8; 
 
-        // [FIX] Added Precision Mapping for API Compliance
-        this.assets = {
-            'XRP': { deltaId: 14969, precision: 4 }, 
-            'BTC': { deltaId: 27,    precision: 1 },    
-            'ETH': { deltaId: 299,   precision: 2 },
-            'SOL': { deltaId: 417,   precision: 3 }
+        // --- MASTER CONFIG (Specs Pattern) ---
+        // Combined deltaId and precision (decimals) into one source of truth
+        this.specs = {
+            'BTC': { deltaId: 27,    precision: 1 },  // Tick: 0.1
+            'ETH': { deltaId: 299,   precision: 2 },  // Tick: 0.01
+            'SOL': { deltaId: 417,   precision: 3 },  // Tick: 0.001
+            'XRP': { deltaId: 14969, precision: 4 }   // Tick: 0.0001
         };
 
         // --- STATE ---
@@ -45,6 +46,7 @@ class LeadStrategy {
         this.history = {};      
         this.volState = {};     
         
+        // Ring Buffers
         this.zBuffer = {};      
         this.zPointer = {};     
         this.zCount = {};       
@@ -53,8 +55,8 @@ class LeadStrategy {
         this.triggerState = {}; 
         this.pendingSignals = []; 
 
-        // Init
-        Object.keys(this.assets).forEach(a => {
+        // Init State based on Specs
+        Object.keys(this.specs).forEach(a => {
             this.history[a] = [];
             this.volState[a] = { variance: 0.000001, lastTime: Date.now() };
             
@@ -66,14 +68,14 @@ class LeadStrategy {
             this.triggerState[a] = { isFiring: false, lastFire: 0 };
         });
 
-        this.logger.info(`[LeadStrategy v12] 🛡️ Ready. TP: ${this.TP_PCT*100}% | SL: ${this.SL_PCT*100}%`);
+        this.logger.info(`[LeadStrategy v12] 🛡️ Ready with Brackets (SL: ${this.SL_PCT*100}%, TP: ${this.TP_PCT*100}%).`);
 
         setInterval(() => this.updateThresholds(), this.UPDATE_INTERVAL_MS);
         this.startHeartbeat();
     }
 
     updateThresholds() {
-        Object.keys(this.assets).forEach(asset => {
+        Object.keys(this.specs).forEach(asset => {
             const count = this.zCount[asset];
             if (count < 500) return; 
 
@@ -92,7 +94,7 @@ class LeadStrategy {
             const elapsed = now - this.startTime;
             const isWarmingUp = elapsed < this.WARMUP_MS;
             
-            Object.keys(this.assets).forEach(asset => {
+            Object.keys(this.specs).forEach(asset => {
                 if (this.zCount[asset] > 0) {
                      let status = isWarmingUp ? `⏳ WARMUP` : "🟢 ACTIVE";
                      const vol = Math.sqrt(this.volState[asset].variance);
@@ -106,12 +108,17 @@ class LeadStrategy {
     }
 
     async onDepthUpdate(asset, depth) {
-        if (!this.assets[asset]) return;
+        if (!this.specs[asset]) return;
         const now = Date.now();
-        const currentPrice = (parseFloat(depth.bids[0][0]) + parseFloat(depth.asks[0][0])) / 2;
+        
+        // Extract Best Bid/Ask for precise entry calculation
+        const bestBid = parseFloat(depth.bids[0][0]);
+        const bestAsk = parseFloat(depth.asks[0][0]);
+        const currentPrice = (bestBid + bestAsk) / 2; 
 
         this.checkEdgeDecay(asset, now, currentPrice);
 
+        // --- HISTORY MANIPULATION ---
         const history = this.history[asset];
         history.push({ p: currentPrice, t: now });
         if (history.length > 250) history.shift(); 
@@ -121,12 +128,13 @@ class LeadStrategy {
         for (let i = history.length - 1; i >= 0; i--) {
             if (history[i].t <= targetTime) {
                 prevTick = history[i];
-                break;
+                break; 
             }
         }
         
         if (!prevTick) return;
 
+        // --- TIME-BASED VOLATILITY ---
         const rawReturn = (currentPrice - prevTick.p) / prevTick.p;
         const volState = this.volState[asset];
         
@@ -145,13 +153,18 @@ class LeadStrategy {
         const zScore = rawReturn / effectiveSigma;
         const absZ = Math.abs(zScore);
         
+        // --- RING BUFFER WRITE ---
         const ptr = this.zPointer[asset];
         this.zBuffer[asset][ptr] = absZ;
         this.zPointer[asset] = (ptr + 1) % this.BUFFER_SIZE;
-        if (this.zCount[asset] < this.BUFFER_SIZE) this.zCount[asset]++;
+        
+        if (this.zCount[asset] < this.BUFFER_SIZE) {
+            this.zCount[asset]++;
+        }
 
         if (now - this.startTime < this.WARMUP_MS) return;
 
+        // --- TRIGGER LOGIC ---
         const threshold = this.dynamicThresholds[asset];
         const state = this.triggerState[asset];
 
@@ -164,8 +177,17 @@ class LeadStrategy {
                 const totalQty = bidQty + askQty;
 
                 let side = null;
-                if (zScore > 0 && (bidQty / totalQty) >= this.IMBALANCE_THRESHOLD) side = 'buy';
-                else if (zScore < 0 && (askQty / totalQty) >= this.IMBALANCE_THRESHOLD) side = 'sell';
+                // Execution Price logic:
+                let executionPrice = currentPrice; 
+
+                if (zScore > 0 && (bidQty / totalQty) >= this.IMBALANCE_THRESHOLD) {
+                    side = 'buy';
+                    executionPrice = bestAsk; // We buy at Ask
+                }
+                else if (zScore < 0 && (askQty / totalQty) >= this.IMBALANCE_THRESHOLD) {
+                    side = 'sell';
+                    executionPrice = bestBid; // We sell at Bid
+                }
 
                 if (side) {
                     const sigId = `z12_${now}`;
@@ -175,14 +197,14 @@ class LeadStrategy {
                         id: sigId,
                         asset: asset,
                         side: side,
-                        entryPrice: currentPrice,
+                        entryPrice: currentPrice, 
                         time: now,
                         z: zScore,
                         checked50: false,
                         checked100: false
                     });
 
-                    await this.tryExecute(asset, side, currentPrice, sigId);
+                    await this.tryExecute(asset, side, executionPrice, sigId);
                 }
             }
         } else if (absZ < (threshold * this.RESET_THRESHOLD_RATIO)) {
@@ -225,22 +247,25 @@ class LeadStrategy {
         if (now - this.triggerState[asset].lastFire < 1000) return; 
         this.triggerState[asset].lastFire = now;
 
-        const spec = this.assets[asset];
-        
-        // --- BRACKET CALCULATION (FIXED) ---
-        let tpPrice, slPrice;
+        const spec = this.specs[asset];
+
+        // --- CALCULATE BRACKETS ---
+        // 1. Calculate raw prices based on percentages
+        let slPrice, tpPrice;
 
         if (side === 'buy') {
-            tpPrice = price * (1 + this.TP_PCT);
+            // Buy: Stop Loss is BELOW, Take Profit is ABOVE
             slPrice = price * (1 - this.SL_PCT);
+            tpPrice = price * (1 + this.TP_PCT);
         } else {
-            tpPrice = price * (1 - this.TP_PCT);
+            // Sell: Stop Loss is ABOVE, Take Profit is BELOW
             slPrice = price * (1 + this.SL_PCT);
+            tpPrice = price * (1 - this.TP_PCT);
         }
 
-        // [FIX] Apply Precision Formatting for API
-        const formattedTP = tpPrice.toFixed(spec.precision);
-        const formattedSL = slPrice.toFixed(spec.precision);
+        // 2. Format using the Master Config Precision (toFixed rounds efficiently)
+        const slString = slPrice.toFixed(spec.precision);
+        const tpString = tpPrice.toFixed(spec.precision);
 
         const payload = {
             product_id: spec.deltaId.toString(),
@@ -249,13 +274,14 @@ class LeadStrategy {
             order_type: 'market_order',
             client_order_id: orderId,
             
-            // Fixed Params
-            bracket_stop_loss_price: formattedSL,     
-            bracket_take_profit_price: formattedTP,   
-            bracket_stop_trigger_method: 'mark_price' // Aligned with AdvanceStrategy
+            // --- BRACKET ORDERS ---
+            // "See how it's done" -> Direct string formatting
+            bracket_stop_loss_price: slString,
+            bracket_take_profit_price: tpString,
+            bracket_stop_trigger_method: 'mark_price'
         };
 
-        this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} @ ${price} | TP: ${formattedTP} | SL: ${formattedSL}`);
+        this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} @ ${price} | TP: ${tpString} | SL: ${slString}`);
         
         try {
             await this.bot.placeOrder(payload);
@@ -264,8 +290,11 @@ class LeadStrategy {
         }
     }
 
-    getName() { return "LeadStrategy (Velocity v12 + Fixed Brackets)"; }
+    // --- INTERFACE METHODS ---
+    onLaggerTrade(trade) {}
+    onPositionClose(asset) {}
+    getName() { return "LeadStrategy (Brackets v12)"; }
 }
 
 module.exports = LeadStrategy;
-                
+    
