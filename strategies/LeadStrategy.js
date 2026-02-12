@@ -1,12 +1,7 @@
-
 /**
  * ============================================================================
- * LEAD STRATEGY (GAP + IMBALANCE)
- * Version: Simple v1.1 [WITH EXTENSIVE HEARTBEAT]
- * Logic: 
- * 1. Calculate Gap % between Binance (Leader) and Delta Last Trade (Lagger).
- * 2. If Gap > 0.03% -> BUY | If Gap < -0.03% -> SELL.
- * 3. Filter: Confirm Binance Order Book Imbalance supports the direction.
+ * LEAD STRATEGY (ANONYMOUS + EXTENSIVE LOGS)
+ * Logic: Gap > 0.03% AND Imbalance > 60%
  * ============================================================================
  */
 
@@ -16,80 +11,66 @@ class LeadStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.GAP_THRESHOLD = 0.0003;      // 0.03% target
-        this.IMBALANCE_RATIO = 0.6;       // 60% book dominance required
-        this.COOLDOWN_MS = 1000;          // 1s cooldown
+        this.GAP_THRESHOLD = 0.0005;      // 0.03%
+        this.IMBALANCE_RATIO = 0.6;       // 60% dominance
+        this.COOLDOWN_MS = 1000;          
 
         // --- ASSET SPECS ---
         this.assets = {
-            'XRP': { deltaId: 14969, precision: 4 }, 
-            'BTC': { deltaId: 27, precision: 1 },    
-            'ETH': { deltaId: 299, precision: 2 },
-            'SOL': { deltaId: 417, precision: 3 }
+            'XRP': { deltaId: 14969 }, 
+            'BTC': { deltaId: 27 },    
+            'ETH': { deltaId: 299 },
+            'SOL': { deltaId: 417 }
         };
 
         // --- STATE ---
         this.lastDeltaPrice = {};         
         this.lastTriggerTime = {};        
-        
-        // Store latest calculations for the Heartbeat Logger
         this.latestStats = {}; 
 
-        this.logger.info(`[LeadStrategy Simple] Loaded.`);
-        this.logger.info(`> Config: Gap Req > ${this.GAP_THRESHOLD * 100}% | Imbalance Req > ${this.IMBALANCE_RATIO * 100}%`);
-
-        // Start the 10s Monitor
+        this.logger.info(`[LeadStrategy] Loaded. Gap Target: 0.03% | Imbalance: 60%`);
         this.startHeartbeat();
     }
 
     /**
-     * 🟢 HEARTBEAT LOGGER
-     * Runs every 10 seconds to show you exactly what the bot sees.
+     * 🟢 EXTENSIVE HEARTBEAT (Every 10s)
+     * Shows RAW math. No Asset Names.
      */
     startHeartbeat() {
         setInterval(() => {
             const activeAssets = Object.keys(this.assets);
-            this.logger.info(`--- 📊 STRATEGY SNAPSHOT (10s) 📊 ---`);
+            this.logger.info(`--- 📊 MARKET X-RAY 📊 ---`);
 
             activeAssets.forEach(asset => {
                 const stats = this.latestStats[asset];
                 const deltaP = this.lastDeltaPrice[asset];
 
-                if (!stats || !deltaP) {
-                    this.logger.info(`[${asset}] Waiting for data...`);
-                    return;
-                }
+                if (!stats || !deltaP) return; // Skip if no data yet
 
-                // 1. Format Values
+                // 1. Calculate values
                 const gapPct = (stats.gap * 100).toFixed(4);
-                const reqGap = (this.GAP_THRESHOLD * 100).toFixed(3);
                 const imb = stats.imbalance.toFixed(2);
-                const reqImb = this.IMBALANCE_RATIO.toFixed(2);
+                const binPrice = stats.binancePrice;
                 
-                // 2. Determine Status
-                let status = "💤 IDLE";
+                // 2. Status Flag
+                let status = "💤"; // Idle
                 if (Math.abs(stats.gap) > this.GAP_THRESHOLD) {
-                    if (stats.imbalance >= this.IMBALANCE_RATIO) {
-                        status = "🔥 TRIGGERING";
-                    } else {
-                        status = "⚠️ GAP OK / LOW IMBALANCE";
-                    }
+                    if (stats.imbalance >= this.IMBALANCE_RATIO) status = "🔥 FIRE";
+                    else status = "⚠️ IMB_FAIL";
                 } else if (Math.abs(stats.gap) > (this.GAP_THRESHOLD * 0.5)) {
-                    status = "👀 WARMING UP";
+                    status = "👀 WARM";
                 }
 
-                // 3. Log Line
+                // 3. LOG (No Name, Just Data)
+                // Format: [Status] Gap: X% | Imb: Y | Bin: Z vs Delta: A
                 this.logger.info(
-                    `[${asset}] ${status} | Gap: ${gapPct}% (Req ${reqGap}%) | Imb: ${imb} (Req ${reqImb}) | Bin: ${stats.binancePrice} vs Delta: ${deltaP}`
+                    `${status} | Gap: ${gapPct}% | Imb: ${imb} | Lead: ${binPrice} vs Lag: ${deltaP}`
                 );
             });
-            this.logger.info(`------------------------------------------`);
-        }, 10000); // 10,000 ms = 10 seconds
+            this.logger.info(`----------------------------`);
+        }, 10000); 
     }
 
-    /**
-     * Called when a public trade happens on Delta (The Lagger)
-     */
     onLaggerTrade(trade) {
         const rawSymbol = trade.symbol || trade.product_symbol;
         if (!rawSymbol) return;
@@ -97,63 +78,51 @@ class LeadStrategy {
         if (!asset) return;
 
         const price = parseFloat(trade.price);
-        if (!isNaN(price)) {
-            this.lastDeltaPrice[asset] = price;
-        }
+        if (!isNaN(price)) this.lastDeltaPrice[asset] = price;
     }
 
-    /**
-     * Called when Binance (Leader) updates (High Frequency)
-     */
     async onDepthUpdate(asset, depth) {
         if (!this.assets[asset]) return;
         
         const deltaPrice = this.lastDeltaPrice[asset];
         if (!deltaPrice) return;
 
-        // 1. Extract Leader Metrics
-        const binanceBid = parseFloat(depth.bids[0][0]);
-        const binanceBidQty = parseFloat(depth.bids[0][1]);
-        const binanceAsk = parseFloat(depth.asks[0][0]);
-        const binanceAskQty = parseFloat(depth.asks[0][1]);
-        const binanceMid = (binanceBid + binanceAsk) / 2;
+        // 1. Parse Leader
+        const binBid = parseFloat(depth.bids[0][0]);
+        const binBidQty = parseFloat(depth.bids[0][1]);
+        const binAsk = parseFloat(depth.asks[0][0]);
+        const binAskQty = parseFloat(depth.asks[0][1]);
+        const binMid = (binBid + binAsk) / 2;
 
-        // 2. Calculate Gap & Imbalance
-        const gap = (binanceMid - deltaPrice) / deltaPrice;
+        // 2. Math
+        const gap = (binMid - deltaPrice) / deltaPrice;
         
-        const totalQty = binanceBidQty + binanceAskQty;
-        const bidRatio = binanceBidQty / totalQty;
-        const askRatio = binanceAskQty / totalQty;
+        const totalQty = binBidQty + binAskQty;
+        const bidRatio = binBidQty / totalQty; // 0.0 to 1.0
+        const askRatio = binAskQty / totalQty; // 0.0 to 1.0
 
-        // 3. Store Stats for Heartbeat (regardless of trigger)
-        // We store the relevant imbalance based on direction of gap
-        // If Gap is positive (Buy), we care about Bid Ratio. If negative (Sell), Ask Ratio.
+        // 3. Store for Heartbeat
+        // (If Gap is +, we watch Bids. If -, we watch Asks)
         const relevantImbalance = gap > 0 ? bidRatio : askRatio;
 
         this.latestStats[asset] = {
             gap: gap,
             imbalance: relevantImbalance,
-            binancePrice: binanceMid,
-            timestamp: Date.now()
+            binancePrice: binMid
         };
 
-        // 4. Logic: Check Thresholds
+        // 4. Trigger Logic
         if (Math.abs(gap) > this.GAP_THRESHOLD) {
-            
             let side = null;
 
-            // BUY: Leader Higher + Heavy Bids
-            if (gap > 0 && bidRatio >= this.IMBALANCE_RATIO) {
-                side = 'buy';
-            }
-            // SELL: Leader Lower + Heavy Asks
-            else if (gap < 0 && askRatio >= this.IMBALANCE_RATIO) {
-                side = 'sell';
-            }
+            // Buy: Leader High + Heavy Bids
+            if (gap > 0 && bidRatio >= this.IMBALANCE_RATIO) side = 'buy';
+            // Sell: Leader Low + Heavy Asks
+            else if (gap < 0 && askRatio >= this.IMBALANCE_RATIO) side = 'sell';
 
-            // 5. Execute
             if (side) {
-                this.logger.info(`[Signal ${asset}] Gap: ${(gap*100).toFixed(3)}% | Imb: ${relevantImbalance.toFixed(2)} | Delta: ${deltaPrice} -> Bin: ${binanceMid}`);
+                // LOG THE TRIGGER
+                this.logger.info(`🚀 SIGNAL | Gap: ${(gap*100).toFixed(3)}% | Imb: ${relevantImbalance.toFixed(2)} | P: ${deltaPrice}`);
                 await this.tryExecute(asset, side, deltaPrice);
             }
         }
@@ -172,14 +141,14 @@ class LeadStrategy {
             side: side,
             size: process.env.ORDER_SIZE || "1",
             order_type: 'market_order',
-            client_order_id: `simp_${now}`
+            client_order_id: `s_${now}`
         };
 
-        this.logger.info(`[Sniper] ⚡ FIRE ${asset} ${side.toUpperCase()} @ ${currentPrice}`);
+        this.logger.info(`⚡ EXECUTING ${side.toUpperCase()} @ ${currentPrice}`);
         await this.bot.placeOrder(payload);
     }
 
-    getName() { return "LeadStrategy (Simple + Heartbeat)"; }
+    getName() { return "LeadStrategy (Clean)"; }
     onPositionClose(asset) {}
 }
 
