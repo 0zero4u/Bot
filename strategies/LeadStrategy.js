@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * LEAD STRATEGY (LEADER-LAGGER ARBITRAGE)
- * Version: 13.3 [DEBUG LOGGING + DYNAMIC THRESHOLD DISPLAY]
+ * Version: 14.0 [CONFIGURABLE SIGMA + HYPERPARAMETERS]
  * ============================================================================
  */
 
@@ -51,16 +51,22 @@ class LeadStrategy {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- KALMAN FILTER HYPERPARAMETERS ---
+        // --- HYPERPARAMETERS (ENV CONFIGURABLE) ---
+        // 1. Trigger Sensitivity
+        this.Z_THRESHOLD = parseFloat(process.env.Z_THRESHOLD || '0.3');
+        
+        // 2. Sigma (Volatility) Tuning
+        // "Floor": Minimum sigma in ticks. Lowering this allows trading on quiet markets.
+        this.SIGMA_TICK_MULT = parseFloat(process.env.SIGMA_TICK_MULT || '0.0001'); 
+        // "Scale": Multiplier for the Kalman calculation. < 1.0 = More aggressive.
+        this.SIGMA_SCALE = parseFloat(process.env.SIGMA_SCALE || '1.0'); 
+
+        // 3. Kalman Defaults
         this.BASE_Q = 0.0000001;    
         this.BASE_R = 0.001;        
         this.Q_SCALER = 50000;      
         this.VAR_EMA_ALPHA = 0.0005;  
 
-        // --- TRIGGER THRESHOLDS ---
-        // Z-Score: How many standard deviations away from "Fair" before we trade?
-        // 0.3 is very aggressive. 2.0 is conservative.
-        this.Z_THRESHOLD = 0.3;     
         this.DEBUG_THRESHOLD = 0.1; // Log "Thinking..." if Z > 0.1
         this.COOLDOWN_MS = 200;     
 
@@ -76,7 +82,8 @@ class LeadStrategy {
         this.stats = {};            
         this.lastTriggerTime = {};  
 
-        this.logger.info(`[LeadStrategy v13.3] Initialized | Threshold: ${this.Z_THRESHOLD}`);
+        this.logger.info(`[LeadStrategy v14.0] Loaded.`);
+        this.logger.info(`> Config: Z_REQ=${this.Z_THRESHOLD} | SigmaMinTicks=${this.SIGMA_TICK_MULT} | SigmaScale=${this.SIGMA_SCALE}`);
 
         // START THE HEARTBEAT
         this.startHeartbeat();
@@ -84,7 +91,7 @@ class LeadStrategy {
 
     /**
      * [UPDATED] HEARTBEAT LOGGER
-     * Corrected the "(Req 2.0)" text to show actual variable.
+     * Shows the dynamic Sigma and Z-Score status
      */
     startHeartbeat() {
         setInterval(() => {
@@ -99,9 +106,12 @@ class LeadStrategy {
 
                 // 1. Re-calculate metrics
                 const gap = f.x - f.laggerAtLastTrade;
-                const calculatedSigma = Math.sqrt(f.P + f.lastAnchorR);
-                const minSigma = f.tickSize * 2; 
+                
+                // --- SIGMA CALCULATION (Using Hyperparams) ---
+                const calculatedSigma = Math.sqrt(f.P + f.lastAnchorR) * this.SIGMA_SCALE;
+                const minSigma = f.tickSize * this.SIGMA_TICK_MULT; 
                 const effectiveSigma = Math.max(minSigma, calculatedSigma);
+                
                 const zScore = gap / effectiveSigma;
 
                 // 2. Status
@@ -110,13 +120,12 @@ class LeadStrategy {
                 else if (Math.abs(zScore) > 1.0) status = "WATCHING (Hot)";
 
                 // 3. Format Data
-                const leaderP = f.lastLeader.toFixed(spec.precision);
                 const fairP = f.x.toFixed(spec.precision);
                 const refP = f.laggerAtLastTrade.toFixed(spec.precision);
                 
                 const gapStr = gap.toFixed(spec.precision);
                 const zStr = zScore.toFixed(2);
-                const sigmaStr = effectiveSigma.toFixed(spec.precision + 1);
+                const sigmaStr = effectiveSigma.toFixed(spec.precision + 2);
 
                 this.logger.info(
                     `[${asset}] ${status} | Fair: ${fairP} vs Ref: ${refP} | Gap: ${gapStr} | Z: ${zStr} (Req ${this.Z_THRESHOLD}) | Sigma: ${sigmaStr}`
@@ -178,20 +187,18 @@ class LeadStrategy {
 
         const diff = filter.x - referencePrice;
 
-        const calculatedSigma = Math.sqrt(filter.P + filter.lastAnchorR);
-        const minSigma = filter.tickSize * 2; 
+        // --- SIGMA CALCULATION (Using Hyperparams) ---
+        const calculatedSigma = Math.sqrt(filter.P + filter.lastAnchorR) * this.SIGMA_SCALE;
+        const minSigma = filter.tickSize * this.SIGMA_TICK_MULT; 
         const effectiveSigma = Math.max(minSigma, calculatedSigma);
 
         const zScore = diff / effectiveSigma;
 
-        // [NEW] Debug Logging for "Close Calls"
-        // If Z-Score is small (0.03), this will correctly skip logging to save space.
-        // If Z-Score > 0.1, we log it so you see movement.
+        // [Debug Logging]
+        // Show "thinking" logs if we are close (e.g. Z > 0.1 but < 0.3)
         if (Math.abs(zScore) > this.DEBUG_THRESHOLD && Math.abs(zScore) < this.Z_THRESHOLD) {
-             // Rate limit these logs to avoid spamming (simple throttle check could go here)
-             // For now, let's trust the threshold.
-             // Uncomment below if you want very verbose logs:
-             // this.logger.info(`[${asset}] 👀 Watch: Z=${zScore.toFixed(3)} < Req ${this.Z_THRESHOLD}`);
+             // Optional: Uncomment to see close calls in real-time
+             // this.logger.info(`[${asset}] 👀 Watch: Z=${zScore.toFixed(3)} (Req ${this.Z_THRESHOLD})`);
         }
 
         if (Math.abs(zScore) > this.Z_THRESHOLD) {
@@ -246,7 +253,8 @@ class LeadStrategy {
 
         if (this.lastTriggerTime[asset] && (now - this.lastTriggerTime[asset] < this.COOLDOWN_MS)) return;
         if (this.bot.hasOpenPosition(asset)) {
-            this.logger.info(`[Signal] ${asset} Z:${zScore.toFixed(2)} -> Ignored (Already Open)`);
+            // Optional: Log ignored signals if you want to debug missed opportunities
+            // this.logger.info(`[Signal] ${asset} Z:${zScore.toFixed(2)} -> Ignored (Already Open)`);
             return;
         }
 
@@ -270,16 +278,16 @@ class LeadStrategy {
                 client_order_id: `k_${now}`           
             };
             
-            // Log the math clearly for the user
-            this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} | Z: ${zScore.toFixed(3)} > ${this.Z_THRESHOLD} | Gap: ${(fairValue - referencePrice).toFixed(spec.precision)}`);
+            // Clear Log for action
+            const gap = (fairValue - referencePrice).toFixed(spec.precision);
+            this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} | Z: ${zScore.toFixed(3)} > ${this.Z_THRESHOLD} | Gap: ${gap}`);
             
             await this.bot.placeOrder(payload);
         }
     }
 
-    getName() { return "LeadStrategy (Sigma v13.3 - Debug Logs)"; }
+    getName() { return "LeadStrategy (Sigma v14.0 - Tunable)"; }
     onPositionClose(asset) {}
 }
 
 module.exports = LeadStrategy;
-            
