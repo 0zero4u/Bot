@@ -19,7 +19,7 @@ class LeadStrategy {
         // --- RISK MANAGEMENT (PERCENTAGE BASED) ---
         // User Requirement: 0.03% SL, 0.08% TP
         this.STOP_LOSS_PERCENT = 0.03;   
-        this.TAKE_PROFIT_PERCENT = 0.08; 
+        this.TAKE_PROFIT_PERCENT = 0.1; 
         
         // --- VOLATILITY CONFIG (Time Based) ---
         this.VOL_HALF_LIFE_MS = 5000;    
