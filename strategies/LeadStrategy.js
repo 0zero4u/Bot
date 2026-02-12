@@ -13,8 +13,8 @@ class LeadStrategy {
 
         // --- CONFIGURATION ---
         this.WARMUP_MS = 100000;
-        this.WINDOW_MS = 13;             
-        this.IMBALANCE_THRESHOLD = 0.30; 
+        this.WINDOW_MS = 20;             
+        this.IMBALANCE_THRESHOLD = 0.65; 
         
         // --- VOLATILITY CONFIG (Time Based) ---
         this.VOL_HALF_LIFE_MS = 5000;    
@@ -25,7 +25,7 @@ class LeadStrategy {
         this.QUANTILE_RANK = 0.9990;      
         this.BUFFER_SIZE = 90000;        
         this.UPDATE_INTERVAL_MS = 10000;  
-        this.MIN_THRESHOLD_FLOOR = 4.0;  
+        this.MIN_THRESHOLD_FLOOR = 3.0;  
         this.RESET_THRESHOLD_RATIO = 1.8; 
 
         this.assets = {
