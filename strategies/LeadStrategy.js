@@ -62,7 +62,7 @@ class LeadStrategy {
         this.VAR_EMA_ALPHA = 0.0005;  
 
         // --- TRIGGER THRESHOLDS ---
-        this.Z_THRESHOLD = 0.6;     
+        this.Z_THRESHOLD = 0.3;     
         this.COOLDOWN_MS = 200;     
 
         // --- ASSET SPECIFICATIONS ---
