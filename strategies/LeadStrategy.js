@@ -1,9 +1,8 @@
-
 /**
  * ============================================================================
- * LEAD STRATEGY v12: BRACKET ORDERS & NORMALIZED TICKS
- * * Added: Bracket Orders (SL 0.03% / TP 0.08%)
- * * Added: Tick Size Normalization to prevent API rejection
+ * LEAD STRATEGY v13: BRACKET FIX & PRECISION ALIGNMENT
+ * * Fix: SL/TP uses Percentage Config (0.03 / 100) matching FastStrategy.
+ * * Fix: Added explicit 'precision' map for correct toFixed() formatting.
  * ============================================================================
  */
 
@@ -17,9 +16,10 @@ class LeadStrategy {
         this.WINDOW_MS = 20;             
         this.IMBALANCE_THRESHOLD = 0.50; 
         
-        // --- RISK MANAGEMENT (NORMALIZED) ---
-        this.SL_PCT = 0.0004; // 0.03% Stop Loss
-        this.TP_PCT = 0.0008; // 0.08% Take Profit
+        // --- RISK MANAGEMENT (PERCENTAGE BASED) ---
+        // User Requirement: 0.03% SL, 0.08% TP
+        this.STOP_LOSS_PERCENT = 0.03;   
+        this.TAKE_PROFIT_PERCENT = 0.08; 
         
         // --- VOLATILITY CONFIG (Time Based) ---
         this.VOL_HALF_LIFE_MS = 5000;    
@@ -33,19 +33,12 @@ class LeadStrategy {
         this.MIN_THRESHOLD_FLOOR = 3.0;  
         this.RESET_THRESHOLD_RATIO = 1.8; 
 
+        // --- ASSET SPECS (Matched to FastStrategy Precision) ---
         this.assets = {
-            'XRP': { deltaId: 14969 }, 
-            'BTC': { deltaId: 27 },    
-            'ETH': { deltaId: 299 },
-            'SOL': { deltaId: 417 }
-        };
-
-        // Tick Sizes for Normalization (Crucial for Bracket Orders)
-        this.tickSizes = {
-            'BTC': 0.1,
-            'ETH': 0.01,
-            'SOL': 0.001,
-            'XRP': 0.0001
+            'XRP': { deltaId: 14969, precision: 4 }, 
+            'BTC': { deltaId: 27,    precision: 1 },    
+            'ETH': { deltaId: 299,   precision: 2 },
+            'SOL': { deltaId: 417,   precision: 3 }
         };
 
         // --- STATE ---
@@ -75,22 +68,10 @@ class LeadStrategy {
             this.triggerState[a] = { isFiring: false, lastFire: 0 };
         });
 
-        this.logger.info(`[LeadStrategy v12] 🛡️ Ready with Brackets (SL: ${this.SL_PCT*100}%, TP: ${this.TP_PCT*100}%).`);
+        this.logger.info(`[LeadStrategy v13] 🛡️ Ready | SL: ${this.STOP_LOSS_PERCENT}% | TP: ${this.TAKE_PROFIT_PERCENT}%`);
 
         setInterval(() => this.updateThresholds(), this.UPDATE_INTERVAL_MS);
         this.startHeartbeat();
-    }
-
-    /**
-     * Helper: Round price to nearest valid tick size
-     */
-    roundToTick(price, tickSize) {
-        return (Math.round(price / tickSize) * tickSize).toFixed(this.getPrecision(tickSize));
-    }
-
-    getPrecision(tickSize) {
-        if (tickSize >= 1) return 0;
-        return -Math.floor(Math.log10(tickSize));
     }
 
     updateThresholds() {
@@ -129,7 +110,10 @@ class LeadStrategy {
     async onDepthUpdate(asset, depth) {
         if (!this.assets[asset]) return;
         const now = Date.now();
-        const currentPrice = (parseFloat(depth.bids[0][0]) + parseFloat(depth.asks[0][0])) / 2;
+        
+        const bestBid = parseFloat(depth.bids[0][0]);
+        const bestAsk = parseFloat(depth.asks[0][0]);
+        const currentPrice = (bestBid + bestAsk) / 2; // Mid price for Volatility
 
         this.checkEdgeDecay(asset, now, currentPrice);
 
@@ -192,25 +176,36 @@ class LeadStrategy {
                 const totalQty = bidQty + askQty;
 
                 let side = null;
-                if (zScore > 0 && (bidQty / totalQty) >= this.IMBALANCE_THRESHOLD) side = 'buy';
-                else if (zScore < 0 && (askQty / totalQty) >= this.IMBALANCE_THRESHOLD) side = 'sell';
+                // Execution Price logic:
+                // We must use the price we are "taking" to calculate risk correctly
+                let executionPrice = currentPrice; 
+
+                if (zScore > 0 && (bidQty / totalQty) >= this.IMBALANCE_THRESHOLD) {
+                    side = 'buy';
+                    executionPrice = bestAsk; 
+                }
+                else if (zScore < 0 && (askQty / totalQty) >= this.IMBALANCE_THRESHOLD) {
+                    side = 'sell';
+                    executionPrice = bestBid; 
+                }
 
                 if (side) {
-                    const sigId = `z12_${now}`;
+                    const sigId = `z13_${now}`;
                     this.logger.info(`[SIGNAL ${asset}] ⚡ IMPULSE! Z=${zScore.toFixed(2)} > ${threshold.toFixed(2)}`);
                     
                     this.pendingSignals.push({
                         id: sigId,
                         asset: asset,
                         side: side,
-                        entryPrice: currentPrice,
+                        entryPrice: currentPrice, 
                         time: now,
                         z: zScore,
                         checked50: false,
                         checked100: false
                     });
 
-                    await this.tryExecute(asset, side, currentPrice, sigId);
+                    // Pass correct execution price for bracket math
+                    await this.tryExecute(asset, side, executionPrice, sigId);
                 }
             }
         } else if (absZ < (threshold * this.RESET_THRESHOLD_RATIO)) {
@@ -254,20 +249,25 @@ class LeadStrategy {
         this.triggerState[asset].lastFire = now;
 
         const spec = this.assets[asset];
-        const tickSize = this.tickSizes[asset] || 0.1; // Default to 0.1 if unknown
-
-        // --- CALCULATE BRACKETS ---
+        
+        // --- BRACKET CALCULATION (PERCENTAGE BASED) ---
+        // Formula: Price * (1 +/- (Percent / 100))
         let slPrice, tpPrice;
-
+        
         if (side === 'buy') {
-            // Buy: Stop Loss is BELOW, Take Profit is ABOVE
-            slPrice = price * (1 - this.SL_PCT);
-            tpPrice = price * (1 + this.TP_PCT);
+            // Buy: Stop Loss Lower, Take Profit Higher
+            slPrice = price * (1 - (this.STOP_LOSS_PERCENT / 100));
+            tpPrice = price * (1 + (this.TAKE_PROFIT_PERCENT / 100));
         } else {
-            // Sell: Stop Loss is ABOVE, Take Profit is BELOW
-            slPrice = price * (1 + this.SL_PCT);
-            tpPrice = price * (1 - this.TP_PCT);
+            // Sell: Stop Loss Higher, Take Profit Lower
+            slPrice = price * (1 + (this.STOP_LOSS_PERCENT / 100));
+            tpPrice = price * (1 - (this.TAKE_PROFIT_PERCENT / 100));
         }
+
+        // --- PRECISION FORMATTING ---
+        // Using toFixed(precision) as seen in FastStrategy/AdvanceStrategy
+        const slString = slPrice.toFixed(spec.precision);
+        const tpString = tpPrice.toFixed(spec.precision);
 
         const payload = {
             product_id: spec.deltaId.toString(),
@@ -276,13 +276,13 @@ class LeadStrategy {
             order_type: 'market_order',
             client_order_id: orderId,
             
-            // --- BRACKET ORDERS ---
-            bracket_stop_loss_price: this.roundToTick(slPrice, tickSize),
-            bracket_take_profit_price: this.roundToTick(tpPrice, tickSize),
-            bracket_stop_trigger_method: 'mark_price' // Normalized trigger method
+            // --- BRACKET PAYLOAD ---
+            bracket_stop_loss_price: slString,
+            bracket_take_profit_price: tpString,
+            bracket_stop_trigger_method: 'mark_price'
         };
 
-        this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} @ ${price} | TP: ${payload.bracket_take_profit_price} | SL: ${payload.bracket_stop_loss_price}`);
+        this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} @ ${price} | SL: ${slString} (${this.STOP_LOSS_PERCENT}%) | TP: ${tpString} (${this.TAKE_PROFIT_PERCENT}%)`);
         
         try {
             await this.bot.placeOrder(payload);
@@ -294,8 +294,7 @@ class LeadStrategy {
     // --- INTERFACE METHODS ---
     onLaggerTrade(trade) {}
     onPositionClose(asset) {}
-    getName() { return "LeadStrategy (Brackets v12)"; }
+    getName() { return "LeadStrategy (Brackets v13)"; }
 }
 
 module.exports = LeadStrategy;
-            
