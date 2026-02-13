@@ -12,8 +12,8 @@ class LeadStrategy {
 
         // --- CONFIGURATION ---
         this.MOVE_THRESHOLD = 0.00030;     // 0.03% price change required
-        this.TIME_LOOKBACK_MS = 25;        // Compare vs price 50ms ago
-        this.IMBALANCE_RATIO = 0.60;       // 60% Order Book Support required
+        this.TIME_LOOKBACK_MS = 30;        // Compare vs price 50ms ago
+        this.IMBALANCE_RATIO = 0.53;       // 60% Order Book Support required
         this.COOLDOWN_MS = 1000;           // 1s cooldown after firing
         this.TRAILING_PERCENT = 0.02;      // 0.02% Trailing Stop
 
