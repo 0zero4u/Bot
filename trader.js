@@ -1,7 +1,9 @@
 /**
  * trader.js
  * ALIGNED WITH LEAD STRATEGY v16 + MARKET LISTENER
- * Fixes: Now routes 'T' (Trade) messages to strategy for CVD calculation.
+ * Fixes: 
+ * - Explicitly starts Strategy to enable Heartbeat/Warmup logs.
+ * - Logs warning if market data is received before Authentication.
  */
 
 const WebSocket = require('ws');
@@ -68,6 +70,7 @@ class TradingBot {
 
         this.ws = null; 
         this.authenticated = false;
+        this.lastAuthWarning = 0; // Throttling for auth warning
 
         // Position & Execution State
         this.activePositions = {};
@@ -119,6 +122,15 @@ class TradingBot {
         await this.initWebSocket();
         this.setupHttpServer();
         this.startRestKeepAlive();
+
+        // --- FIX: EXPLICITLY START STRATEGY ---
+        // This triggers the Warmup and Heartbeat loops in AdvanceStrategy
+        if (this.strategy && typeof this.strategy.start === 'function') {
+            this.logger.info(`🚀 Starting Strategy Logic...`);
+            await this.strategy.start();
+        } else {
+            this.logger.warn(`⚠️ Strategy does not have a start() method. Heartbeat may not run.`);
+        }
     }
 
     startRestKeepAlive() {
@@ -297,7 +309,16 @@ class TradingBot {
 
     // --- SIGNAL HANDLING (CRITICAL FIXES HERE) ---
     async handleSignalMessage(message) {
-        if (!this.authenticated) return;
+        // ⚠️ VISIBILITY FIX: Log if data is dropped due to no authentication
+        if (!this.authenticated) {
+            const now = Date.now();
+            if (now - this.lastAuthWarning > 5000) { // Throttle log: once every 5s
+                this.logger.warn(`[Data Drop] ⚠️ Receiving Market Data but Bot NOT Authenticated yet. Ignoring.`);
+                this.lastAuthWarning = now;
+            }
+            return;
+        }
+
         try {
             const data = JSON.parse(message.toString());
             
@@ -376,4 +397,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-    
+                   
