@@ -15,7 +15,7 @@ class LeadStrategy {
         // --- 1. ORIGINAL CONFIGURATION (RESTORED) ---
         this.WARMUP_MS = 100000;         
         this.WINDOW_MS = 30;             // Critical: 30ms Lookback
-        this.IMBALANCE_THRESHOLD = 0.60; // Critical: Book Imbalance
+        this.IMBALANCE_THRESHOLD = 0.30; // Critical: Book Imbalance
         
         // --- 2. NEW: CVD FILTER CONFIG ---
         this.CVD_WINDOW_MS = 100;        // 100ms Volume Lookback
