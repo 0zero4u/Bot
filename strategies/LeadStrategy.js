@@ -18,7 +18,7 @@ class LeadStrategy {
         
         // --- RISK MANAGEMENT (NORMALIZED) ---
         this.SL_PCT = 0.00015; // 0.03% Stop Loss
-        this.TP_PCT = 0.00065; // 0.08% Take Profit
+        this.TP_PCT = 0.00075; // 0.08% Take Profit
         
         // --- VOLATILITY CONFIG (Time Based) ---
         this.VOL_HALF_LIFE_MS = 10000;    
