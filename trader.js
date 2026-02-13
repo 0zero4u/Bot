@@ -2,9 +2,9 @@
  * trader.js
  * ALIGNED WITH LEAD STRATEGY v16 + MARKET LISTENER v3
  * Fixes:
- * 1. Automatically appends "USD" to assets for 'all_trades' subscription (e.g., XRP -> XRPUSD).
- * 2. Explicitly starts Strategy (enables Heartbeat/Warmup).
- * 3. Trims spaces from TARGET_ASSETS to prevent connection errors.
+ * 1. LOGGING: Inspects and logs full JSON of order failures (Fixes "MISS: [object Object]" blindness).
+ * 2. DATA: Automatically appends "USD" to assets for 'all_trades' subscription.
+ * 3. SETUP: Explicitly starts Strategy (enables Heartbeat/Warmup).
  */
 
 const WebSocket = require('ws');
@@ -24,7 +24,7 @@ try {
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Advance', // Default to Advance
+    strategy: process.env.STRATEGY || 'Advance', 
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
@@ -77,11 +77,8 @@ class TradingBot {
         this.activePositions = {};
         this.orderLatencies = new Map(); 
         
-        // --- ASSET LOADING (FIXED) ---
-        // 1. Load from Env
-        // 2. Split by comma
-        // 3. Trim spaces (Fixes " XRP" issue)
-        // 4. Uppercase
+        // --- ASSET LOADING ---
+        // 1. Load from Env, Split, Trim, Uppercase
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL')
             .split(',')
             .map(a => a.trim().toUpperCase());
@@ -116,7 +113,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v71.0 - Auto USD Parsing) ---`);
+        this.logger.info(`--- Bot Initializing (v72.0 - Debug Enhanced) ---`);
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
@@ -208,7 +205,6 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        // --- ⚡ FIX: GENERATE "USD" PAIRS AUTOMATICALLY ---
         // Maps ['XRP'] -> ['XRPUSD']
         const tradeSymbols = this.targetAssets.map(asset => `${asset}USD`);
         
@@ -222,7 +218,7 @@ class TradingBot {
                     { name: 'orders', symbols: ['all'] },
                     { name: 'positions', symbols: ['all'] },
                     { name: 'user_trades', symbols: ['all'] },
-                    { name: 'all_trades', symbols: tradeSymbols } // ⚡ Subscription Fixed
+                    { name: 'all_trades', symbols: tradeSymbols } 
                 ]
             }
         }));
@@ -248,10 +244,8 @@ class TradingBot {
         }
 
         switch (message.type) {
-            // ⚡ 1. Handle Public Trades (The Delta Price Feed)
             case 'all_trades':
                 if (Array.isArray(message.data)) {
-                     // If snapshot, take the first valid one
                      if(message.data.length > 0) this.forwardTradeToStrategy(message.data[0]);
                 } else {
                      this.forwardTradeToStrategy(message);
@@ -276,7 +270,7 @@ class TradingBot {
         }
     }
 
-    // ⚡ Helper to forward 'all_trades' to Strategy
+    // Forward 'all_trades' to Strategy
     forwardTradeToStrategy(tradeData) {
         if (this.strategy && this.strategy.onLaggerTrade) {
             this.strategy.onLaggerTrade(tradeData);
@@ -333,7 +327,7 @@ class TradingBot {
         }
     }
 
-    // --- SIGNAL HANDLING (Internal WS) ---
+    // --- SIGNAL HANDLING ---
     async handleSignalMessage(message) {
         if (!this.authenticated) {
             const now = Date.now();
@@ -347,7 +341,6 @@ class TradingBot {
         try {
             const data = JSON.parse(message.toString());
             
-            // 1. PRICE/BOOK UPDATE (Type 'B' from Binance)
             if (data.type === 'B') {
                 const asset = data.s;
                 if (!this.targetAssets.includes(asset)) return;
@@ -376,15 +369,25 @@ class TradingBot {
         this.logger.info(`Internal Data Server running on port ${this.config.port}`);
     }
     
+    // ⚡ IMPROVED ORDER PLACEMENT & LOGGING
     async placeOrder(orderData) {
         if (orderData.client_order_id) {
             this.recordOrderPunch(orderData.client_order_id);
         }
         try {
             const result = await this.client.placeOrder(orderData);
+            
+            // 🔍 LOG REJECT DETAILS IF FAILED
+            // This prevents "MISS: [object Object]" blindness
+            if (result && !result.success) {
+                 this.logger.error(`[ORDER REJECT] Native Client returned failure: ${JSON.stringify(result)}`);
+            }
+            
             return result;
         } catch (error) {
-            this.logger.error(`[ORDER FAIL] Native Client Error: ${error.message || error}`);
+            // Handle exceptions (e.g., network error, crash)
+            const errMsg = error.message || JSON.stringify(error);
+            this.logger.error(`[ORDER FAIL] Native Client Exception: ${errMsg}`);
             throw error; 
         }
     }
@@ -409,4 +412,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                                     
+    
