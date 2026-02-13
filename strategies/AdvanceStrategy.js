@@ -40,7 +40,7 @@ class AdvanceStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.BURST_WINDOW_MS = 60;       
+        this.BURST_WINDOW_MS = 25;       
         this.WARMUP_MS = 30000; // 30 Seconds
         
         // Z-SCORE SETTINGS
