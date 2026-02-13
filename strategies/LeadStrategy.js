@@ -1,9 +1,14 @@
 /**
  * ============================================================================
- * LEAD STRATEGY v16: HYBRID (ALIGNED)
- * * Base Logic: 30ms Rolling Window Return
- * * Filter: Zero-Latency CVD Accumulator (Active)
- * * Status: Heartbeat visible every 10s
+ * LEAD STRATEGY v19: MICROSTRUCTURE PRODUCTION GRADE
+ * * [CRITICAL FIXES]:
+ * 1. Price Source: Changed from Mid -> Volume Weighted Mid Price (VWMP).
+ * - Prevents false signals from spread widening/liquidity pulls.
+ * 2. Math: Raised Clipping to 6.0σ, Rank to 0.99.
+ * - Prevents threshold compression at the top end.
+ * 3. Perf: Replaced O(N) shift() with Lazy Pointer for CVD.
+ * 4. Latency: Reduced Cooldown from 1000ms -> 50ms.
+ * 5. Perf: Throttled Buffer Sort to idle times (simple optimization).
  * ============================================================================
  */
 
@@ -13,41 +18,42 @@ class LeadStrategy {
         this.logger = bot.logger;
 
         // --- 1. CONFIGURATION ---
-        this.WARMUP_MS = 100000;         
+        this.WARMUP_MS = 30000;
         this.WINDOW_MS = 30;             
         this.IMBALANCE_THRESHOLD = 0.60; 
         
-        // --- 2. CVD FILTER CONFIG ---
-        this.CVD_WINDOW_MS = 100;        
+        // --- 2. CVD FILTER ---
+        this.CVD_WINDOW_MS = 50;         
         this.CVD_THRESHOLD = 0.60;       
         
-        // --- 3. RISK MANAGEMENT ---
+        // --- 3. RISK ---
         this.SL_PCT = 0.00015; 
         this.TP_PCT = 0.00160; 
         
-        // --- 4. VOLATILITY CONFIG ---
+        // --- 4. VOLATILITY ---
         this.VOL_HALF_LIFE_MS = 1000;    
         this.VOL_LAMBDA = Math.LN2 / this.VOL_HALF_LIFE_MS; 
         this.MAX_DT_MS = 100;
 
-        // --- 5. ADAPTIVE THRESHOLD ---
-        this.QUANTILE_RANK = 0.9995;      
-        this.BUFFER_SIZE = 200000;        
-        this.UPDATE_INTERVAL_MS = 1000;  
-        this.MIN_THRESHOLD_FLOOR = 3.0;  
-        this.RESET_THRESHOLD_RATIO = 0.8; 
+        // --- 5. ADAPTIVE THRESHOLD (CORRECTED) ---
+        // FIX: Rank 0.99 allows the top 1% to be "extreme".
+        // FIX: Clipping at 6.0 allows the threshold to float above 3.0 naturally.
+        this.QUANTILE_RANK = 0.99;       
+        this.BUFFER_SIZE = 50000;         
+        this.UPDATE_INTERVAL_MS = 5000;   
+        this.MIN_THRESHOLD_FLOOR = 2.5;   
+        this.RESET_THRESHOLD_RATIO = 0.7; 
+        this.MEMORY_CLIPPING_LIMIT = 6.0; // Raised from 3.0 to prevent ceiling effect
 
-        // --- MASTER CONFIG ---
         this.specs = {
-            'BTC': { deltaId: 27,    precision: 1 },
-            'ETH': { deltaId: 299,   precision: 2 },
-            'SOL': { deltaId: 417,   precision: 3 },
-            'XRP': { deltaId: 14969, precision: 4 }
+            'BTC': { deltaId: 27,    precision: 1, minSigma: 0.00003 },
+            'ETH': { deltaId: 299,   precision: 2, minSigma: 0.00004 },
+            'SOL': { deltaId: 417,   precision: 3, minSigma: 0.00006 },
+            'XRP': { deltaId: 14969, precision: 4, minSigma: 0.00008 }
         };
 
-        // --- STATE INITIALIZATION ---
+        // --- STATE ---
         this.startTime = Date.now();
-        
         this.history = {};      
         this.volState = {};     
         this.zBuffer = {};      
@@ -64,26 +70,25 @@ class LeadStrategy {
             this.zBuffer[a] = new Float32Array(this.BUFFER_SIZE); 
             this.zPointer[a] = 0;
             this.zCount[a] = 0;
-            this.dynamicThresholds[a] = 5.0; 
+            this.dynamicThresholds[a] = 4.0; 
             this.triggerState[a] = { isFiring: false, lastFire: 0 };
             
-            // CVD State Init
-            this.cvdState[a] = {
-                queue: [],
-                buySum: 0,
-                sellSum: 0
+            // FIX: CVD Lazy Pointer Implementation
+            this.cvdState[a] = { 
+                queue: [], 
+                headIndex: 0, 
+                buySum: 0, 
+                sellSum: 0 
             };
         });
 
-        this.logger.info(`[LeadStrategy v16] 🛡️ Ready. Waiting for Data...`);
+        this.logger.info(`[LeadStrategy v19] 🛡️ VWMP Signal | Memory Clip @ 6.0σ | Rank 0.99`);
 
         setInterval(() => this.updateThresholds(), this.UPDATE_INTERVAL_MS);
         this.startHeartbeat();
     }
 
-    // ============================================================
-    // PART 1: CVD INGESTION (Now actively fed by Trader)
-    // ============================================================
+    // --- CVD INGESTION (O(1) PERFORMANCE FIX) ---
     onExternalTrade(trade) {
         const cvd = this.cvdState[trade.s];
         if (!cvd) return;
@@ -91,24 +96,34 @@ class LeadStrategy {
         const now = trade.t;
         const qty = trade.q;
 
-        // 1. Add to Accumulator
-        if (trade.side === 'buy') {
-            cvd.buySum += qty;
-            cvd.queue.push({ t: now, q: qty, s: 1 });
-        } else {
-            cvd.sellSum += qty;
-            cvd.queue.push({ t: now, q: qty, s: -1 });
-        }
+        const tradeNode = { t: now, q: qty, s: trade.side === 'buy' ? 1 : -1 };
+        
+        // Add to end
+        cvd.queue.push(tradeNode);
+        if (tradeNode.s === 1) cvd.buySum += qty;
+        else cvd.sellSum += qty;
 
-        // 2. Prune Old Trades (Rolling Window)
+        // Prune from front using Lazy Pointer (Avoids O(N) shift)
         const cutoff = now - this.CVD_WINDOW_MS;
-        while (cvd.queue.length > 0 && cvd.queue[0].t < cutoff) {
-            const old = cvd.queue.shift();
+        
+        while (cvd.headIndex < cvd.queue.length) {
+            const old = cvd.queue[cvd.headIndex];
+            if (old.t >= cutoff) break; // Stop if inside window
+
+            // Remove effect
             if (old.s === 1) cvd.buySum -= old.q;
             else cvd.sellSum -= old.q;
+            
+            cvd.headIndex++;
         }
-        
-        // 3. Float Safety
+
+        // Periodic Cleanup (Memory Management)
+        // Only splice if array gets too big to prevent memory leak
+        if (cvd.headIndex > 1000) {
+            cvd.queue = cvd.queue.slice(cvd.headIndex);
+            cvd.headIndex = 0;
+        }
+
         if (cvd.buySum < 0) cvd.buySum = 0;
         if (cvd.sellSum < 0) cvd.sellSum = 0;
     }
@@ -116,21 +131,19 @@ class LeadStrategy {
     getInstantCVD(asset, signalSide) {
         const cvd = this.cvdState[asset];
         const total = cvd.buySum + cvd.sellSum;
-        
         if (total <= 0) return false; 
-
         if (signalSide === 'buy') return (cvd.buySum / total) >= this.CVD_THRESHOLD;
         else return (cvd.sellSum / total) >= this.CVD_THRESHOLD;
     }
 
-    // ============================================================
-    // PART 2: CORE LOGIC
-    // ============================================================
+    // --- THRESHOLD UPDATE ---
     updateThresholds() {
         Object.keys(this.specs).forEach(asset => {
             const count = this.zCount[asset];
-            if (count < 500) return; 
+            if (count < 1000) return; 
 
+            // Standard Sort is unavoidable for precise Quantile without complex deps
+            // But we do it every 5s, which is acceptable.
             const view = this.zBuffer[asset].subarray(0, count);
             const sorted = Float32Array.from(view).sort();
             const index = Math.floor(sorted.length * this.QUANTILE_RANK);
@@ -143,13 +156,24 @@ class LeadStrategy {
     async onDepthUpdate(asset, depth) {
         if (!this.specs[asset]) return;
         const now = Date.now();
-        
-        // 1. Price Calculation
-        const bestBid = parseFloat(depth.bids[0][0]);
-        const bestAsk = parseFloat(depth.asks[0][0]);
-        const currentPrice = (bestBid + bestAsk) / 2; 
+        const spec = this.specs[asset];
 
-        this.checkEdgeDecay(asset, now, currentPrice);
+        // 1. VWMP CALCULATION (Weighted Mid Price)
+        // This is the FIX for Spread Widening Fakeouts
+        const bestBid = parseFloat(depth.bids[0][0]);
+        const bidQty  = parseFloat(depth.bids[0][1]);
+        const bestAsk = parseFloat(depth.asks[0][0]);
+        const askQty  = parseFloat(depth.asks[0][1]);
+
+        // FIX: Zero Div Guard
+        const totalBookQty = bidQty + askQty;
+        if (totalBookQty <= 0) return;
+
+        // VWMP = (Bid*AskQty + Ask*BidQty) / TotalQty
+        // Logic: If AskQty is huge, price is pressured down towards Bid.
+        const currentPrice = ((bestBid * askQty) + (bestAsk * bidQty)) / totalBookQty;
+
+        this.checkEdgeDecay(asset, now, bestBid, bestAsk);
 
         const history = this.history[asset];
         history.push({ p: currentPrice, t: now });
@@ -166,7 +190,7 @@ class LeadStrategy {
         
         if (!prevTick) return;
 
-        // 4. Volatility Calculation
+        // 2. Volatility
         const rawReturn = (currentPrice - prevTick.p) / prevTick.p;
         const volState = this.volState[asset];
         
@@ -180,65 +204,63 @@ class LeadStrategy {
         }
         
         const sigma = Math.sqrt(volState.variance);
-        const effectiveSigma = Math.max(sigma, 0.00005); 
+        const effectiveSigma = Math.max(sigma, spec.minSigma); 
         
         const zScore = rawReturn / effectiveSigma;
         const absZ = Math.abs(zScore);
         
-        // 5. Update Z-Score Buffer
+        // 3. ADAPTIVE LOGIC SPLIT
+        
+        // A. Memory Path (Winsorized at 6.0)
+        const winsorizedZ = Math.min(absZ, this.MEMORY_CLIPPING_LIMIT);
         const ptr = this.zPointer[asset];
-        this.zBuffer[asset][ptr] = absZ;
+        this.zBuffer[asset][ptr] = winsorizedZ;
         this.zPointer[asset] = (ptr + 1) % this.BUFFER_SIZE;
         if (this.zCount[asset] < this.BUFFER_SIZE) this.zCount[asset]++;
 
         if (now - this.startTime < this.WARMUP_MS) return;
 
-        // 6. TRIGGER LOGIC
+        // B. Execution Path (Raw Z)
         const threshold = this.dynamicThresholds[asset];
         const state = this.triggerState[asset];
 
         if (absZ > threshold) {
             if (!state.isFiring) {
                 
-                const bidQty = parseFloat(depth.bids[0][1]);
-                const askQty = parseFloat(depth.asks[0][1]);
-                const totalQty = bidQty + askQty;
-
                 let side = null;
                 let executionPrice = currentPrice; 
 
-                // A. Check Direction & Book Imbalance
-                if (zScore > 0 && (bidQty / totalQty) >= this.IMBALANCE_THRESHOLD) {
+                // Use simple book imbalance for direction confirmation
+                if (zScore > 0 && (bidQty / totalBookQty) >= this.IMBALANCE_THRESHOLD) {
                     side = 'buy';
-                    executionPrice = bestAsk; 
+                    executionPrice = bestAsk; // Aggress on Ask
                 }
-                else if (zScore < 0 && (askQty / totalQty) >= this.IMBALANCE_THRESHOLD) {
+                else if (zScore < 0 && (askQty / totalBookQty) >= this.IMBALANCE_THRESHOLD) {
                     side = 'sell';
-                    executionPrice = bestBid; 
+                    executionPrice = bestBid; // Aggress on Bid
                 }
 
                 if (side) {
-                    // B. Check CVD Filter
+                    // Check CVD
                     const cvdConfirmed = this.getInstantCVD(asset, side);
-                    
                     if (cvdConfirmed) {
                         state.isFiring = true; 
                         
-                        const sigId = `z16_${now}`;
-                        this.logger.info(`[SIGNAL ${asset}] ⚡ IMPULSE! Z=${zScore.toFixed(2)} | CVD: OK ✅`);
+                        const sigId = `z19_${now}`;
+                        this.logger.info(`[SIGNAL ${asset}] ⚡ Z=${zScore.toFixed(2)} (T:${threshold.toFixed(2)}) | VWMP:${currentPrice.toFixed(2)}`);
                         
                         this.pendingSignals.push({
                             id: sigId,
                             asset: asset,
                             side: side,
-                            entryPrice: currentPrice, 
+                            entryPrice: executionPrice, 
                             time: now,
                             z: zScore,
                             checked50: false,
                             checked100: false
                         });
 
-                        await this.tryExecute(asset, side, executionPrice, sigId);
+                        this.executeFast(asset, side, executionPrice, sigId);
                     }
                 }
             }
@@ -247,10 +269,8 @@ class LeadStrategy {
         }
     }
 
-    // ============================================================
-    // PART 3: UTILITIES & EXECUTION
-    // ============================================================
-    checkEdgeDecay(asset, now, currentPrice) {
+    // --- UTILITIES ---
+    checkEdgeDecay(asset, now, bestBid, bestAsk) {
         for (let i = this.pendingSignals.length - 1; i >= 0; i--) {
             const sig = this.pendingSignals[i];
             if (sig.asset !== asset) continue;
@@ -260,61 +280,57 @@ class LeadStrategy {
                 this.pendingSignals.splice(i, 1);
                 continue;
             }
-
+            const exitPrice = sig.side === 'buy' ? bestBid : bestAsk;
             if (!sig.checked50 && age >= 50) {
-                this.logEdge(sig, 50, currentPrice);
+                this.logEdge(sig, 50, exitPrice);
                 sig.checked50 = true;
             }
             if (!sig.checked100 && age >= 100) {
-                this.logEdge(sig, 100, currentPrice);
+                this.logEdge(sig, 100, exitPrice);
                 sig.checked100 = true;
             }
         }
     }
 
-    logEdge(sig, duration, currentPrice) {
-        const rawMove = (currentPrice - sig.entryPrice) / sig.entryPrice;
+    logEdge(sig, duration, exitPrice) {
+        const rawMove = (exitPrice - sig.entryPrice) / sig.entryPrice;
         const pnlPct = sig.side === 'buy' ? rawMove : -rawMove;
-        // Optional: Enable to see trade performance in logs
-        // const icon = pnlPct > 0 ? '🟢' : '🔴';
-        // this.logger.info(`[EDGE ${duration}ms] ${icon} ${sig.asset} | Result: ${(pnlPct * 10000).toFixed(2)} bps`);
+        // this.logger.info(`[EDGE ${duration}ms] ${sig.asset} | Result: ${(pnlPct * 10000).toFixed(2)} bps`);
     }
 
     startHeartbeat() {
         setInterval(() => {
             const now = Date.now();
             const elapsed = now - this.startTime;
-            const isWarmingUp = elapsed < this.WARMUP_MS;
             
             let anyData = false;
-            
             Object.keys(this.specs).forEach(asset => {
                 const count = this.zCount[asset];
                 const cvd = this.cvdState[asset];
                 
-                // Only log if we have data OR to show we are alive but waiting
                 if (count > 0) {
                      anyData = true;
-                     let status = isWarmingUp ? `⏳ WARMUP` : "🟢 ACTIVE";
-                     const vol = Math.sqrt(this.volState[asset].variance);
+                     const isWarm = elapsed > this.WARMUP_MS;
+                     const status = isWarm ? "🟢 ACTIVE" : "⏳ WARMUP";
                      const cvdVol = cvd ? (cvd.buySum + cvd.sellSum).toFixed(2) : "0";
                      
-                     this.logger.info(`[${asset}] ${status} | Z-Thresh: ${this.dynamicThresholds[asset].toFixed(2)}σ | CVD Vol: ${cvdVol}`);
+                     this.logger.info(`[${asset}] ${status} | Z-Thresh: ${this.dynamicThresholds[asset].toFixed(2)}σ | CVD: ${cvdVol}`);
                 }
             });
 
             if (!anyData) {
-                this.logger.info(`[Heartbeat] Alive but WAITING for Data... (Check Market Listener Connection)`);
+                this.logger.info(`[Heartbeat] Alive but WAITING for Data...`);
             }
 
-        }, 10000); // 10s Heartbeat
+        }, 10000); 
     }
 
-    async tryExecute(asset, side, price, orderId) {
+    executeFast(asset, side, price, orderId) {
         if (this.bot.hasOpenPosition(asset)) return;
-        const now = Date.now();
         
-        if (now - this.triggerState[asset].lastFire < 1000) return; 
+        const now = Date.now();
+        // FIX: Reduced Cooldown from 1000ms to 50ms (Double-tap enabled)
+        if (now - this.triggerState[asset].lastFire < 50) return; 
         this.triggerState[asset].lastFire = now;
 
         const spec = this.specs[asset];
@@ -341,17 +357,15 @@ class LeadStrategy {
 
         this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side} @ ${price}`);
         
-        try {
-            await this.bot.placeOrder(payload);
-        } catch(e) {
+        this.bot.placeOrder(payload).catch(e => {
             this.logger.error(`Order Failed: ${e.message}`);
-        }
+        });
     }
 
     onLaggerTrade(trade) {}
     onPositionClose(asset) {}
-    getName() { return "LeadStrategy (Hybrid v16)"; }
+    getName() { return "LeadStrategy (Production v19)"; }
 }
 
 module.exports = LeadStrategy;
-            
+                
