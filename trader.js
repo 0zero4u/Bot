@@ -1,9 +1,11 @@
+
 /**
  * trader.js
- * ALIGNED WITH LEAD STRATEGY v16 + MARKET LISTENER
- * Fixes: 
- * - Explicitly starts Strategy to enable Heartbeat/Warmup logs.
- * - Logs warning if market data is received before Authentication.
+ * ALIGNED WITH LEAD STRATEGY v16 + MARKET LISTENER v3
+ * Fixes:
+ * 1. Subscribes to 'all_trades' (Delta Lagger Feed).
+ * 2. Routes 'all_trades' to strategy to fix "Waiting for data...".
+ * 3. Starts Strategy Explicitly.
  */
 
 const WebSocket = require('ws');
@@ -23,7 +25,7 @@ try {
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Lead', 
+    strategy: process.env.STRATEGY || 'Advance', // Default to Advance
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
@@ -70,7 +72,7 @@ class TradingBot {
 
         this.ws = null; 
         this.authenticated = false;
-        this.lastAuthWarning = 0; // Throttling for auth warning
+        this.lastAuthWarning = 0; 
 
         // Position & Execution State
         this.activePositions = {};
@@ -109,7 +111,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v69.0) ---`);
+        this.logger.info(`--- Bot Initializing (v70.0 - Full Data) ---`);
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
@@ -123,13 +125,10 @@ class TradingBot {
         this.setupHttpServer();
         this.startRestKeepAlive();
 
-        // --- FIX: EXPLICITLY START STRATEGY ---
-        // This triggers the Warmup and Heartbeat loops in AdvanceStrategy
+        // Start Strategy
         if (this.strategy && typeof this.strategy.start === 'function') {
             this.logger.info(`🚀 Starting Strategy Logic...`);
             await this.strategy.start();
-        } else {
-            this.logger.warn(`⚠️ Strategy does not have a start() method. Heartbeat may not run.`);
         }
     }
 
@@ -138,9 +137,7 @@ class TradingBot {
         this.restKeepAliveInterval = setInterval(async () => {
             try {
                 await this.client.getWalletBalance();
-            } catch (error) {
-                // Silent catch for keep-alive
-            }
+            } catch (error) { }
         }, 29000);
     }
 
@@ -206,12 +203,20 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        this.logger.info(`Subscribing to Execution Channels: Orders, Positions, User Trades`);
-        this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
-            { name: 'orders', symbols: ['all'] },
-            { name: 'positions', symbols: ['all'] },
-            { name: 'user_trades', symbols: ['all'] } 
-        ]}}));
+        this.logger.info(`Subscribing to: Orders, Positions, User Trades, All Trades`);
+        
+        // ⚡ HERE IS THE FIX: Added "all_trades" for "futures"
+        this.ws.send(JSON.stringify({ 
+            type: 'subscribe', 
+            payload: { 
+                channels: [
+                    { name: 'orders', symbols: ['all'] },
+                    { name: 'positions', symbols: ['all'] },
+                    { name: 'user_trades', symbols: ['all'] },
+                    { name: 'all_trades', symbols: ['futures'] } // Subscribe to all futures trades
+                ]
+            }
+        }));
     }
 
     handleWebSocketMessage(message) {
@@ -234,6 +239,20 @@ class TradingBot {
         }
 
         switch (message.type) {
+            // ⚡ 1. Handle Public Trades (The Delta Price Feed)
+            case 'all_trades':
+                // Check if it's a snapshot (array) or single update
+                if (Array.isArray(message.data)) {
+                     // Snapshot (ignore or process latest)
+                     const latest = message.data[0]; // Usually latest is first or last, check docs. 
+                     // For Delta, snapshots are usually historical. We prefer real-time.
+                     // But we can use the first one to init price.
+                     if(latest) this.forwardTradeToStrategy(latest);
+                } else {
+                     this.forwardTradeToStrategy(message);
+                }
+                break;
+
             case 'orders':
                 if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
                 break;
@@ -249,6 +268,14 @@ class TradingBot {
             case 'user_trades':
                 this.measureLatency(message);
                 break;
+        }
+    }
+
+    // ⚡ Helper to forward 'all_trades' to Strategy
+    forwardTradeToStrategy(tradeData) {
+        // tradeData structure: { symbol: "BTCUSD", price: "100", size: "1", ... }
+        if (this.strategy && this.strategy.onLaggerTrade) {
+            this.strategy.onLaggerTrade(tradeData);
         }
     }
 
@@ -302,17 +329,11 @@ class TradingBot {
         }
     }
 
-    hasOpenPosition(symbol) {
-        if (symbol) return this.activePositions[symbol] === true;
-        return Object.values(this.activePositions).some(status => status === true);
-    }
-
-    // --- SIGNAL HANDLING (CRITICAL FIXES HERE) ---
+    // --- SIGNAL HANDLING (Internal WS) ---
     async handleSignalMessage(message) {
-        // ⚠️ VISIBILITY FIX: Log if data is dropped due to no authentication
         if (!this.authenticated) {
             const now = Date.now();
-            if (now - this.lastAuthWarning > 5000) { // Throttle log: once every 5s
+            if (now - this.lastAuthWarning > 5000) { 
                 this.logger.warn(`[Data Drop] ⚠️ Receiving Market Data but Bot NOT Authenticated yet. Ignoring.`);
                 this.lastAuthWarning = now;
             }
@@ -322,7 +343,7 @@ class TradingBot {
         try {
             const data = JSON.parse(message.toString());
             
-            // 1. PRICE/BOOK UPDATE (Type 'B')
+            // 1. PRICE/BOOK UPDATE (Type 'B' from Binance)
             if (data.type === 'B') {
                 const asset = data.s;
                 if (!this.targetAssets.includes(asset)) return;
@@ -336,19 +357,6 @@ class TradingBot {
                     this.strategy.onDepthUpdate(asset, depthPayload);
                 }
             } 
-            // 2. TRADE/CVD UPDATE (Type 'T') - [NOW ENABLED]
-            else if (data.type === 'T') {
-                const asset = data.s;
-                if (this.targetAssets.includes(asset) && this.strategy.onExternalTrade) {
-                    this.strategy.onExternalTrade(data);
-                }
-            }
-            // 3. GENERIC UPDATE
-            else if (data.type === 'depthUpdate') {
-                if (this.strategy.onDepthUpdate && data.symbol) {
-                   this.strategy.onDepthUpdate(data.symbol, data);
-                }
-            }
         } catch (error) {
             this.logger.error("Error handling signal message:", error);
         }
@@ -397,4 +405,3 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                   
