@@ -1,9 +1,6 @@
 /**
  * trader.js
- * v70.0 [CVD SUPPORT ADDED]
- * 1. Protocol: Supports market_listener 'B' (Book) AND 'T' (Trade) types.
- * 2. Execution: Uses Rust Native Client.
- * 3. Routing: Routes 'T' messages to strategy.onExternalTrade for CVD Filter.
+ * v71.0 [CVD SUPPORT + 10s HEARTBEAT COMPATIBLE]
  */
 
 const WebSocket = require('ws');
@@ -40,18 +37,13 @@ const logger = winston.createLogger({
     level: config.logLevel,
     format: winston.format.combine(
         winston.format.timestamp(),
-        winston.format.printf(({ timestamp, level, message }) => {
-            return `${timestamp} [${level.toUpperCase()}]: ${message}`;
-        })
+        winston.format.printf(({ timestamp, level, message }) => `${timestamp} [${level.toUpperCase()}]: ${message}`)
     ),
     transports: [
         new winston.transports.File({ filename: 'error.log', level: 'error' }),
         new winston.transports.File({ filename: 'combined.log' }),
         new winston.transports.Console({
-            format: winston.format.combine(
-                winston.format.colorize(),
-                winston.format.simple()
-            )
+            format: winston.format.combine(winston.format.colorize(), winston.format.simple())
         })
     ]
 });
@@ -61,7 +53,6 @@ class TradingBot {
         this.config = { ...botConfig };
         this.logger = logger;
         
-        // Initialize Rust Client
         this.client = new DeltaClient(
             this.config.apiKey, 
             this.config.apiSecret, 
@@ -70,22 +61,16 @@ class TradingBot {
 
         this.ws = null; 
         this.authenticated = false;
-
-        // Position & Execution State
         this.activePositions = {};
         this.orderLatencies = new Map(); 
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         
-        this.targetAssets.forEach(asset => {
-            this.activePositions[asset] = false;
-        });
+        this.targetAssets.forEach(asset => { this.activePositions[asset] = false; });
 
-        this.isStateSynced = false;
         this.pingInterval = null; 
         this.heartbeatTimeout = null;
         this.restKeepAliveInterval = null;
 
-        // Load Strategy
         try {
             const StrategyClass = require(`./strategies/${this.config.strategy}Strategy.js`);
             this.strategy = new StrategyClass(this);
@@ -96,22 +81,18 @@ class TradingBot {
         }
     }
 
-    // --- Latency Helper ---
     recordOrderPunch(clientOrderId) {
         this.orderLatencies.set(clientOrderId, Date.now());
         setTimeout(() => {
-            if (this.orderLatencies.has(clientOrderId)) {
-                this.orderLatencies.delete(clientOrderId);
-            }
+            if (this.orderLatencies.has(clientOrderId)) this.orderLatencies.delete(clientOrderId);
         }, 60000);
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v70.0 CVD) ---`);
-        this.logger.info("🔥 Warming up Rust Native Connection...");
+        this.logger.info(`--- Bot Initializing ---`);
         try {
             await this.client.getWalletBalance();
-            this.logger.info("🔥 Connection Warmed. Native Socket is open.");
+            this.logger.info("🔥 Native Connection Warmed.");
         } catch (e) {
             this.logger.warn("Warmup failed (non-fatal), continuing...");
         }
@@ -125,15 +106,10 @@ class TradingBot {
     startRestKeepAlive() {
         if (this.restKeepAliveInterval) clearInterval(this.restKeepAliveInterval);
         this.restKeepAliveInterval = setInterval(async () => {
-            try {
-                await this.client.getWalletBalance();
-            } catch (error) {
-                this.logger.warn(`[Keep-Alive] Check Failed: ${error}`);
-            }
+            try { await this.client.getWalletBalance(); } catch (error) {}
         }, 29000);
     }
 
-    // --- WebSocket Heartbeat ---
     startHeartbeat() {
         this.resetHeartbeatTimeout();
         this.pingInterval = setInterval(() => {
@@ -156,7 +132,6 @@ class TradingBot {
         clearInterval(this.pingInterval);
     }
 
-    // --- WebSocket Connection ---
     async initWebSocket() {
         this.logger.info(`Connecting to: ${this.config.wsURL}`);
         this.ws = new WebSocket(this.config.wsURL);
@@ -165,7 +140,7 @@ class TradingBot {
         this.ws.on('message', (data) => this.handleWebSocketMessage(JSON.parse(data.toString())));
         this.ws.on('error', (error) => this.logger.error('WebSocket error:', error.message));
         this.ws.on('close', (code, reason) => {
-            this.logger.warn(`WebSocket disconnected: ${code} - ${reason}. Reconnecting...`);
+            this.logger.warn(`WebSocket disconnected. Reconnecting...`);
             this.stopHeartbeat();
             this.authenticated = false;
             setTimeout(() => this.initWebSocket(), this.config.reconnectInterval);
@@ -175,27 +150,17 @@ class TradingBot {
     authenticateWebSocket() {
         const timestampNum = Math.floor(Date.now() / 1000);
         const timestampStr = timestampNum.toString();
-
         const signatureData = 'GET' + timestampStr + '/live';
-        const signature = crypto
-            .createHmac('sha256', this.config.apiSecret)
-            .update(signatureData)
-            .digest('hex');
+        const signature = crypto.createHmac('sha256', this.config.apiSecret).update(signatureData).digest('hex');
 
         const payload = {
             type: 'key-auth',
-            payload: {
-                'api-key': this.config.apiKey,
-                timestamp: timestampStr,
-                signature: signature
-            }
+            payload: { 'api-key': this.config.apiKey, timestamp: timestampStr, signature: signature }
         };
-
         this.ws.send(JSON.stringify(payload));
     }
 
     subscribeToChannels() {
-        this.logger.info(`Subscribing to Execution Channels: Orders, Positions, User Trades`);
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
@@ -209,7 +174,7 @@ class TradingBot {
             (message.type === 'key-auth' && message.status === 'authenticated') ||
             (message.success === true && message.status === 'authenticated')
         ) {
-            this.logger.info('✅ WebSocket AUTHENTICATED Successfully.');
+            this.logger.info('✅ WebSocket AUTHENTICATED.');
             this.authenticated = true;
             this.subscribeToChannels();
             this.startHeartbeat();
@@ -226,22 +191,13 @@ class TradingBot {
             case 'orders':
                 if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
                 break;
-
             case 'positions':
-                if (Array.isArray(message.data)) {
-                    message.data.forEach(pos => this.handlePositionUpdate(pos));
-                } else if (message.size !== undefined) {
-                    this.handlePositionUpdate(message);
-                }
+                if (Array.isArray(message.data)) message.data.forEach(pos => this.handlePositionUpdate(pos));
+                else if (message.size !== undefined) this.handlePositionUpdate(message);
                 break;
-            
             case 'user_trades':
-                // We track latency here, but strategy execution happens in handleSignalMessage
-                if (Array.isArray(message.data)) {
-                     message.data.forEach(trade => this.measureLatency(trade));
-                } else {
-                     this.measureLatency(message);
-                }
+                if (Array.isArray(message.data)) message.data.forEach(trade => this.measureLatency(trade));
+                else this.measureLatency(message);
                 break;
         }
     }
@@ -250,8 +206,6 @@ class TradingBot {
         const clientOid = trade.client_order_id;
         if (clientOid && this.orderLatencies.has(clientOid)) {
             const t0 = this.orderLatencies.get(clientOid);
-            // Delta timestamp is in microseconds mostly, or milliseconds. 
-            // Standardizing to ms:
             const t1 = parseInt(trade.timestamp) / 1000; 
             const latency = t1 - t0;
             this.logger.info(`[LATENCY] ⚡ ${trade.symbol} | OID:${clientOid} | Delay: ${latency.toFixed(2)}ms`);
@@ -262,16 +216,12 @@ class TradingBot {
     handlePositionUpdate(pos) {
         if (!pos.product_symbol) return;
         const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
-        
         if (asset) {
             const size = parseFloat(pos.size);
             const isOpen = size !== 0;
-
             if (this.activePositions[asset] !== isOpen) {
                 this.activePositions[asset] = isOpen;
-                if (!isOpen && this.strategy.onPositionClose) {
-                    this.strategy.onPositionClose(asset);
-                }
+                if (!isOpen && this.strategy.onPositionClose) this.strategy.onPositionClose(asset);
                 this.logger.info(`[POS UPDATE] ${asset} is now ${isOpen ? 'OPEN' : 'CLOSED'} (Size: ${size})`);
             }
         }
@@ -282,18 +232,14 @@ class TradingBot {
             const response = await this.client.getPositions();
             const positions = response.result || [];
             this.targetAssets.forEach(a => this.activePositions[a] = false);
-
             positions.forEach(pos => {
                 const size = parseFloat(pos.size);
                 if (size !== 0) {
                     const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
-                    if (asset) {
-                        this.activePositions[asset] = true;
-                    }
+                    if (asset) this.activePositions[asset] = true;
                 }
             });
             this.isStateSynced = true;
-            this.logger.info(`Position State Synced: ${JSON.stringify(this.activePositions)}`);
         } catch (error) {
             this.logger.error(`Failed to sync position state: ${error}`);
         }
@@ -304,49 +250,31 @@ class TradingBot {
         return Object.values(this.activePositions).some(status => status === true);
     }
 
-    // --- CORE STRATEGY ROUTING ---
     async handleSignalMessage(message) {
-        if (!this.authenticated) return; // Wait for Exchange Auth before processing signals
+        if (!this.authenticated) return; 
         try {
             const data = JSON.parse(message.toString());
             
-            // 1. BOOK TICKER (Price) -> STRATEGY CORE
+            // 1. BOOK TICKER
             if (data.type === 'B') {
-                const asset = data.s;
-                // Only process target assets
-                // if (!this.targetAssets.includes(asset)) return; // Optional optimization
-
-                // Convert flat fields to 'depth' format expected by LeadStrategy
-                const depthPayload = {
-                    bids: [[ data.bb, data.bq ]], 
-                    asks: [[ data.ba, data.aq ]]  
-                };
-                
+                const depthPayload = { bids: [[ data.bb, data.bq ]], asks: [[ data.ba, data.aq ]] };
                 if (this.strategy && this.strategy.onDepthUpdate) {
-                    this.strategy.onDepthUpdate(asset, depthPayload);
+                    this.strategy.onDepthUpdate(data.s, depthPayload);
                 }
             } 
-            
-            // 2. AGG TRADE (CVD) -> STRATEGY FILTER (NEW)
+            // 2. CVD UPDATE
             else if (data.type === 'T') {
                 if (this.strategy && this.strategy.onExternalTrade) {
                     this.strategy.onExternalTrade(data);
                 }
             }
-            
-            // 3. LEGACY SUPPORT (Standard depthUpdate)
+            // 3. LEGACY
             else if (data.type === 'depthUpdate') {
                 if (this.strategy.onDepthUpdate && data.symbol && data.bids) {
                    this.strategy.onDepthUpdate(data.symbol, data);
                 }
             }
-
-        } catch (error) {
-            // Squelch JSON parse errors for speed, but log others
-            if (!error.message.includes('JSON')) {
-                this.logger.error("Signal Error:", error);
-            }
-        }
+        } catch (error) {}
     }
     
     setupHttpServer() {
@@ -359,21 +287,13 @@ class TradingBot {
         this.logger.info(`Internal Data Server running on port ${this.config.port}`);
     }
     
-    // [FIX] Enhanced Place Order with Debugging
     async placeOrder(orderData) {
-        if (orderData.client_order_id) {
-            this.recordOrderPunch(orderData.client_order_id);
-        }
-        
+        if (orderData.client_order_id) this.recordOrderPunch(orderData.client_order_id);
         try {
-            // Log payload for debugging if needed (remove in prod if too noisy)
-            // this.logger.info(`[SENDING] ${JSON.stringify(orderData)}`);
-            
             const result = await this.client.placeOrder(orderData);
             return result;
         } catch (error) {
             this.logger.error(`[ORDER FAIL] Native Client Error: ${error.message || error}`);
-            // Re-throw so strategy knows it failed
             throw error; 
         }
     }
@@ -385,7 +305,6 @@ class TradingBot {
     }
 }
 
-// --- Main Execution ---
 (async () => {
     try {
         const bot = new TradingBot(config);
@@ -398,4 +317,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                     
+        
