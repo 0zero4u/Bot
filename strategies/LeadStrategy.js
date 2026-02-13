@@ -14,7 +14,7 @@ class LeadStrategy {
 
         // --- CONFIGURATION ---
         this.WARMUP_MS = 100000;
-        this.WINDOW_MS = 20;             
+        this.WINDOW_MS = 40;             
         this.IMBALANCE_THRESHOLD = 0.60; 
         
         // --- RISK MANAGEMENT (NORMALIZED) ---
