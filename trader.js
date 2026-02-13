@@ -1,6 +1,7 @@
+
 /**
  * trader.js
- * v69.0 [CLEANED + NO ALL_TRADES + LOCK FIX]
+ * v70.0 [PRODUCTION: NO ALL_TRADES + LOCKING + ROBUST ERROR LOGS]
  */
 
 const WebSocket = require('ws');
@@ -71,7 +72,9 @@ class TradingBot {
         // Position & Execution State
         this.activePositions = {};
         this.orderLatencies = new Map(); 
-        this.isOrderInProgress = false; // [FIX] Initialize explicitly
+        
+        // [CRITICAL FIX] Initialize Lock Flag
+        this.isOrderInProgress = false; 
 
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         
@@ -106,7 +109,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v69.0) ---`);
+        this.logger.info(`--- Bot Initializing (v70.0) ---`);
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
@@ -194,8 +197,8 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        // [FIX] Removed 'all_trades'
-        this.logger.info(`Subscribing to Execution Channels: Orders, Positions, User Trades`);
+        // [FIX] REMOVED 'all_trades' to prevent noise
+        this.logger.info(`Subscribing to Execution Channels...`);
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
@@ -235,7 +238,7 @@ class TradingBot {
                 }
                 break;
             
-            // [FIX] 'all_trades' case REMOVED
+            // [NOTE] 'all_trades' is intentionally omitted
 
             case 'user_trades':
                 this.measureLatency(message);
@@ -303,7 +306,7 @@ class TradingBot {
         if (!this.authenticated) return;
         try {
             const data = JSON.parse(message.toString());
-            // Support 'B' (Binance BookTicker) and generic 'depthUpdate'
+            // Support 'B' (Binance BookTicker)
             if (data.type === 'B') {
                 const asset = data.s;
                 if (!this.targetAssets.includes(asset)) return;
@@ -314,7 +317,9 @@ class TradingBot {
                 if (this.strategy.onDepthUpdate) {
                     this.strategy.onDepthUpdate(asset, depthPayload);
                 }
-            } else if (data.type === 'depthUpdate') {
+            } 
+            // Support generic 'depthUpdate'
+            else if (data.type === 'depthUpdate') {
                 if (this.strategy.onDepthUpdate && data.symbol && data.bids) {
                    this.strategy.onDepthUpdate(data.symbol, data);
                 }
@@ -334,21 +339,17 @@ class TradingBot {
         this.logger.info(`Internal Data Server running on port ${this.config.port}`);
     }
     
-    // [FIX] Enhanced Place Order with Debugging
+    // [FIX] Enhanced Place Order with Try/Catch
     async placeOrder(orderData) {
         if (orderData.client_order_id) {
             this.recordOrderPunch(orderData.client_order_id);
         }
         
         try {
-            // Log payload for debugging if needed (remove in prod if too noisy)
-            // this.logger.info(`[SENDING] ${JSON.stringify(orderData)}`);
-            
             const result = await this.client.placeOrder(orderData);
             return result;
         } catch (error) {
             this.logger.error(`[ORDER FAIL] Native Client Error: ${error.message || error}`);
-            // Re-throw so strategy knows it failed
             throw error; 
         }
     }
@@ -373,4 +374,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-    
+            
