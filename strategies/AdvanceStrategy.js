@@ -1,6 +1,6 @@
 /**
  * AdvanceStrategy.js
- * v18.0 - [FIXED] Added onDepthUpdate Adapter
+ * v19.0 - [MONITOR ADDED] Tracks 'required window' for missed moves
  */
 
 class AdvanceStrategy {
@@ -33,7 +33,15 @@ class AdvanceStrategy {
                     deltaPrice: 0,       
                     deltaLastUpdate: 0,
                     buffers: {},         
-                    lastLogTime: 0       
+                    lastLogTime: 0,
+                    
+                    // --- NEW: 10s Monitor Stats ---
+                    monitor: {
+                        high: -Infinity,
+                        low: Infinity,
+                        highTime: 0,
+                        lowTime: 0
+                    }
                 };
             }
         });
@@ -42,23 +50,13 @@ class AdvanceStrategy {
         this.localInPosition = false;
     }
 
-    getName() { return "AdvanceStrategy (Market + Trail 0.02% + Adapter)"; }
+    getName() { return "AdvanceStrategy (Market + Trail 0.02% + Adapter + Monitor)"; }
 
-    /**
-     * [NEW] ADAPTER METHOD
-     * This bridges the gap between market_listener (Type B) and this strategy.
-     */
     onDepthUpdate(asset, depth) {
         if (!depth.bids[0] || !depth.asks[0]) return;
-
-        // Extract Best Bid/Ask
         const bestBid = parseFloat(depth.bids[0][0]);
         const bestAsk = parseFloat(depth.asks[0][0]);
-
-        // Calculate Mid-Price (Fair Price)
         const midPrice = (bestBid + bestAsk) / 2;
-
-        // Pass to the sniping logic
         this.onPriceUpdate(asset, midPrice, 'BINANCE');
     }
 
@@ -78,17 +76,47 @@ class AdvanceStrategy {
         const assetData = this.assets[asset];
         if (!assetData) return;
 
-        // Heartbeat Log (10s)
+        // --- 1. UPDATE MONITOR STATS ---
+        // Track the High/Low since the last heartbeat
+        if (price > assetData.monitor.high) {
+            assetData.monitor.high = price;
+            assetData.monitor.highTime = now;
+        }
+        if (price < assetData.monitor.low) {
+            assetData.monitor.low = price;
+            assetData.monitor.lowTime = now;
+        }
+
+        // --- 2. HEARTBEAT LOG (With "Required Window" Analysis) ---
         if (now - assetData.lastLogTime > 10000) {
             const gap = assetData.deltaPrice > 0 
                 ? ((price - assetData.deltaPrice) / assetData.deltaPrice) * 100 
                 : 0;
-            this.logger.info(`[HEARTBEAT] ${asset} | Ext: ${price} | Delta: ${assetData.deltaPrice} | Gap: ${gap.toFixed(4)}%`);
+
+            // Calculate the move statistics for the last 10 seconds
+            const moveAmt = assetData.monitor.high - assetData.monitor.low;
+            const movePct = (assetData.monitor.low > 0) ? (moveAmt / assetData.monitor.low) * 100 : 0;
+            const timeTaken = Math.abs(assetData.monitor.highTime - assetData.monitor.lowTime);
+            
+            // Determine "Required Window"
+            // If the move was huge (>0.03%), how long did it take?
+            let analysis = "";
+            if (movePct > (this.BURST_THRESHOLD * 100)) {
+                analysis = ` | ⚠️ Missed Move: ${movePct.toFixed(3)}% in ${timeTaken}ms (Req: <${this.BURST_WINDOW_MS}ms)`;
+            } else {
+                analysis = ` | Volatility: ${movePct.toFixed(4)}% (Too small)`;
+            }
+
+            this.logger.info(`[HEARTBEAT] ${asset} | Gap: ${gap.toFixed(4)}%${analysis}`);
+
+            // Reset Monitor for next 10s
             assetData.lastLogTime = now;
+            assetData.monitor = { high: -Infinity, low: Infinity, highTime: 0, lowTime: 0 };
         }
 
         if (now - this.lastTriggerTime < this.LOCK_DURATION_MS) return;
 
+        // --- 3. EXISTING TRADING LOGIC (Unchanged) ---
         if (!assetData.buffers[source]) assetData.buffers[source] = [];
         const buffer = assetData.buffers[source];
 
@@ -118,11 +146,11 @@ class AdvanceStrategy {
         const deltaP = assetData.deltaPrice;
         if (deltaP === 0) return;
 
-        let gap = (direction === 'buy') ? (price - deltaP) / deltaP : (deltaP - price) / deltaP;
+        let triggerGap = (direction === 'buy') ? (price - deltaP) / deltaP : (deltaP - price) / deltaP;
 
-        if (gap >= this.GAP_THRESHOLD) {
+        if (triggerGap >= this.GAP_THRESHOLD) {
             this.lastTriggerTime = now;
-            this.logger.info(`[Sniper] ⚡ FIRE: ${asset} ${direction.toUpperCase()} | Gap: ${(gap*100).toFixed(4)}%`);
+            this.logger.info(`[Sniper] ⚡ FIRE: ${asset} ${direction.toUpperCase()} | Gap: ${(triggerGap*100).toFixed(4)}%`);
             await this.executeSnipe(asset, direction, deltaP);
         }
     }
@@ -134,7 +162,6 @@ class AdvanceStrategy {
         try {
             const spec = this.specs[asset];
             
-            // Precision-safe trail calculation
             let trailDistance = currentPrice * (this.TRAILING_PERCENT / 100);
             const tickSize = 1 / Math.pow(10, spec.precision);
             if (trailDistance < tickSize) trailDistance = tickSize;
@@ -184,4 +211,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-            
+        
