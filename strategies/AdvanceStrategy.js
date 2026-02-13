@@ -45,7 +45,7 @@ class AdvanceStrategy {
         
         // Z-SCORE SETTINGS
         this.Z_SCORE_THRESHOLD = 2.2;    
-        this.MIN_GAP_THRESHOLD = 0.0004; 
+        this.MIN_GAP_THRESHOLD = 0.0006; 
         
         // BURST SETTINGS
         this.MIN_BURST_VELOCITY = 0.0001; 
