@@ -8,7 +8,7 @@
  */
 
 class RollingStats {
-    constructor(windowSize = 50) {
+    constructor(windowSize = 25) {
         this.size = windowSize;
         this.values = [];
     }
