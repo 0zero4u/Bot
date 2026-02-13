@@ -1,14 +1,12 @@
 /**
  * ============================================================================
  * LEAD STRATEGY: PURE MOMENTUM (VELOCITY + IMBALANCE)
- * Version: Simple v3.0 [FULL VISIBILITY HEARTBEAT]
+ * Version: Simple v3.1 [TRAILING STOP ADDED]
  * * Logic:
  * 1. Monitor Binance (Leader) exclusively.
  * 2. TRIGGER: If Binance Price moves > 0.03% in ~30ms.
  * 3. FILTER: Check Imbalance > 0.60 (60%) on the side of the move.
- * 4. LOGGING: 
- * - Heartbeat every 10s for ACTIVE assets only.
- * - Shows Current Price + 30ms Move % (even if 0.00%).
+ * 4. EXECUTION: Market Order with 0.02% Trailing Stop.
  * ============================================================================
  */
 
@@ -19,16 +17,17 @@ class LeadStrategy {
 
         // --- CONFIGURATION ---
         this.MOVE_THRESHOLD = 0.00015;     // 0.03% price change required
-        this.TIME_LOOKBACK_MS = 50;       // Compare vs price 30ms ago
-        this.IMBALANCE_RATIO = 0.60;      // 60% Order Book Support required
-        this.COOLDOWN_MS = 1000;          // 1s cooldown after firing
+        this.TIME_LOOKBACK_MS = 25;        // Compare vs price 30ms ago
+        this.IMBALANCE_RATIO = 0.60;       // 60% Order Book Support required
+        this.COOLDOWN_MS = 1000;           // 1s cooldown after firing
+        this.TRAILING_PERCENT = 0.02;      // 0.02% Trailing Stop
 
-        // --- ASSET SPECS ---
+        // --- ASSET SPECS (Updated with Precision for Trailing Stop) ---
         this.assets = {
-            'XRP': { deltaId: 14969 }, 
-            'BTC': { deltaId: 27 },    
-            'ETH': { deltaId: 299 },
-            'SOL': { deltaId: 417 }
+            'XRP': { deltaId: 14969, precision: 4 }, 
+            'BTC': { deltaId: 27,    precision: 1 },    
+            'ETH': { deltaId: 299,   precision: 2 },
+            'SOL': { deltaId: 417,   precision: 3 }
         };
 
         // --- STATE ---
@@ -46,13 +45,13 @@ class LeadStrategy {
         });
 
         this.logger.info(`[LeadStrategy Momentum] Loaded.`);
-        this.logger.info(`> Logic: Move > ${this.MOVE_THRESHOLD*100}% in 30ms | Imbalance > ${this.IMBALANCE_RATIO}`);
+        this.logger.info(`> Logic: Move > ${this.MOVE_THRESHOLD*100}% in 30ms | Trail: ${this.TRAILING_PERCENT}%`);
         
         this.startHeartbeat();
     }
 
     /**
-     * 🟢 HEARTBEAT LOGGER (10s)
+     * 泙 HEARTBEAT LOGGER (10s)
      * Logs the precise state of active assets so you know "everything happening".
      */
     startHeartbeat() {
@@ -63,20 +62,19 @@ class LeadStrategy {
                 const stats = this.latestStats[asset];
 
                 // 1. SKIP DEAD ASSETS
-                // If price is 0, we haven't received data for this asset yet.
                 if (stats.price <= 0) return; 
 
                 activeCount++;
 
                 // 2. Format Data
-                const price = stats.price.toFixed(4); // Show 4 decimals for precision
-                const changePct = (stats.change * 100).toFixed(4); // e.g. "0.0000" or "0.0421"
+                const price = stats.price.toFixed(4);
+                const changePct = (stats.change * 100).toFixed(4);
                 const imb = stats.imbalance.toFixed(2);
                 
                 // 3. Determine Status Label
-                let status = "💤 STABLE";
-                if (Math.abs(stats.change) > (this.MOVE_THRESHOLD * 0.5)) status = "🌊 ACTIVITY";
-                if (Math.abs(stats.change) > this.MOVE_THRESHOLD) status = "🔥 TRIGGER ZONE";
+                let status = "彫 STABLE";
+                if (Math.abs(stats.change) > (this.MOVE_THRESHOLD * 0.5)) status = "穴 ACTIVITY";
+                if (Math.abs(stats.change) > this.MOVE_THRESHOLD) status = "櫨 TRIGGER ZONE";
 
                 // 4. Log the Line
                 this.logger.info(
@@ -138,7 +136,6 @@ class LeadStrategy {
         const priceChangePct = (currentPrice - pastTick.p) / pastTick.p;
         
         // Update Stats for Heartbeat
-        // We track the imbalance of the side that matters (Bid if price up, Ask if price down)
         const relevantImbalance = priceChangePct >= 0 ? bidRatio : askRatio;
 
         this.latestStats[asset] = {
@@ -165,7 +162,7 @@ class LeadStrategy {
 
             // 6. Execute
             if (side) {
-                this.logger.info(`[SIGNAL ${asset}] 🚀 VELOCITY DETECTED!`);
+                this.logger.info(`[SIGNAL ${asset}] 噫 VELOCITY DETECTED!`);
                 this.logger.info(`> Move: ${(priceChangePct*100).toFixed(4)}% in ${now - pastTick.t}ms | Imb: ${relevantImbalance.toFixed(2)}`);
                 await this.tryExecute(asset, side, currentPrice);
             }
@@ -184,23 +181,40 @@ class LeadStrategy {
         this.lastTriggerTime[asset] = now;
         const spec = this.assets[asset];
 
+        // --- TRAILING STOP CALCULATION ---
+        // 1. Calculate raw distance (Price * 0.02%)
+        let trailDistance = price * (this.TRAILING_PERCENT / 100);
+        
+        // 2. Ensure min tick size (1 / 10^precision)
+        const tickSize = 1 / Math.pow(10, spec.precision);
+        if (trailDistance < tickSize) trailDistance = tickSize;
+
+        // 3. Format strictly to string
+        const trailAmount = trailDistance.toFixed(spec.precision);
+
         const payload = {
             product_id: spec.deltaId.toString(),
             side: side,
             size: process.env.ORDER_SIZE || "1",
             order_type: 'market_order',
-            client_order_id: `vel_${now}`
+            client_order_id: `vel_${now}`,
+            // Trailing Stop Params
+            bracket_trail_amount: trailAmount,
+            bracket_stop_trigger_method: 'last_traded_price' 
         };
 
-        this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} @ ${price}`);
+        this.logger.info(`[Sniper] 鉢 FIRE ${asset} ${side.toUpperCase()} @ ${price} | Trail: ${trailAmount}`);
         await this.bot.placeOrder(payload);
     }
 
     // --- Unused ---
     onLaggerTrade(trade) {}
-    onPositionClose(asset) {}
-    getName() { return "LeadStrategy (Velocity 30ms)"; }
+    onPositionClose(asset) {
+        // Optional: Reset cooldown immediately on close if aggressive re-entry is desired
+        // this.lastTriggerTime[asset] = 0; 
+    }
+    getName() { return "LeadStrategy (Velocity 30ms + Trail)"; }
 }
 
 module.exports = LeadStrategy;
-
+            
