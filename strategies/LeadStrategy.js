@@ -24,7 +24,7 @@ class LeadStrategy {
         
         // --- 2. CVD FILTER ---
         this.CVD_WINDOW_MS = 50;         
-        this.CVD_THRESHOLD = 0.60;       
+        this.CVD_THRESHOLD = 0.75;       
         
         // --- 3. RISK ---
         this.SL_PCT = 0.00015; 
