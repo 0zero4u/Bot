@@ -11,11 +11,11 @@ class LeadStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.MOVE_THRESHOLD = 0.00030;     // 0.03% price change required
+        this.MOVE_THRESHOLD = 0.0002;     // 0.03% price change required
         this.TIME_LOOKBACK_MS = 30;        // Compare vs price 50ms ago
         this.IMBALANCE_RATIO = 0.53;       // 60% Order Book Support required
         this.COOLDOWN_MS = 1000;           // 1s cooldown after firing
-        this.TRAILING_PERCENT = 0.02;      // 0.02% Trailing Stop
+        this.TRAILING_PERCENT = 0.025;      // 0.02% Trailing Stop
 
         // --- ASSET SPECS ---
         this.assets = {
