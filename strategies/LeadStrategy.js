@@ -38,7 +38,7 @@ class LeadStrategy {
         // --- 5. ADAPTIVE THRESHOLD (CORRECTED) ---
         // FIX: Rank 0.99 allows the top 1% to be "extreme".
         // FIX: Clipping at 6.0 allows the threshold to float above 3.0 naturally.
-        this.QUANTILE_RANK = 0.9995;       
+        this.QUANTILE_RANK = 0.9999;       
         this.BUFFER_SIZE = 150000;         
         this.UPDATE_INTERVAL_MS = 5000;   
         this.MIN_THRESHOLD_FLOOR = 2.5;   
