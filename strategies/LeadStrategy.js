@@ -14,12 +14,12 @@ class LeadStrategy {
 
         // --- CONFIGURATION ---
         this.WARMUP_MS = 100000;
-        this.WINDOW_MS = 30;             
+        this.WINDOW_MS = 20;             
         this.IMBALANCE_THRESHOLD = 0.60; 
         
         // --- RISK MANAGEMENT (NORMALIZED) ---
-        this.SL_PCT = 0.0004; // 0.03% Stop Loss
-        this.TP_PCT = 0.0008; // 0.08% Take Profit
+        this.SL_PCT = 0.00015; // 0.03% Stop Loss
+        this.TP_PCT = 0.00085; // 0.08% Take Profit
         
         // --- VOLATILITY CONFIG (Time Based) ---
         this.VOL_HALF_LIFE_MS = 1000;    
@@ -29,7 +29,7 @@ class LeadStrategy {
         // --- ADAPTIVE THRESHOLD ---
         this.QUANTILE_RANK = 0.9995;      
         this.BUFFER_SIZE = 200000;        
-        this.UPDATE_INTERVAL_MS = 10000;  
+        this.UPDATE_INTERVAL_MS = 3000;  
         this.MIN_THRESHOLD_FLOOR = 3.0;  
         this.RESET_THRESHOLD_RATIO = 0.8; 
 
