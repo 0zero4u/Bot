@@ -1,11 +1,12 @@
-
 /**
  * AdvanceStrategy.js
- * v70.0 - INSTITUTIONAL FINAL
+ * v71.0 - INSTITUTIONAL FINAL [ALIGNED]
  * Features: Winsorized Stats, Dominance Burst, PROPORTIONAL LAG TRACKER
+ * Updates:
+ * - Aligned with Trader v68 interface (onDepthUpdate, onLaggerTrade)
+ * - Added onPositionClose & getName
+ * - Fixed Execution Payload strictness
  */
-
-const fs = require('fs');
 
 class RollingStats {
     constructor(windowSize = 50) {
@@ -64,6 +65,7 @@ class AdvanceStrategy {
             'SOL': { deltaId: 417,   precision: 3, lot: 0.1 }
         };
 
+        // Initialize Assets
         const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         this.assets = {};
         
@@ -78,7 +80,6 @@ class AdvanceStrategy {
                     lockedUntil: 0,
                     
                     // LAG TRACKING STATE
-                    // Stores: { t, dir, deltaStart, binanceBurstSize }
                     pendingBurst: null, 
                     
                     // STATS ENGINE
@@ -90,24 +91,67 @@ class AdvanceStrategy {
         });
 
         this.localInPosition = false;
-        this.logger.info(`[Strategy] Loaded V70 (Proportional Lag Tracker)`);
+        this.logger.info(`[Strategy] Loaded V71 (Aligned Interface)`);
+    }
+
+    // --- REQUIRED INTERFACE METHODS ---
+
+    getName() {
+        return "AdvanceStrategy (V71 Institutional)";
     }
 
     async start() {
         this.logger.info('[Strategy] Active.');
     }
 
-    handleMessage(msg) {
-        if (msg.type === 'B') {
-            this.onPriceUpdate(msg);
-        } else if (msg.type === 'trade' || msg.type === 'all_trades') {
-            const asset = Object.keys(this.assets).find(k => 
-                (msg.symbol && msg.symbol.includes(k)) || 
-                (msg.product_id && msg.product_id == this.specs[k].deltaId)
-            );
-            if (asset) this.onDeltaUpdate(asset, parseFloat(msg.price));
+    /**
+     * Called by Trader.js when a position is closed.
+     * Resets locks to allow immediate re-entry if conditions persist.
+     */
+    onPositionClose(asset) {
+        this.localInPosition = false;
+        if (this.assets[asset]) {
+            this.assets[asset].lockedUntil = 0; // Reset lock
+            this.assets[asset].pendingBurst = null; // Reset pending patterns
+            this.logger.info(`[Strategy] ${asset} Position Closed. Resetting locks.`);
         }
     }
+
+    /**
+     * Called by Trader.js when 'all_trades' arrives (Delta Lagger Feed)
+     */
+    onLaggerTrade(trade) {
+        const price = parseFloat(trade.price);
+        // Map symbol (e.g., BTCUSD -> BTC)
+        const asset = Object.keys(this.assets).find(k => trade.symbol && trade.symbol.includes(k));
+        
+        if (asset) {
+            this.onDeltaUpdate(asset, price);
+        }
+    }
+
+    /**
+     * Called by Trader.js when 'B' type (Binance Fast Feed) arrives
+     */
+    onDepthUpdate(asset, depthPayload) {
+        if (!this.assets[asset]) return;
+        
+        // Extract Best Bid/Ask from payload formatted by trader.js
+        // depthPayload = { bids: [[p, q]], asks: [[p, q]] }
+        const bb = parseFloat(depthPayload.bids[0][0]);
+        const ba = parseFloat(depthPayload.asks[0][0]);
+
+        // Construct standard object for internal logic
+        const updateData = {
+            s: asset,
+            bb: bb,
+            ba: ba
+        };
+
+        this.onPriceUpdate(updateData);
+    }
+
+    // --- INTERNAL LOGIC ---
 
     onDeltaUpdate(asset, price) {
         const assetData = this.assets[asset];
@@ -130,10 +174,6 @@ class AdvanceStrategy {
         }
     }
 
-    /**
-     * Checks if Delta has "caught up" to a previous Binance Burst.
-     * Uses PROPORTIONAL logic (e.g. 50% retracement of the burst).
-     */
     checkLagClosure(asset, currentDeltaPrice) {
         const data = this.assets[asset];
         if (!data.pendingBurst) return;
@@ -141,36 +181,29 @@ class AdvanceStrategy {
         const burst = data.pendingBurst;
         const elapsed = Date.now() - burst.t;
 
-        // Timeout: If 2 seconds passed, the connection is lost or lag is irrelevant
         if (elapsed > 2000) {
             data.pendingBurst = null;
             return;
         }
 
-        // Calculate Delta's move from the start of the burst
         const deltaMove = (currentDeltaPrice - burst.deltaStart);
         const deltaPct = deltaMove / burst.deltaStart;
-
-        // Compare Delta's move to Binance's original burst size
-        // We look for a ratio (e.g., Delta moved 0.3%, Binance moved 0.6% -> Ratio = 0.5)
         
         let catchUpRatio = 0;
         
         if (burst.dir === 1 && deltaPct > 0) {
             catchUpRatio = deltaPct / burst.binBurstSize;
         } else if (burst.dir === -1 && deltaPct < 0) {
-            catchUpRatio = deltaPct / burst.binBurstSize; // Both negative, ratio positive
+            catchUpRatio = deltaPct / burst.binBurstSize; 
         }
 
-        // If Delta has covered X% of the distance Binance traveled
         if (catchUpRatio >= this.LAG_CATCHUP_RATIO) {
             this.logLag(asset, elapsed, catchUpRatio);
-            data.pendingBurst = null; // Reset
+            data.pendingBurst = null; 
         }
     }
 
     logLag(asset, ms, ratio) {
-        // Log meaningful lag data
         if (ms > 50 || Math.random() < 0.1) {
             this.logger.info(`[LagTracker] ${asset} caught up ${(ratio*100).toFixed(0)}% in ${ms}ms`);
         }
@@ -211,24 +244,22 @@ class AdvanceStrategy {
         const totalRange = upImpulse + downImpulse;
 
         // --- LAG TRACKER REGISTRATION ---
-        // If we see a new burst, register it to watch Delta's reaction
-        // We only register if there isn't one pending (or we could overwrite if this one is bigger)
         if (!assetData.pendingBurst) {
-            const burstThreshold = this.MIN_BURST_VELOCITY * startPrice * 2.0; // Only track big moves
+            const burstThreshold = this.MIN_BURST_VELOCITY * startPrice * 2.0; 
             
             if (upImpulse > burstThreshold) {
                 assetData.pendingBurst = { 
                     t: now, 
                     dir: 1, 
                     deltaStart: assetData.deltaPrice,
-                    binBurstSize: upImpulse / startPrice // Store % size
+                    binBurstSize: upImpulse / startPrice 
                 };
             } else if (downImpulse > burstThreshold) {
                 assetData.pendingBurst = { 
                     t: now, 
                     dir: -1, 
                     deltaStart: assetData.deltaPrice,
-                    binBurstSize: -(downImpulse / startPrice) // Store % size (negative)
+                    binBurstSize: -(downImpulse / startPrice) 
                 };
             }
         }
@@ -242,9 +273,6 @@ class AdvanceStrategy {
 
         const rawGap = (midPrice - assetData.deltaPrice) / assetData.deltaPrice;
         const adjustedGap = rawGap - assetData.emaBasis;
-
-        // SIGNAL ISOLATION:
-        // We update stats LATER, only if we DON'T trade.
 
         let direction = null;
 
@@ -271,11 +299,9 @@ class AdvanceStrategy {
         }
 
         if (direction) {
-            // EXECUTE (Do not update stats)
             await this.executeSniper(asset, direction, midPrice, assetData.deltaPrice, adjustedGap, dynamicThreshold);
         } else {
-            // NO TRADE -> Safe to update stats (Winsorized)
-            // But only if it's not a massive outlier (e.g. > 4 sigma) that we ignored for other reasons
+            // Stats update (Winsorized)
             if (Math.abs(adjustedGap) < dynamicThreshold * 2.0) {
                 assetData.gapStats.add(adjustedGap, 3.0); 
             }
@@ -289,20 +315,23 @@ class AdvanceStrategy {
 
         try {
             this.assets[asset].lockedUntil = Date.now() + this.LOCK_DURATION_MS;
-            const clientOid = `sniper-${Date.now()}`;
+            const clientOid = `adv_${Date.now()}`;
             
             this.logger.info(`[Sniper] ⚡ TRIGGER ${asset} ${side.toUpperCase()} | Gap: ${(gap*100).toFixed(4)}% | Thresh: ${(thresholdUsed*100).toFixed(4)}%`);
 
+            // Calculate Trail
             const trailValue = delPrice * (this.TRAILING_PERCENT / 100);
             const trailFixed = trailValue.toFixed(spec.precision);
 
+            // [ALIGNED] Payload matches MicroStrategy strictness
             const payload = { 
                 product_id: spec.deltaId.toString(), 
                 size: spec.lot.toString(), 
                 side: side, 
                 order_type: 'market_order',              
                 bracket_trail_amount: trailFixed, 
-                bracket_stop_trigger_method: 'last_traded_price',
+                // Using mark_price for trail trigger is safer and standard in MicroStrategy
+                bracket_stop_trigger_method: 'mark_price', 
                 client_order_id: clientOid
             };
             
@@ -312,6 +341,7 @@ class AdvanceStrategy {
 
             if (orderResult && orderResult.success) {
                  this.logger.info(`[Sniper] 🎯 FILLED ${asset} | Latency: ${latency}ms | Trail: ${trailFixed}`);
+                 // Don't clear localInPosition immediately; wait for onPositionClose or timeout
                  setTimeout(() => { this.localInPosition = false; }, this.LOCK_DURATION_MS);
             } else {
                 this.logger.error(`[Sniper] 💨 MISS: ${orderResult ? orderResult.error : 'Unknown'}`);
@@ -328,4 +358,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-                    
+                
