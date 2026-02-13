@@ -278,7 +278,7 @@ class LeadStrategy {
             // "See how it's done" -> Direct string formatting
             bracket_stop_loss_price: slString,
             bracket_take_profit_price: tpString,
-            bracket_stop_trigger_method: 'mark_price'
+            bracket_stop_trigger_method: 'last_traded_price'
         };
 
         this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side.toUpperCase()} @ ${price} | TP: ${tpString} | SL: ${slString}`);
