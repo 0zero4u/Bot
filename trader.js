@@ -1,6 +1,7 @@
 /**
  * trader.js
  * ALIGNED WITH LEAD STRATEGY v16 + MARKET LISTENER
+ * Fixes: Now routes 'T' (Trade) messages to strategy for CVD calculation.
  */
 
 const WebSocket = require('ws');
@@ -71,15 +72,14 @@ class TradingBot {
         // Position & Execution State
         this.activePositions = {};
         this.orderLatencies = new Map(); 
-        this.isOrderInProgress = false; 
-
+        
+        // Default assets if env is missing
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         
         this.targetAssets.forEach(asset => {
             this.activePositions[asset] = false;
         });
 
-        this.isStateSynced = false;
         this.pingInterval = null; 
         this.heartbeatTimeout = null;
         this.restKeepAliveInterval = null;
@@ -88,7 +88,7 @@ class TradingBot {
         try {
             const StrategyClass = require(`./strategies/${this.config.strategy}Strategy.js`);
             this.strategy = new StrategyClass(this);
-            this.logger.info(`Successfully loaded strategy: ${this.strategy.getName()}`);
+            this.logger.info(`✅ Strategy Loaded: ${this.strategy.getName()}`);
         } catch (e) {
             this.logger.error(`FATAL: Could not load strategy: ${e.message}`);
             process.exit(1);
@@ -127,7 +127,7 @@ class TradingBot {
             try {
                 await this.client.getWalletBalance();
             } catch (error) {
-                this.logger.warn(`[Keep-Alive] Check Failed: ${error}`);
+                // Silent catch for keep-alive
             }
         }, 29000);
     }
@@ -284,7 +284,6 @@ class TradingBot {
                     }
                 }
             });
-            this.isStateSynced = true;
             this.logger.info(`Position State Synced: ${JSON.stringify(this.activePositions)}`);
         } catch (error) {
             this.logger.error(`Failed to sync position state: ${error}`);
@@ -296,7 +295,7 @@ class TradingBot {
         return Object.values(this.activePositions).some(status => status === true);
     }
 
-    // --- SIGNAL HANDLING (Updated for CVD) ---
+    // --- SIGNAL HANDLING (CRITICAL FIXES HERE) ---
     async handleSignalMessage(message) {
         if (!this.authenticated) return;
         try {
@@ -307,7 +306,6 @@ class TradingBot {
                 const asset = data.s;
                 if (!this.targetAssets.includes(asset)) return;
                 
-                // Format for strategy
                 const depthPayload = {
                     bids: [[ data.bb, data.bq ]], 
                     asks: [[ data.ba, data.aq ]]  
@@ -317,16 +315,16 @@ class TradingBot {
                     this.strategy.onDepthUpdate(asset, depthPayload);
                 }
             } 
-            // 2. TRADE/CVD UPDATE (Type 'T') - [ADDED MISSING LOGIC]
+            // 2. TRADE/CVD UPDATE (Type 'T') - [NOW ENABLED]
             else if (data.type === 'T') {
-                if (this.strategy.onExternalTrade) {
-                    // Pass full data object: { s, p, q, side, t }
+                const asset = data.s;
+                if (this.targetAssets.includes(asset) && this.strategy.onExternalTrade) {
                     this.strategy.onExternalTrade(data);
                 }
             }
-            // 3. GENERIC DEPTH
+            // 3. GENERIC UPDATE
             else if (data.type === 'depthUpdate') {
-                if (this.strategy.onDepthUpdate && data.symbol && data.bids) {
+                if (this.strategy.onDepthUpdate && data.symbol) {
                    this.strategy.onDepthUpdate(data.symbol, data);
                 }
             }
@@ -349,7 +347,6 @@ class TradingBot {
         if (orderData.client_order_id) {
             this.recordOrderPunch(orderData.client_order_id);
         }
-        
         try {
             const result = await this.client.placeOrder(orderData);
             return result;
@@ -379,4 +376,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                   
+                
