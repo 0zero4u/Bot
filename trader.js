@@ -1,6 +1,9 @@
 /**
  * trader.js
- * 
+ * v70.0 [CVD SUPPORT ADDED]
+ * 1. Protocol: Supports market_listener 'B' (Book) AND 'T' (Trade) types.
+ * 2. Execution: Uses Rust Native Client.
+ * 3. Routing: Routes 'T' messages to strategy.onExternalTrade for CVD Filter.
  */
 
 const WebSocket = require('ws');
@@ -71,8 +74,6 @@ class TradingBot {
         // Position & Execution State
         this.activePositions = {};
         this.orderLatencies = new Map(); 
-        this.isOrderInProgress = false; // [FIX] Initialize explicitly
-
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         
         this.targetAssets.forEach(asset => {
@@ -106,7 +107,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v69.0) ---`);
+        this.logger.info(`--- Bot Initializing (v70.0 CVD) ---`);
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
@@ -194,7 +195,6 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        
         this.logger.info(`Subscribing to Execution Channels: Orders, Positions, User Trades`);
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
@@ -235,10 +235,13 @@ class TradingBot {
                 }
                 break;
             
-            // 
-
             case 'user_trades':
-                this.measureLatency(message);
+                // We track latency here, but strategy execution happens in handleSignalMessage
+                if (Array.isArray(message.data)) {
+                     message.data.forEach(trade => this.measureLatency(trade));
+                } else {
+                     this.measureLatency(message);
+                }
                 break;
         }
     }
@@ -247,7 +250,9 @@ class TradingBot {
         const clientOid = trade.client_order_id;
         if (clientOid && this.orderLatencies.has(clientOid)) {
             const t0 = this.orderLatencies.get(clientOid);
-            const t1 = parseInt(trade.timestamp) / 1000;
+            // Delta timestamp is in microseconds mostly, or milliseconds. 
+            // Standardizing to ms:
+            const t1 = parseInt(trade.timestamp) / 1000; 
             const latency = t1 - t0;
             this.logger.info(`[LATENCY] ⚡ ${trade.symbol} | OID:${clientOid} | Delay: ${latency.toFixed(2)}ms`);
             this.orderLatencies.delete(clientOid);
@@ -299,35 +304,55 @@ class TradingBot {
         return Object.values(this.activePositions).some(status => status === true);
     }
 
+    // --- CORE STRATEGY ROUTING ---
     async handleSignalMessage(message) {
-        if (!this.authenticated) return;
+        if (!this.authenticated) return; // Wait for Exchange Auth before processing signals
         try {
             const data = JSON.parse(message.toString());
-            // Support 'B' (Binance BookTicker) and generic 'depthUpdate'
+            
+            // 1. BOOK TICKER (Price) -> STRATEGY CORE
             if (data.type === 'B') {
                 const asset = data.s;
-                if (!this.targetAssets.includes(asset)) return;
+                // Only process target assets
+                // if (!this.targetAssets.includes(asset)) return; // Optional optimization
+
+                // Convert flat fields to 'depth' format expected by LeadStrategy
                 const depthPayload = {
                     bids: [[ data.bb, data.bq ]], 
                     asks: [[ data.ba, data.aq ]]  
                 };
-                if (this.strategy.onDepthUpdate) {
+                
+                if (this.strategy && this.strategy.onDepthUpdate) {
                     this.strategy.onDepthUpdate(asset, depthPayload);
                 }
-            } else if (data.type === 'depthUpdate') {
+            } 
+            
+            // 2. AGG TRADE (CVD) -> STRATEGY FILTER (NEW)
+            else if (data.type === 'T') {
+                if (this.strategy && this.strategy.onExternalTrade) {
+                    this.strategy.onExternalTrade(data);
+                }
+            }
+            
+            // 3. LEGACY SUPPORT (Standard depthUpdate)
+            else if (data.type === 'depthUpdate') {
                 if (this.strategy.onDepthUpdate && data.symbol && data.bids) {
                    this.strategy.onDepthUpdate(data.symbol, data);
                 }
             }
+
         } catch (error) {
-            this.logger.error("Error handling signal message:", error);
+            // Squelch JSON parse errors for speed, but log others
+            if (!error.message.includes('JSON')) {
+                this.logger.error("Signal Error:", error);
+            }
         }
     }
     
     setupHttpServer() {
         const httpServer = new WebSocket.Server({ port: this.config.port });
         httpServer.on('connection', ws => {
-            this.logger.info('External Data Feed Connected');
+            this.logger.info('External Data Feed Connected (Market Listener)');
             ws.on('message', m => this.handleSignalMessage(m));
             ws.on('error', (err) => this.logger.error('Signal listener error:', err));
         });
@@ -373,4 +398,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-    
+                     
