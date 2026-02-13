@@ -5,9 +5,8 @@
  * - Type 'B' (BookTicker - Price)
  * - Type 'T' (AggTrade - CVD Volume)
  * * FEATURES:
- * - Correct Spot URL (Port 9443)
+ * - 10s Heartbeat Log
  * - Watchdog Safety
- * - CVD Data Parsing
  */
 const WebSocket = require('ws');
 const winston = require('winston');
@@ -56,13 +55,12 @@ function connectToInternal() {
 
 // --- 2. CONNECT TO BINANCE SPOT ---
 function connectBinance() {
-    // Note: Spot streams must be Lowercase
     const streams = config.assets.flatMap(a => [
         `${a.toLowerCase()}usdt@bookTicker`,
         `${a.toLowerCase()}usdt@aggTrade`
     ]).join('/');
 
-    // CORRECT URL FOR SPOT
+    // SPOT URL
     const url = `wss://stream.binance.com:9443/stream?streams=${streams}`;
 
     logger.info(`[Binance Spot] Connecting...`);
@@ -89,7 +87,7 @@ function connectBinance() {
             const eventType = msg.data.e;
             const asset = msg.data.s.replace('USDT', '');
 
-            // 1. PRICE UPDATE (BookTicker)
+            // 1. PRICE UPDATE
             if (eventType === 'bookTicker') {
                 const payload = {
                     type: 'B',
@@ -101,11 +99,9 @@ function connectBinance() {
                 };
                 internalWs.send(JSON.stringify(payload));
             } 
-            // 2. CVD UPDATE (AggTrade)
+            // 2. CVD UPDATE
             else if (eventType === 'aggTrade') {
-                // SPOT LOGIC: 
-                // m = true -> Buyer is Maker -> Taker is Seller -> SELL SIDE
-                // m = false -> Seller is Maker -> Taker is Buyer -> BUY SIDE
+                // Spot Logic: m=true -> Taker Sold
                 const isSell = msg.data.m; 
                 
                 const payload = {
@@ -113,7 +109,7 @@ function connectBinance() {
                     s: asset,
                     p: parseFloat(msg.data.p),
                     q: parseFloat(msg.data.q),
-                    side: isSell ? 'sell' : 'buy', // Correctly interpreted
+                    side: isSell ? 'sell' : 'buy',
                     t: msg.data.T
                 };
                 internalWs.send(JSON.stringify(payload));
@@ -133,5 +129,13 @@ function connectBinance() {
     });
 }
 
+// --- 3. ALIVENESS LOG (10s) ---
+setInterval(() => {
+    if (binanceWs && binanceWs.readyState === WebSocket.OPEN) {
+        logger.info(`[Listener] 💓 Alive | Mode: Spot | Watchdog: OK`);
+    }
+}, 10000);
+
 connectToInternal();
 connectBinance();
+        
