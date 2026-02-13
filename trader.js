@@ -1,9 +1,6 @@
 /**
  * trader.js
- * v68.0 [ALL_TRADES FIXED + LATENCY TRACKING]
- * 1. Protocol: Supports market_listener v4.0 'depthUpdate' AND 'B' types.
- * 2. Execution: Uses Rust Native Client.
- * 3. Correction: Routes 'all_trades' to strategy for Kalman Filter correction.
+ * v69.0 [CLEANED + NO ALL_TRADES + LOCK FIX]
  */
 
 const WebSocket = require('ws');
@@ -12,7 +9,6 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 // --- Rust Native Client Integration ---
-// Fallback if fast-client is missing during dev, but required for prod
 let DeltaClient;
 try {
     const { DeltaNativeClient } = require('fast-client');
@@ -24,13 +20,12 @@ try {
 
 // --- Configuration ---
 const config = {
-    strategy: process.env.STRATEGY || 'Lead', // Default to Lead Strategy
+    strategy: process.env.STRATEGY || 'Lead', 
     port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
     apiSecret: process.env.DELTA_API_SECRET,
-    // These are general defaults; strategy defines specific assets
     logLevel: process.env.LOG_LEVEL || 'info',
     reconnectInterval: parseInt(process.env.RECONNECT_INTERVAL || '5000'),
     pingIntervalMs: parseInt(process.env.PING_INTERVAL_MS || '30000'),
@@ -58,18 +53,6 @@ const logger = winston.createLogger({
     ]
 });
 
-// --- Validation ---
-function validateConfig() {
-    const required = ['apiKey', 'apiSecret'];
-    const missing = required.filter(key => !config[key]);
-    if (missing.length > 0) {
-        logger.error(`FATAL: Missing config: ${missing.join(', ')}`);
-        process.exit(1);
-    }
-    logger.info(`API Key Loaded: ${config.apiKey.substring(0, 4)}...${config.apiKey.slice(-4)}`);
-}
-validateConfig();
-
 class TradingBot {
     constructor(botConfig) {
         this.config = { ...botConfig };
@@ -85,13 +68,13 @@ class TradingBot {
         this.ws = null; 
         this.authenticated = false;
 
-        // Position & Latency Tracking
+        // Position & Execution State
         this.activePositions = {};
         this.orderLatencies = new Map(); 
+        this.isOrderInProgress = false; // [FIX] Initialize explicitly
 
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         
-        // Initialize State
         this.targetAssets.forEach(asset => {
             this.activePositions[asset] = false;
         });
@@ -114,10 +97,7 @@ class TradingBot {
 
     // --- Latency Helper ---
     recordOrderPunch(clientOrderId) {
-        // Record T0: The moment we decided to send
         this.orderLatencies.set(clientOrderId, Date.now());
-        
-        // Auto-cleanup after 60s
         setTimeout(() => {
             if (this.orderLatencies.has(clientOrderId)) {
                 this.orderLatencies.delete(clientOrderId);
@@ -126,9 +106,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v68.0 - All Trades Fix) ---`);
-
-        // --- 1. WARM UP CONNECTION ---
+        this.logger.info(`--- Bot Initializing (v69.0) ---`);
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
@@ -147,7 +125,6 @@ class TradingBot {
         if (this.restKeepAliveInterval) clearInterval(this.restKeepAliveInterval);
         this.restKeepAliveInterval = setInterval(async () => {
             try {
-                // Periodically fetch balance to keep Rust TCP pool active
                 await this.client.getWalletBalance();
             } catch (error) {
                 this.logger.warn(`[Keep-Alive] Check Failed: ${error}`);
@@ -217,19 +194,16 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        const symbols = this.targetAssets.map(asset => `${asset}USD`); // Adjust based on Delta format (e.g. BTCUSD or BTCUSDT)
-        this.logger.info(`Subscribing to Execution Channels: ${symbols.join(', ')}`);
-
+        // [FIX] Removed 'all_trades'
+        this.logger.info(`Subscribing to Execution Channels: Orders, Positions, User Trades`);
         this.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: [
             { name: 'orders', symbols: ['all'] },
             { name: 'positions', symbols: ['all'] },
-            { name: 'all_trades', symbols: symbols },
             { name: 'user_trades', symbols: ['all'] } 
         ]}}));
     }
 
     handleWebSocketMessage(message) {
-        // 1. Auth Handling
         if (
             (message.type === 'success' && message.message === 'Authenticated') ||
             (message.type === 'key-auth' && message.status === 'authenticated') ||
@@ -243,16 +217,11 @@ class TradingBot {
             return;
         }
 
-        if (message.type === 'error' && !this.authenticated) {
-            this.logger.error(`❌ AUTH FAILED. Error Code: ${message.error ? message.error.code : 'Unknown'}`);
-        }
-
         if (message.type === 'pong') {
             this.resetHeartbeatTimeout();
             return;
         }
 
-        // 2. Data Handling
         switch (message.type) {
             case 'orders':
                 if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
@@ -266,29 +235,7 @@ class TradingBot {
                 }
                 break;
             
-            // [CRITICAL FIX] Handle Public Trades for Kalman Correction
-            case 'all_trades':
-                if (this.strategy.onLaggerTrade) {
-                    // Normalize data: Delta sometimes sends single object, sometimes array in 'data', sometimes implicit
-                    let trades = [];
-                    if (Array.isArray(message.data)) {
-                        trades = message.data;
-                    } else if (message.symbol && message.price) {
-                        trades = [message];
-                    } else if (message.data && message.data.price) {
-                        trades = [message.data];
-                    }
-
-                    // Enforce symbol presence
-                    trades.forEach(trade => {
-                        // Inherit symbol from parent if missing in trade object
-                        if (!trade.symbol && message.symbol) {
-                            trade.symbol = message.symbol;
-                        }
-                        this.strategy.onLaggerTrade(trade);
-                    });
-                }
-                break;
+            // [FIX] 'all_trades' case REMOVED
 
             case 'user_trades':
                 this.measureLatency(message);
@@ -296,28 +243,17 @@ class TradingBot {
         }
     }
 
-    // --- Latency Calculation Logic ---
     measureLatency(trade) {
         const clientOid = trade.client_order_id;
-        
-        // Only track if it's OUR order
         if (clientOid && this.orderLatencies.has(clientOid)) {
-            const t0 = this.orderLatencies.get(clientOid); // Punch Time (Local)
-            const t1 = parseInt(trade.timestamp) / 1000;   // Engine Time (Exchange)
+            const t0 = this.orderLatencies.get(clientOid);
+            const t1 = parseInt(trade.timestamp) / 1000;
             const latency = t1 - t0;
-
-            let logMsg = `[LATENCY] ⚡ ${trade.symbol} | OID:${clientOid} | T0:${t0} | T1:${t1.toFixed(0)} | Delay: ${latency.toFixed(2)}ms`;
-            
-            if (latency < 0) logMsg += " ⚠️ (Clock Drift Detected!)";
-            else if (latency < 60) logMsg += " 🚀 (Fast)";
-            else if (latency > 250) logMsg += " 🐢 (Slow)";
-
-            this.logger.info(logMsg);
+            this.logger.info(`[LATENCY] ⚡ ${trade.symbol} | OID:${clientOid} | Delay: ${latency.toFixed(2)}ms`);
             this.orderLatencies.delete(clientOid);
         }
     }
 
-    // --- State Management ---
     handlePositionUpdate(pos) {
         if (!pos.product_symbol) return;
         const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
@@ -328,12 +264,9 @@ class TradingBot {
 
             if (this.activePositions[asset] !== isOpen) {
                 this.activePositions[asset] = isOpen;
-
-                // IMMEDIATELY RESET STRATEGY COOLDOWN IF CLOSED
                 if (!isOpen && this.strategy.onPositionClose) {
                     this.strategy.onPositionClose(asset);
                 }
-
                 this.logger.info(`[POS UPDATE] ${asset} is now ${isOpen ? 'OPEN' : 'CLOSED'} (Size: ${size})`);
             }
         }
@@ -343,7 +276,6 @@ class TradingBot {
         try {
             const response = await this.client.getPositions();
             const positions = response.result || [];
-            
             this.targetAssets.forEach(a => this.activePositions[a] = false);
 
             positions.forEach(pos => {
@@ -352,7 +284,6 @@ class TradingBot {
                     const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
                     if (asset) {
                         this.activePositions[asset] = true;
-                        this.logger.info(`[SYNC] Found OPEN position for ${asset}: ${size}`);
                     }
                 }
             });
@@ -368,34 +299,24 @@ class TradingBot {
         return Object.values(this.activePositions).some(status => status === true);
     }
 
-    // --- External Feed Handler ---
     async handleSignalMessage(message) {
         if (!this.authenticated) return;
-
         try {
             const data = JSON.parse(message.toString());
-            
-            // 1. market_listener v4.0 (Raw BookTicker format from Binance)
-            // Expects: { type: 'B', s: 'BTC', bb: ..., ba: ... }
+            // Support 'B' (Binance BookTicker) and generic 'depthUpdate'
             if (data.type === 'B') {
                 const asset = data.s;
                 if (!this.targetAssets.includes(asset)) return;
-
                 const depthPayload = {
                     bids: [[ data.bb, data.bq ]], 
                     asks: [[ data.ba, data.aq ]]  
                 };
-
                 if (this.strategy.onDepthUpdate) {
-                    // Fire-and-forget to avoid blocking event loop
                     this.strategy.onDepthUpdate(asset, depthPayload);
                 }
-            }
-            
-            // 2. Generic depthUpdate (Forward compatibility)
-            else if (data.type === 'depthUpdate') {
-                if (this.strategy.execute) {
-                    await this.strategy.execute(data);
+            } else if (data.type === 'depthUpdate') {
+                if (this.strategy.onDepthUpdate && data.symbol && data.bids) {
+                   this.strategy.onDepthUpdate(data.symbol, data);
                 }
             }
         } catch (error) {
@@ -406,20 +327,30 @@ class TradingBot {
     setupHttpServer() {
         const httpServer = new WebSocket.Server({ port: this.config.port });
         httpServer.on('connection', ws => {
-            this.logger.info('External Data Feed Connected (Market Listener)');
+            this.logger.info('External Data Feed Connected');
             ws.on('message', m => this.handleSignalMessage(m));
-            ws.on('close', () => this.logger.warn('External Feed Disconnected'));
             ws.on('error', (err) => this.logger.error('Signal listener error:', err));
         });
         this.logger.info(`Internal Data Server running on port ${this.config.port}`);
     }
     
+    // [FIX] Enhanced Place Order with Debugging
     async placeOrder(orderData) {
-        // Record timestamp for latency tracking logic
         if (orderData.client_order_id) {
             this.recordOrderPunch(orderData.client_order_id);
         }
-        return this.client.placeOrder(orderData);
+        
+        try {
+            // Log payload for debugging if needed (remove in prod if too noisy)
+            // this.logger.info(`[SENDING] ${JSON.stringify(orderData)}`);
+            
+            const result = await this.client.placeOrder(orderData);
+            return result;
+        } catch (error) {
+            this.logger.error(`[ORDER FAIL] Native Client Error: ${error.message || error}`);
+            // Re-throw so strategy knows it failed
+            throw error; 
+        }
     }
     
     handleOrderUpdate(orderUpdate) {
@@ -434,12 +365,9 @@ class TradingBot {
     try {
         const bot = new TradingBot(config);
         await bot.start();
-        
         process.on('uncaughtException', async (err) => {
             logger.error('Uncaught Exception:', err);
-            // Don't exit on minor errors, but careful with state
         });
-        
     } catch (error) {
         logger.error("Failed to start bot:", error);
         process.exit(1);
