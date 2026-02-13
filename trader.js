@@ -1,11 +1,10 @@
-
 /**
  * trader.js
  * ALIGNED WITH LEAD STRATEGY v16 + MARKET LISTENER v3
  * Fixes:
- * 1. Subscribes to 'all_trades' (Delta Lagger Feed).
- * 2. Routes 'all_trades' to strategy to fix "Waiting for data...".
- * 3. Starts Strategy Explicitly.
+ * 1. Automatically appends "USD" to assets for 'all_trades' subscription (e.g., XRP -> XRPUSD).
+ * 2. Explicitly starts Strategy (enables Heartbeat/Warmup).
+ * 3. Trims spaces from TARGET_ASSETS to prevent connection errors.
  */
 
 const WebSocket = require('ws');
@@ -78,8 +77,14 @@ class TradingBot {
         this.activePositions = {};
         this.orderLatencies = new Map(); 
         
-        // Default assets if env is missing
-        this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
+        // --- ASSET LOADING (FIXED) ---
+        // 1. Load from Env
+        // 2. Split by comma
+        // 3. Trim spaces (Fixes " XRP" issue)
+        // 4. Uppercase
+        this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL')
+            .split(',')
+            .map(a => a.trim().toUpperCase());
         
         this.targetAssets.forEach(asset => {
             this.activePositions[asset] = false;
@@ -111,7 +116,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v70.0 - Full Data) ---`);
+        this.logger.info(`--- Bot Initializing (v71.0 - Auto USD Parsing) ---`);
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
@@ -203,9 +208,13 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        this.logger.info(`Subscribing to: Orders, Positions, User Trades, All Trades`);
+        // --- ⚡ FIX: GENERATE "USD" PAIRS AUTOMATICALLY ---
+        // Maps ['XRP'] -> ['XRPUSD']
+        const tradeSymbols = this.targetAssets.map(asset => `${asset}USD`);
         
-        // ⚡ HERE IS THE FIX: Added "all_trades" for "futures"
+        this.logger.info(`Subscribing to: Orders, Positions, User Trades`);
+        this.logger.info(`Subscribing to All Trades for: ${tradeSymbols.join(', ')}`);
+        
         this.ws.send(JSON.stringify({ 
             type: 'subscribe', 
             payload: { 
@@ -213,7 +222,7 @@ class TradingBot {
                     { name: 'orders', symbols: ['all'] },
                     { name: 'positions', symbols: ['all'] },
                     { name: 'user_trades', symbols: ['all'] },
-                    { name: 'all_trades', symbols: ['futures'] } // Subscribe to all futures trades
+                    { name: 'all_trades', symbols: tradeSymbols } // ⚡ Subscription Fixed
                 ]
             }
         }));
@@ -241,13 +250,9 @@ class TradingBot {
         switch (message.type) {
             // ⚡ 1. Handle Public Trades (The Delta Price Feed)
             case 'all_trades':
-                // Check if it's a snapshot (array) or single update
                 if (Array.isArray(message.data)) {
-                     // Snapshot (ignore or process latest)
-                     const latest = message.data[0]; // Usually latest is first or last, check docs. 
-                     // For Delta, snapshots are usually historical. We prefer real-time.
-                     // But we can use the first one to init price.
-                     if(latest) this.forwardTradeToStrategy(latest);
+                     // If snapshot, take the first valid one
+                     if(message.data.length > 0) this.forwardTradeToStrategy(message.data[0]);
                 } else {
                      this.forwardTradeToStrategy(message);
                 }
@@ -273,7 +278,6 @@ class TradingBot {
 
     // ⚡ Helper to forward 'all_trades' to Strategy
     forwardTradeToStrategy(tradeData) {
-        // tradeData structure: { symbol: "BTCUSD", price: "100", size: "1", ... }
         if (this.strategy && this.strategy.onLaggerTrade) {
             this.strategy.onLaggerTrade(tradeData);
         }
@@ -405,3 +409,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
+                                     
