@@ -1,9 +1,9 @@
 /**
  * ============================================================================
- * LEAD STRATEGY v16: HYBRID (ORIGINAL v12 LOGIC + CVD FILTER)
- * * Base Logic: 30ms Rolling Window Return (Restored)
- * * Filter: Zero-Latency CVD Accumulator (Added)
- * * Execution: Bracket Orders (Original)
+ * LEAD STRATEGY v16: HYBRID (ALIGNED)
+ * * Base Logic: 30ms Rolling Window Return
+ * * Filter: Zero-Latency CVD Accumulator (Active)
+ * * Status: Heartbeat visible every 10s
  * ============================================================================
  */
 
@@ -12,14 +12,14 @@ class LeadStrategy {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- 1. ORIGINAL CONFIGURATION (RESTORED) ---
+        // --- 1. CONFIGURATION ---
         this.WARMUP_MS = 100000;         
-        this.WINDOW_MS = 30;             // Critical: 30ms Lookback
-        this.IMBALANCE_THRESHOLD = 0.60; // Critical: Book Imbalance
+        this.WINDOW_MS = 30;             
+        this.IMBALANCE_THRESHOLD = 0.60; 
         
-        // --- 2. NEW: CVD FILTER CONFIG ---
-        this.CVD_WINDOW_MS = 100;        // 100ms Volume Lookback
-        this.CVD_THRESHOLD = 0.60;       // 60% Volume Dominance
+        // --- 2. CVD FILTER CONFIG ---
+        this.CVD_WINDOW_MS = 100;        
+        this.CVD_THRESHOLD = 0.60;       
         
         // --- 3. RISK MANAGEMENT ---
         this.SL_PCT = 0.00015; 
@@ -48,7 +48,6 @@ class LeadStrategy {
         // --- STATE INITIALIZATION ---
         this.startTime = Date.now();
         
-        // Strategy State (v12)
         this.history = {};      
         this.volState = {};     
         this.zBuffer = {};      
@@ -57,12 +56,9 @@ class LeadStrategy {
         this.dynamicThresholds = {}; 
         this.triggerState = {}; 
         this.pendingSignals = []; 
-
-        // CVD State (v16)
         this.cvdState = {};
 
         Object.keys(this.specs).forEach(a => {
-            // v12 Init
             this.history[a] = [];
             this.volState[a] = { variance: 0.000001, lastTime: Date.now() };
             this.zBuffer[a] = new Float32Array(this.BUFFER_SIZE); 
@@ -70,8 +66,8 @@ class LeadStrategy {
             this.zCount[a] = 0;
             this.dynamicThresholds[a] = 5.0; 
             this.triggerState[a] = { isFiring: false, lastFire: 0 };
-
-            // v16 Init (CVD Accumulator)
+            
+            // CVD State Init
             this.cvdState[a] = {
                 queue: [],
                 buySum: 0,
@@ -79,14 +75,14 @@ class LeadStrategy {
             };
         });
 
-        this.logger.info(`[LeadStrategy v16] 🛡️ Ready. Window: ${this.WINDOW_MS}ms | CVD: ${this.CVD_WINDOW_MS}ms`);
+        this.logger.info(`[LeadStrategy v16] 🛡️ Ready. Waiting for Data...`);
 
         setInterval(() => this.updateThresholds(), this.UPDATE_INTERVAL_MS);
         this.startHeartbeat();
     }
 
     // ============================================================
-    // PART 1: CVD INGESTION (Zero Latency Accumulator)
+    // PART 1: CVD INGESTION (Now actively fed by Trader)
     // ============================================================
     onExternalTrade(trade) {
         const cvd = this.cvdState[trade.s];
@@ -121,7 +117,6 @@ class LeadStrategy {
         const cvd = this.cvdState[asset];
         const total = cvd.buySum + cvd.sellSum;
         
-        // Strict Mode: If no volume in 100ms, assume fake-out and block.
         if (total <= 0) return false; 
 
         if (signalSide === 'buy') return (cvd.buySum / total) >= this.CVD_THRESHOLD;
@@ -129,7 +124,7 @@ class LeadStrategy {
     }
 
     // ============================================================
-    // PART 2: CORE LOGIC (Restored v12)
+    // PART 2: CORE LOGIC
     // ============================================================
     updateThresholds() {
         Object.keys(this.specs).forEach(asset => {
@@ -137,7 +132,6 @@ class LeadStrategy {
             if (count < 500) return; 
 
             const view = this.zBuffer[asset].subarray(0, count);
-            // Optimization: Don't sort full array every time if huge
             const sorted = Float32Array.from(view).sort();
             const index = Math.floor(sorted.length * this.QUANTILE_RANK);
             const newThreshold = sorted[index];
@@ -155,10 +149,8 @@ class LeadStrategy {
         const bestAsk = parseFloat(depth.asks[0][0]);
         const currentPrice = (bestBid + bestAsk) / 2; 
 
-        // 2. Edge Decay Logging (Restored)
         this.checkEdgeDecay(asset, now, currentPrice);
 
-        // 3. History Buffer (Restored 30ms Window Logic)
         const history = this.history[asset];
         history.push({ p: currentPrice, t: now });
         if (history.length > 250) history.shift(); 
@@ -215,7 +207,7 @@ class LeadStrategy {
                 let side = null;
                 let executionPrice = currentPrice; 
 
-                // A. Check Direction & Book Imbalance (Original v12)
+                // A. Check Direction & Book Imbalance
                 if (zScore > 0 && (bidQty / totalQty) >= this.IMBALANCE_THRESHOLD) {
                     side = 'buy';
                     executionPrice = bestAsk; 
@@ -226,8 +218,7 @@ class LeadStrategy {
                 }
 
                 if (side) {
-                    // B. Check CVD Filter (New v16)
-                    // "Does the volume flow confirm this imbalance?"
+                    // B. Check CVD Filter
                     const cvdConfirmed = this.getInstantCVD(asset, side);
                     
                     if (cvdConfirmed) {
@@ -236,7 +227,6 @@ class LeadStrategy {
                         const sigId = `z16_${now}`;
                         this.logger.info(`[SIGNAL ${asset}] ⚡ IMPULSE! Z=${zScore.toFixed(2)} | CVD: OK ✅`);
                         
-                        // Log Signal for Edge Tracking
                         this.pendingSignals.push({
                             id: sigId,
                             asset: asset,
@@ -249,9 +239,6 @@ class LeadStrategy {
                         });
 
                         await this.tryExecute(asset, side, executionPrice, sigId);
-                    } else {
-                        // Optional: Log rejection
-                        // this.logger.debug(`[FILTER] ${asset} Z-Score OK but CVD Rejected.`);
                     }
                 }
             }
@@ -261,7 +248,7 @@ class LeadStrategy {
     }
 
     // ============================================================
-    // PART 3: UTILITIES & EXECUTION (Restored v12)
+    // PART 3: UTILITIES & EXECUTION
     // ============================================================
     checkEdgeDecay(asset, now, currentPrice) {
         for (let i = this.pendingSignals.length - 1; i >= 0; i--) {
@@ -288,7 +275,8 @@ class LeadStrategy {
     logEdge(sig, duration, currentPrice) {
         const rawMove = (currentPrice - sig.entryPrice) / sig.entryPrice;
         const pnlPct = sig.side === 'buy' ? rawMove : -rawMove;
-        const icon = pnlPct > 0 ? '🟢' : '🔴';
+        // Optional: Enable to see trade performance in logs
+        // const icon = pnlPct > 0 ? '🟢' : '🔴';
         // this.logger.info(`[EDGE ${duration}ms] ${icon} ${sig.asset} | Result: ${(pnlPct * 10000).toFixed(2)} bps`);
     }
 
@@ -298,21 +286,34 @@ class LeadStrategy {
             const elapsed = now - this.startTime;
             const isWarmingUp = elapsed < this.WARMUP_MS;
             
+            let anyData = false;
+            
             Object.keys(this.specs).forEach(asset => {
-                if (this.zCount[asset] > 0) {
+                const count = this.zCount[asset];
+                const cvd = this.cvdState[asset];
+                
+                // Only log if we have data OR to show we are alive but waiting
+                if (count > 0) {
+                     anyData = true;
                      let status = isWarmingUp ? `⏳ WARMUP` : "🟢 ACTIVE";
                      const vol = Math.sqrt(this.volState[asset].variance);
+                     const cvdVol = cvd ? (cvd.buySum + cvd.sellSum).toFixed(2) : "0";
                      
-                     this.logger.info(`[${asset}] ${status} | Z-Thresh: ${this.dynamicThresholds[asset].toFixed(2)}σ`);
+                     this.logger.info(`[${asset}] ${status} | Z-Thresh: ${this.dynamicThresholds[asset].toFixed(2)}σ | CVD Vol: ${cvdVol}`);
                 }
             });
-        }, 10000); // FIXED: 10s Heartbeat as requested
+
+            if (!anyData) {
+                this.logger.info(`[Heartbeat] Alive but WAITING for Data... (Check Market Listener Connection)`);
+            }
+
+        }, 10000); // 10s Heartbeat
     }
 
     async tryExecute(asset, side, price, orderId) {
         if (this.bot.hasOpenPosition(asset)) return;
         const now = Date.now();
-        // Simple cooldown to prevent double fire on same spike
+        
         if (now - this.triggerState[asset].lastFire < 1000) return; 
         this.triggerState[asset].lastFire = now;
 
@@ -347,11 +348,10 @@ class LeadStrategy {
         }
     }
 
-    // --- INTERFACE METHODS ---
     onLaggerTrade(trade) {}
     onPositionClose(asset) {}
     getName() { return "LeadStrategy (Hybrid v16)"; }
 }
 
 module.exports = LeadStrategy;
-                                               
+            
