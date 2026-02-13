@@ -5,6 +5,7 @@
  * - Type 'B' (BookTicker - Price)
  * - Type 'T' (AggTrade - CVD Volume)
  * * FEATURES:
+ * - Default Asset: XRP (Restricted for precision/testing)
  * - 10s Heartbeat Log
  * - Watchdog Safety
  */
@@ -16,7 +17,8 @@ require('dotenv').config();
 const config = {
     internalReceiverUrl: `ws://localhost:${process.env.INTERNAL_WS_PORT || 8082}`,
     reconnectInterval: 2000, 
-    assets: (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(','),
+    // UPDATED: Now defaults to XRP only
+    assets: (process.env.TARGET_ASSETS || 'XRP').split(','),
     watchdogTimeout: 5000    
 };
 
@@ -34,9 +36,10 @@ let internalWs = null;
 let binanceWs = null;
 let watchdog = null;
 
-// --- WATCHDOG ---
+// --- WATCHDOG (THE SAFETY NET) ---
 function heartbeat() {
     clearTimeout(watchdog);
+    // If no message received for 5 seconds, kill and reconnect
     watchdog = setTimeout(() => {
         logger.warn(`[Binance Spot] 🚨 WATCHDOG TIMEOUT. Reconnecting...`);
         if (binanceWs) binanceWs.terminate();
@@ -48,22 +51,30 @@ function heartbeat() {
 function connectToInternal() {
     internalWs = new WebSocket(config.internalReceiverUrl);
 
-    internalWs.on('open', () => logger.info(`✓ Connected to Trader Bot.`));
-    internalWs.on('close', () => setTimeout(connectToInternal, config.reconnectInterval));
+    internalWs.on('open', () => {
+        logger.info(`✓ Connected to Trader Bot. Forwarding: ${config.assets.join(', ')}`);
+    });
+
+    internalWs.on('close', () => {
+        logger.warn('⚠ Internal Bot Disconnected. Retrying...');
+        setTimeout(connectToInternal, config.reconnectInterval);
+    });
+
     internalWs.on('error', (e) => logger.error(`Internal WS Error: ${e.message}`));
 }
 
 // --- 2. CONNECT TO BINANCE SPOT ---
 function connectBinance() {
+    // Note: Spot streams must be lowercase (e.g., xrpusdt@bookTicker)
     const streams = config.assets.flatMap(a => [
         `${a.toLowerCase()}usdt@bookTicker`,
         `${a.toLowerCase()}usdt@aggTrade`
     ]).join('/');
 
-    // SPOT URL
+    // CORRECT URL FOR BINANCE SPOT
     const url = `wss://stream.binance.com:9443/stream?streams=${streams}`;
 
-    logger.info(`[Binance Spot] Connecting...`);
+    logger.info(`[Binance Spot] Connecting to Stream for assets: ${config.assets.join(', ')}`);
     
     if (binanceWs) {
         try { binanceWs.terminate(); } catch(e){}
@@ -77,7 +88,8 @@ function connectBinance() {
     });
 
     binanceWs.on('message', (data) => {
-        heartbeat(); 
+        heartbeat(); // Reset watchdog on every message
+
         if (!internalWs || internalWs.readyState !== WebSocket.OPEN) return;
 
         try {
@@ -87,7 +99,7 @@ function connectBinance() {
             const eventType = msg.data.e;
             const asset = msg.data.s.replace('USDT', '');
 
-            // 1. PRICE UPDATE
+            // 1. PRICE UPDATE (BookTicker)
             if (eventType === 'bookTicker') {
                 const payload = {
                     type: 'B',
@@ -99,9 +111,10 @@ function connectBinance() {
                 };
                 internalWs.send(JSON.stringify(payload));
             } 
-            // 2. CVD UPDATE
+            // 2. CVD UPDATE (AggTrade)
             else if (eventType === 'aggTrade') {
-                // Spot Logic: m=true -> Taker Sold
+                // m = true -> Buyer is Maker -> Taker is Seller -> SELL SIDE
+                // m = false -> Seller is Maker -> Taker is Buyer -> BUY SIDE
                 const isSell = msg.data.m; 
                 
                 const payload = {
@@ -114,28 +127,32 @@ function connectBinance() {
                 };
                 internalWs.send(JSON.stringify(payload));
             }
-        } catch (e) {}
+
+        } catch (e) {
+            // Squelch parsing errors
+        }
     });
 
     binanceWs.on('close', () => {
-        logger.warn('[Binance Spot] Disconnected. Reconnecting...');
+        logger.warn('[Binance Spot] Disconnected from Binance. Reconnecting...');
         clearTimeout(watchdog);
         setTimeout(connectBinance, config.reconnectInterval);
     });
 
     binanceWs.on('error', (e) => {
-        logger.error(`[Binance Spot] Error: ${e.message}`);
+        logger.error(`[Binance Spot] WebSocket Error: ${e.message}`);
         binanceWs.terminate();
     });
 }
 
-// --- 3. ALIVENESS LOG (10s) ---
+// --- 3. ALIVENESS LOG (Every 10 Seconds) ---
 setInterval(() => {
     if (binanceWs && binanceWs.readyState === WebSocket.OPEN) {
-        logger.info(`[Listener] 💓 Alive | Mode: Spot | Watchdog: OK`);
+        logger.info(`[Listener] 💓 Alive | Mode: Spot | Watchdog: OK | Assets: ${config.assets.join(',')}`);
     }
 }, 10000);
 
+// START
 connectToInternal();
 connectBinance();
-        
+                    
