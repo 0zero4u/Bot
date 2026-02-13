@@ -1,7 +1,9 @@
 /**
  * ============================================================================
- * LEAD STRATEGY: VELOCITY + TRAILING STOP
- * v8.0 [FIXED: HISTORY AMNESIA + LOCKING + TRAIL LOGIC]
+ * LEAD STRATEGY v16: HYBRID (ORIGINAL v12 LOGIC + CVD FILTER)
+ * * Base Logic: 30ms Rolling Window Return (Restored)
+ * * Filter: Zero-Latency CVD Accumulator (Added)
+ * * Execution: Bracket Orders (Original)
  * ============================================================================
  */
 
@@ -10,169 +12,346 @@ class LeadStrategy {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- CONFIGURATION ---
-        this.MOVE_THRESHOLD = 0.0002;     // 0.03% price change required
-        this.TIME_LOOKBACK_MS = 30;        // Compare vs price 50ms ago
-        this.IMBALANCE_RATIO = 0.53;       // 60% Order Book Support required
-        this.COOLDOWN_MS = 1000;           // 1s cooldown after firing
-        this.TRAILING_PERCENT = 0.025;      // 0.02% Trailing Stop
+        // --- 1. ORIGINAL CONFIGURATION (RESTORED) ---
+        this.WARMUP_MS = 100000;         
+        this.WINDOW_MS = 30;             // Critical: 30ms Lookback
+        this.IMBALANCE_THRESHOLD = 0.60; // Critical: Book Imbalance
+        
+        // --- 2. NEW: CVD FILTER CONFIG ---
+        this.CVD_WINDOW_MS = 100;        // 100ms Volume Lookback
+        this.CVD_THRESHOLD = 0.60;       // 60% Volume Dominance
+        
+        // --- 3. RISK MANAGEMENT ---
+        this.SL_PCT = 0.00015; 
+        this.TP_PCT = 0.00160; 
+        
+        // --- 4. VOLATILITY CONFIG ---
+        this.VOL_HALF_LIFE_MS = 1000;    
+        this.VOL_LAMBDA = Math.LN2 / this.VOL_HALF_LIFE_MS; 
+        this.MAX_DT_MS = 100;
 
-        // --- ASSET SPECS ---
-        this.assets = {
-            'XRP': { deltaId: 14969, precision: 4 }, 
-            'BTC': { deltaId: 27,    precision: 1 },    
+        // --- 5. ADAPTIVE THRESHOLD ---
+        this.QUANTILE_RANK = 0.9995;      
+        this.BUFFER_SIZE = 200000;        
+        this.UPDATE_INTERVAL_MS = 1500;  
+        this.MIN_THRESHOLD_FLOOR = 3.0;  
+        this.RESET_THRESHOLD_RATIO = 0.8; 
+
+        // --- MASTER CONFIG ---
+        this.specs = {
+            'BTC': { deltaId: 27,    precision: 1 },
             'ETH': { deltaId: 299,   precision: 2 },
-            'SOL': { deltaId: 417,   precision: 3 }
+            'SOL': { deltaId: 417,   precision: 3 },
+            'XRP': { deltaId: 14969, precision: 4 }
         };
 
-        // --- STATE ---
-        this.priceHistory = {};
-        this.lastTriggerTime = {};
-        this.latestStats = {};
+        // --- STATE INITIALIZATION ---
+        this.startTime = Date.now();
+        
+        // Strategy State (v12)
+        this.history = {};      
+        this.volState = {};     
+        this.zBuffer = {};      
+        this.zPointer = {};     
+        this.zCount = {};       
+        this.dynamicThresholds = {}; 
+        this.triggerState = {}; 
+        this.pendingSignals = []; 
 
-        Object.keys(this.assets).forEach(a => {
-            this.priceHistory[a] = [];
-            this.lastTriggerTime[a] = 0;
-            this.latestStats[a] = { change: 0, imbalance: 0.5, price: 0 };
+        // CVD State (v16)
+        this.cvdState = {};
+
+        Object.keys(this.specs).forEach(a => {
+            // v12 Init
+            this.history[a] = [];
+            this.volState[a] = { variance: 0.000001, lastTime: Date.now() };
+            this.zBuffer[a] = new Float32Array(this.BUFFER_SIZE); 
+            this.zPointer[a] = 0;
+            this.zCount[a] = 0;
+            this.dynamicThresholds[a] = 5.0; 
+            this.triggerState[a] = { isFiring: false, lastFire: 0 };
+
+            // v16 Init (CVD Accumulator)
+            this.cvdState[a] = {
+                queue: [],
+                buySum: 0,
+                sellSum: 0
+            };
         });
 
-        this.logger.info(`[LeadStrategy] Loaded v8.0 (History Fix). 0.02% Trail.`);
+        this.logger.info(`[LeadStrategy v16] 🛡️ Ready. Window: ${this.WINDOW_MS}ms | CVD: ${this.CVD_WINDOW_MS}ms`);
+
+        setInterval(() => this.updateThresholds(), this.UPDATE_INTERVAL_MS);
         this.startHeartbeat();
+    }
+
+    // ============================================================
+    // PART 1: CVD INGESTION (Zero Latency Accumulator)
+    // ============================================================
+    onExternalTrade(trade) {
+        const cvd = this.cvdState[trade.s];
+        if (!cvd) return;
+
+        const now = trade.t;
+        const qty = trade.q;
+
+        // 1. Add to Accumulator
+        if (trade.side === 'buy') {
+            cvd.buySum += qty;
+            cvd.queue.push({ t: now, q: qty, s: 1 });
+        } else {
+            cvd.sellSum += qty;
+            cvd.queue.push({ t: now, q: qty, s: -1 });
+        }
+
+        // 2. Prune Old Trades (Rolling Window)
+        const cutoff = now - this.CVD_WINDOW_MS;
+        while (cvd.queue.length > 0 && cvd.queue[0].t < cutoff) {
+            const old = cvd.queue.shift();
+            if (old.s === 1) cvd.buySum -= old.q;
+            else cvd.sellSum -= old.q;
+        }
+        
+        // 3. Float Safety
+        if (cvd.buySum < 0) cvd.buySum = 0;
+        if (cvd.sellSum < 0) cvd.sellSum = 0;
+    }
+
+    getInstantCVD(asset, signalSide) {
+        const cvd = this.cvdState[asset];
+        const total = cvd.buySum + cvd.sellSum;
+        
+        // Strict Mode: If no volume in 100ms, assume fake-out and block.
+        if (total <= 0) return false; 
+
+        if (signalSide === 'buy') return (cvd.buySum / total) >= this.CVD_THRESHOLD;
+        else return (cvd.sellSum / total) >= this.CVD_THRESHOLD;
+    }
+
+    // ============================================================
+    // PART 2: CORE LOGIC (Restored v12)
+    // ============================================================
+    updateThresholds() {
+        Object.keys(this.specs).forEach(asset => {
+            const count = this.zCount[asset];
+            if (count < 500) return; 
+
+            const view = this.zBuffer[asset].subarray(0, count);
+            // Optimization: Don't sort full array every time if huge
+            const sorted = Float32Array.from(view).sort();
+            const index = Math.floor(sorted.length * this.QUANTILE_RANK);
+            const newThreshold = sorted[index];
+
+            this.dynamicThresholds[asset] = Math.max(newThreshold, this.MIN_THRESHOLD_FLOOR);
+        });
+    }
+
+    async onDepthUpdate(asset, depth) {
+        if (!this.specs[asset]) return;
+        const now = Date.now();
+        
+        // 1. Price Calculation
+        const bestBid = parseFloat(depth.bids[0][0]);
+        const bestAsk = parseFloat(depth.asks[0][0]);
+        const currentPrice = (bestBid + bestAsk) / 2; 
+
+        // 2. Edge Decay Logging (Restored)
+        this.checkEdgeDecay(asset, now, currentPrice);
+
+        // 3. History Buffer (Restored 30ms Window Logic)
+        const history = this.history[asset];
+        history.push({ p: currentPrice, t: now });
+        if (history.length > 250) history.shift(); 
+
+        const targetTime = now - this.WINDOW_MS;
+        let prevTick = null;
+        for (let i = history.length - 1; i >= 0; i--) {
+            if (history[i].t <= targetTime) {
+                prevTick = history[i];
+                break; 
+            }
+        }
+        
+        if (!prevTick) return;
+
+        // 4. Volatility Calculation
+        const rawReturn = (currentPrice - prevTick.p) / prevTick.p;
+        const volState = this.volState[asset];
+        
+        let dt = now - volState.lastTime;
+        volState.lastTime = now;
+
+        if (dt > 0) {
+            const clampedDt = Math.min(dt, this.MAX_DT_MS);
+            const weight = Math.exp(-this.VOL_LAMBDA * clampedDt);
+            volState.variance = (volState.variance * weight) + ((rawReturn ** 2) * (1 - weight));
+        }
+        
+        const sigma = Math.sqrt(volState.variance);
+        const effectiveSigma = Math.max(sigma, 0.00005); 
+        
+        const zScore = rawReturn / effectiveSigma;
+        const absZ = Math.abs(zScore);
+        
+        // 5. Update Z-Score Buffer
+        const ptr = this.zPointer[asset];
+        this.zBuffer[asset][ptr] = absZ;
+        this.zPointer[asset] = (ptr + 1) % this.BUFFER_SIZE;
+        if (this.zCount[asset] < this.BUFFER_SIZE) this.zCount[asset]++;
+
+        if (now - this.startTime < this.WARMUP_MS) return;
+
+        // 6. TRIGGER LOGIC
+        const threshold = this.dynamicThresholds[asset];
+        const state = this.triggerState[asset];
+
+        if (absZ > threshold) {
+            if (!state.isFiring) {
+                
+                const bidQty = parseFloat(depth.bids[0][1]);
+                const askQty = parseFloat(depth.asks[0][1]);
+                const totalQty = bidQty + askQty;
+
+                let side = null;
+                let executionPrice = currentPrice; 
+
+                // A. Check Direction & Book Imbalance (Original v12)
+                if (zScore > 0 && (bidQty / totalQty) >= this.IMBALANCE_THRESHOLD) {
+                    side = 'buy';
+                    executionPrice = bestAsk; 
+                }
+                else if (zScore < 0 && (askQty / totalQty) >= this.IMBALANCE_THRESHOLD) {
+                    side = 'sell';
+                    executionPrice = bestBid; 
+                }
+
+                if (side) {
+                    // B. Check CVD Filter (New v16)
+                    // "Does the volume flow confirm this imbalance?"
+                    const cvdConfirmed = this.getInstantCVD(asset, side);
+                    
+                    if (cvdConfirmed) {
+                        state.isFiring = true; 
+                        
+                        const sigId = `z16_${now}`;
+                        this.logger.info(`[SIGNAL ${asset}] ⚡ IMPULSE! Z=${zScore.toFixed(2)} | CVD: OK ✅`);
+                        
+                        // Log Signal for Edge Tracking
+                        this.pendingSignals.push({
+                            id: sigId,
+                            asset: asset,
+                            side: side,
+                            entryPrice: currentPrice, 
+                            time: now,
+                            z: zScore,
+                            checked50: false,
+                            checked100: false
+                        });
+
+                        await this.tryExecute(asset, side, executionPrice, sigId);
+                    } else {
+                        // Optional: Log rejection
+                        // this.logger.debug(`[FILTER] ${asset} Z-Score OK but CVD Rejected.`);
+                    }
+                }
+            }
+        } else if (absZ < (threshold * this.RESET_THRESHOLD_RATIO)) {
+            state.isFiring = false; 
+        }
+    }
+
+    // ============================================================
+    // PART 3: UTILITIES & EXECUTION (Restored v12)
+    // ============================================================
+    checkEdgeDecay(asset, now, currentPrice) {
+        for (let i = this.pendingSignals.length - 1; i >= 0; i--) {
+            const sig = this.pendingSignals[i];
+            if (sig.asset !== asset) continue;
+            
+            const age = now - sig.time;
+            if (age > 150) {
+                this.pendingSignals.splice(i, 1);
+                continue;
+            }
+
+            if (!sig.checked50 && age >= 50) {
+                this.logEdge(sig, 50, currentPrice);
+                sig.checked50 = true;
+            }
+            if (!sig.checked100 && age >= 100) {
+                this.logEdge(sig, 100, currentPrice);
+                sig.checked100 = true;
+            }
+        }
+    }
+
+    logEdge(sig, duration, currentPrice) {
+        const rawMove = (currentPrice - sig.entryPrice) / sig.entryPrice;
+        const pnlPct = sig.side === 'buy' ? rawMove : -rawMove;
+        const icon = pnlPct > 0 ? '🟢' : '🔴';
+        // this.logger.info(`[EDGE ${duration}ms] ${icon} ${sig.asset} | Result: ${(pnlPct * 10000).toFixed(2)} bps`);
     }
 
     startHeartbeat() {
         setInterval(() => {
-            Object.keys(this.assets).forEach(asset => {
-                const stats = this.latestStats[asset];
-                if (stats.price <= 0) return; 
-
-                const price = stats.price.toFixed(4);
-                const changePct = (stats.change * 100).toFixed(4);
-                const imb = stats.imbalance.toFixed(2);
-                
-                let status = "[STABLE]";
-                if (Math.abs(stats.change) > (this.MOVE_THRESHOLD * 0.5)) status = "[ACTIVITY]";
-                if (Math.abs(stats.change) > this.MOVE_THRESHOLD) status = "[TRIGGER ZONE]";
-
-                this.logger.info(`[${asset}] ${status} | Price: ${price} | Move: ${changePct}% | Imb: ${imb}`);
+            const now = Date.now();
+            const elapsed = now - this.startTime;
+            const isWarmingUp = elapsed < this.WARMUP_MS;
+            
+            Object.keys(this.specs).forEach(asset => {
+                if (this.zCount[asset] > 0) {
+                     let status = isWarmingUp ? `⏳ WARMUP` : "🟢 ACTIVE";
+                     const vol = Math.sqrt(this.volState[asset].variance);
+                     
+                     // this.logger.info(`[${asset}] ${status} | Z-Thresh: ${this.dynamicThresholds[asset].toFixed(2)}σ`);
+                }
             });
-        }, 10000);
+        }, 5000); 
     }
 
-    async onDepthUpdate(asset, depth) {
-        if (!this.assets[asset]) return;
+    async tryExecute(asset, side, price, orderId) {
+        if (this.bot.hasOpenPosition(asset)) return;
         const now = Date.now();
+        // Simple cooldown to prevent double fire on same spike
+        if (now - this.triggerState[asset].lastFire < 1000) return; 
+        this.triggerState[asset].lastFire = now;
 
-        const bid = parseFloat(depth.bids[0][0]);
-        const bidQty = parseFloat(depth.bids[0][1]);
-        const ask = parseFloat(depth.asks[0][0]);
-        const askQty = parseFloat(depth.asks[0][1]);
+        const spec = this.specs[asset];
+        let slPrice, tpPrice;
 
-        const currentPrice = (bid + ask) / 2;
-        const totalQty = bidQty + askQty;
-        const bidRatio = bidQty / totalQty; 
-        const askRatio = askQty / totalQty;
-
-        const history = this.priceHistory[asset];
-        history.push({ p: currentPrice, t: now });
-
-        // [CRITICAL FIX] Memory Retention
-        // Keep 2000ms of history to handle slow feed updates (prevents 0% move errors)
-        if (history.length > 200) { 
-             const cutoff = now - 2000; 
-             while(history.length > 10 && history[0].t < cutoff) history.shift();
+        if (side === 'buy') {
+            slPrice = price * (1 - this.SL_PCT);
+            tpPrice = price * (1 + this.TP_PCT);
+        } else {
+            slPrice = price * (1 + this.SL_PCT);
+            tpPrice = price * (1 - this.TP_PCT);
         }
 
-        const targetTime = now - this.TIME_LOOKBACK_MS;
-        let pastTick = null;
-        
-        // Find the tick closest to (but not newer than) targetTime
-        for (let i = history.length - 1; i >= 0; i--) {
-            if (history[i].t <= targetTime) {
-                pastTick = history[i];
-                break;
-            }
-        }
-
-        if (!pastTick) {
-            this.latestStats[asset] = { change: 0, imbalance: 0.5, price: currentPrice };
-            return;
-        }
-
-        const priceChangePct = (currentPrice - pastTick.p) / pastTick.p;
-        const relevantImbalance = priceChangePct >= 0 ? bidRatio : askRatio;
-
-        this.latestStats[asset] = {
-            change: priceChangePct,
-            imbalance: relevantImbalance,
-            price: currentPrice
+        const payload = {
+            product_id: spec.deltaId.toString(),
+            side: side,
+            size: process.env.ORDER_SIZE || "1",
+            order_type: 'market_order',
+            client_order_id: orderId,
+            bracket_stop_loss_price: slPrice.toFixed(spec.precision),
+            bracket_take_profit_price: tpPrice.toFixed(spec.precision),
+            bracket_stop_trigger_method: 'last_traded_price'
         };
 
-        if (Math.abs(priceChangePct) > this.MOVE_THRESHOLD) {
-            let side = null;
-            if (priceChangePct > 0 && bidRatio >= this.IMBALANCE_RATIO) side = 'buy';
-            else if (priceChangePct < 0 && askRatio >= this.IMBALANCE_RATIO) side = 'sell';
-
-            if (side) {
-                await this.tryExecute(asset, side, currentPrice);
-            }
-        }
-    }
-
-    async tryExecute(asset, side, price) {
-        const now = Date.now();
-
-        // 1. Cooldown & Position Check
-        if (this.lastTriggerTime[asset] && (now - this.lastTriggerTime[asset] < this.COOLDOWN_MS)) return;
-        if (this.bot.hasOpenPosition(asset)) return;
+        this.logger.info(`[Sniper] 🔫 FIRE ${asset} ${side} @ ${price}`);
         
-        // 2. Lock Check (Prevents multiple orders firing at once)
-        if (this.bot.isOrderInProgress) return;
-
-        // 3. Set Lock
-        this.lastTriggerTime[asset] = now;
-        this.bot.isOrderInProgress = true; 
-
         try {
-            const spec = this.assets[asset];
-
-            // 4. Trailing Stop Calculation
-            let trailDistance = price * (this.TRAILING_PERCENT / 100);
-            const tickSize = 1 / Math.pow(10, spec.precision);
-            if (trailDistance < tickSize) trailDistance = tickSize;
-            
-            // Format for API
-            const trailAmount = trailDistance.toFixed(spec.precision);
-            const clientOid = `vel_${now}_${Math.floor(Math.random() * 1000)}`;
-
-            const payload = {
-                product_id: spec.deltaId.toString(),
-                side: side,
-                size: (process.env.ORDER_SIZE || "1").toString(),
-                order_type: 'market_order',
-                client_order_id: clientOid,
-                bracket_trail_amount: trailAmount,
-                bracket_stop_trigger_method: 'last_traded_price' 
-            };
-
-            this.logger.info(`[Sniper] FIRE ${asset} ${side.toUpperCase()} @ ${price} | Trail: ${trailAmount}`);
             await this.bot.placeOrder(payload);
-
-        } catch (e) {
-            this.logger.error(`[EXEC ERROR] ${e.message}`);
-        } finally {
-            // 5. Release Lock
-            this.bot.isOrderInProgress = false;
+        } catch(e) {
+            this.logger.error(`Order Failed: ${e.message}`);
         }
     }
 
-    onPositionClose(asset) {
-        this.lastTriggerTime[asset] = 0;
-        this.logger.info(`[LeadStrategy] ${asset} Closed. Cooldown Reset.`);
-    }
-    
-    getName() { return "LeadStrategy (History Fixed)"; }
+    // --- INTERFACE METHODS ---
+    onLaggerTrade(trade) {}
+    onPositionClose(asset) {}
+    getName() { return "LeadStrategy (Hybrid v16)"; }
 }
 
 module.exports = LeadStrategy;
-                               
+                                        
