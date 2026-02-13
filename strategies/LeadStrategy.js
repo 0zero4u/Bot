@@ -28,10 +28,10 @@ class LeadStrategy {
         
         // --- 3. RISK ---
         this.SL_PCT = 0.00015; 
-        this.TP_PCT = 0.00160; 
+        this.TP_PCT = 0.00190; 
         
         // --- 4. VOLATILITY ---
-        this.VOL_HALF_LIFE_MS = 1000;    
+        this.VOL_HALF_LIFE_MS = 1500;    
         this.VOL_LAMBDA = Math.LN2 / this.VOL_HALF_LIFE_MS; 
         this.MAX_DT_MS = 100;
 
@@ -41,7 +41,7 @@ class LeadStrategy {
         this.QUANTILE_RANK = 0.9995;       
         this.BUFFER_SIZE = 150000;         
         this.UPDATE_INTERVAL_MS = 5000;   
-        this.MIN_THRESHOLD_FLOOR = 3.5;   
+        this.MIN_THRESHOLD_FLOOR = 2.5;   
         this.RESET_THRESHOLD_RATIO = 0.7; 
         this.MEMORY_CLIPPING_LIMIT = 6.0; // Raised from 3.0 to prevent ceiling effect
 
