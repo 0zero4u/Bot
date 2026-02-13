@@ -13,7 +13,7 @@ class RollingStats {
         this.values = [];
     }
 
-    add(val, limitSigma = 3) {
+    add(val, limitSigma = 2) {
         const stats = this.getStats();
         let safeVal = val;
         // Winsorization: Clamp outliers to 3 stdDevs to prevent regime destruction
