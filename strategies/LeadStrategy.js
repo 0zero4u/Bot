@@ -17,8 +17,8 @@ class LeadStrategy {
         this.IMBALANCE_THRESHOLD = 0.30; 
         
         // --- RISK MANAGEMENT (NORMALIZED) ---
-        this.SL_PCT = 0.00035; // 0.03% Stop Loss
-        this.TP_PCT = 0.0009; // 0.08% Take Profit
+        this.SL_PCT = 0.0002; // 0.03% Stop Loss
+        this.TP_PCT = 0.0006; // 0.08% Take Profit
         
         // --- VOLATILITY CONFIG (Time Based) ---
         this.VOL_HALF_LIFE_MS = 10000;    
