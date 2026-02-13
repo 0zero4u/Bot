@@ -1,10 +1,11 @@
+
 /**
  * AdvanceStrategy.js
- * v72.0 - [WARMUP + HEARTBEAT + ALIGNED]
+ * v73.0 - [FIX: Negative Trail for Buys]
  * Updates:
- * - Added 30s Warmup Period (Data processing active, Execution blocked)
- * - Added 10s Heartbeat Logger (Deep visibility into internal state)
- * - Confirmed alignment with Trader v68 & Market Listener v4
+ * - Fixes "bracket_trail_amount should be negative" error.
+ * - Ensures BUY trails are negative and SELL trails are positive.
+ * - Maintains Warmup, Heartbeat, and Stats Engine.
  */
 
 class RollingStats {
@@ -95,13 +96,13 @@ class AdvanceStrategy {
         this.warmupUntil = 0; // Set in start()
         this.heartbeatInterval = null;
         
-        this.logger.info(`[Strategy] Loaded V72 (Warmup + Heartbeat)`);
+        this.logger.info(`[Strategy] Loaded V73 (Fix: Negative Trail for Buys)`);
     }
 
     // --- REQUIRED INTERFACE METHODS ---
 
     getName() {
-        return "AdvanceStrategy (V72 Institutional)";
+        return "AdvanceStrategy (V73 Institutional)";
     }
 
     async start() {
@@ -360,7 +361,18 @@ class AdvanceStrategy {
             
             this.logger.info(`[Sniper] ⚡ TRIGGER ${asset} ${side.toUpperCase()} | Gap: ${(gap*100).toFixed(4)}% | Thresh: ${(thresholdUsed*100).toFixed(4)}%`);
 
-            const trailValue = delPrice * (this.TRAILING_PERCENT / 100);
+            // --- ⚡ FIX START: HANDLE TRAILING STOP SIGN ---
+            // Buy Order: Stop is BELOW price (Negative Offset)
+            // Sell Order: Stop is ABOVE price (Positive Offset)
+            let trailValue = delPrice * (this.TRAILING_PERCENT / 100);
+            
+            if (side === 'buy') {
+                trailValue = -Math.abs(trailValue); // MUST BE NEGATIVE FOR BUY
+            } else {
+                trailValue = Math.abs(trailValue);  // MUST BE POSITIVE FOR SELL
+            }
+            // --- ⚡ FIX END ---
+            
             const trailFixed = trailValue.toFixed(spec.precision);
 
             const payload = { 
@@ -374,6 +386,7 @@ class AdvanceStrategy {
             };
             
             const startT = Date.now();
+            // Assuming the bot instance handles the stringify logic for logging errors now
             const orderResult = await this.bot.placeOrder(payload);
             const latency = Date.now() - startT;
 
@@ -381,7 +394,10 @@ class AdvanceStrategy {
                  this.logger.info(`[Sniper] 🎯 FILLED ${asset} | Latency: ${latency}ms | Trail: ${trailFixed}`);
                  setTimeout(() => { this.localInPosition = false; }, this.LOCK_DURATION_MS);
             } else {
-                this.logger.error(`[Sniper] 💨 MISS: ${orderResult ? orderResult.error : 'Unknown'}`);
+                // If bot.placeOrder throws, it's caught below. If it returns failure, we log it.
+                // Note: The Trader.js v72 we wrote earlier logs the full JSON error, 
+                // but the strategy also logs a summary here.
+                this.logger.error(`[Sniper] 💨 MISS: ${orderResult ? (orderResult.error ? JSON.stringify(orderResult.error) : 'Unknown Error') : 'No Result'}`);
                 this.localInPosition = false; 
             }
 
