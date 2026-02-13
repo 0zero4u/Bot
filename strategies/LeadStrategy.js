@@ -22,7 +22,7 @@ class LeadStrategy {
         this.TP_PCT = 0.0008; // 0.08% Take Profit
         
         // --- VOLATILITY CONFIG (Time Based) ---
-        this.VOL_HALF_LIFE_MS = 1500;    
+        this.VOL_HALF_LIFE_MS = 5000;    
         this.VOL_LAMBDA = Math.LN2 / this.VOL_HALF_LIFE_MS; 
         this.MAX_DT_MS = 100;
 
