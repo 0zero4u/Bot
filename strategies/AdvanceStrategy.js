@@ -1,11 +1,10 @@
 /**
  * AdvanceStrategy.js
- * v71.0 - INSTITUTIONAL FINAL [ALIGNED]
- * Features: Winsorized Stats, Dominance Burst, PROPORTIONAL LAG TRACKER
+ * v72.0 - [WARMUP + HEARTBEAT + ALIGNED]
  * Updates:
- * - Aligned with Trader v68 interface (onDepthUpdate, onLaggerTrade)
- * - Added onPositionClose & getName
- * - Fixed Execution Payload strictness
+ * - Added 30s Warmup Period (Data processing active, Execution blocked)
+ * - Added 10s Heartbeat Logger (Deep visibility into internal state)
+ * - Confirmed alignment with Trader v68 & Market Listener v4
  */
 
 class RollingStats {
@@ -42,6 +41,7 @@ class AdvanceStrategy {
 
         // --- CONFIGURATION ---
         this.BURST_WINDOW_MS = 60;       
+        this.WARMUP_MS = 30000; // 30 Seconds
         
         // Z-SCORE SETTINGS
         this.Z_SCORE_THRESHOLD = 2.2;    
@@ -52,7 +52,7 @@ class AdvanceStrategy {
         this.DOMINANCE_RATIO = 0.7;       
 
         // LAG TRACKER SETTINGS
-        this.LAG_CATCHUP_RATIO = 0.5; // Delta must close 50% of the Binance gap to count as "reacted"
+        this.LAG_CATCHUP_RATIO = 0.5;
 
         // TRAILING STOP
         this.TRAILING_PERCENT = 0.1; 
@@ -85,34 +85,74 @@ class AdvanceStrategy {
                     // STATS ENGINE
                     gapStats: new RollingStats(60), 
                     emaBasis: 0,
-                    initialized: false
+                    initialized: false,
+                    lastLogTime: 0
                 };
             }
         });
 
         this.localInPosition = false;
-        this.logger.info(`[Strategy] Loaded V71 (Aligned Interface)`);
+        this.warmupUntil = 0; // Set in start()
+        this.heartbeatInterval = null;
+        
+        this.logger.info(`[Strategy] Loaded V72 (Warmup + Heartbeat)`);
     }
 
     // --- REQUIRED INTERFACE METHODS ---
 
     getName() {
-        return "AdvanceStrategy (V71 Institutional)";
+        return "AdvanceStrategy (V72 Institutional)";
     }
 
     async start() {
-        this.logger.info('[Strategy] Active.');
+        this.warmupUntil = Date.now() + this.WARMUP_MS;
+        this.logger.info(`[Strategy] ⏳ WARMUP STARTED. Execution locked for 30s (Until: ${new Date(this.warmupUntil).toLocaleTimeString()})`);
+        
+        // Start Heartbeat Logger
+        this.startHeartbeat();
+    }
+
+    startHeartbeat() {
+        if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+        
+        this.heartbeatInterval = setInterval(() => {
+            const now = Date.now();
+            const isWarming = now < this.warmupUntil;
+            
+            this.logger.info(`\n=== 🫀 STRATEGY HEARTBEAT (${isWarming ? 'WARMUP' : 'ACTIVE'}) ===`);
+            
+            Object.keys(this.assets).forEach(key => {
+                const a = this.assets[key];
+                if (!a.initialized) {
+                    this.logger.info(`[${key}] Waiting for data...`);
+                    return;
+                }
+
+                const stats = a.gapStats.getStats();
+                const rawGap = (a.binanceMid - a.deltaPrice) / (a.deltaPrice || 1);
+                const adjGap = rawGap - a.emaBasis;
+                const zScore = stats.stdDev > 0 ? (adjGap / stats.stdDev) : 0;
+                
+                this.logger.info(
+                    `[${key}] ` +
+                    `Δ:$${a.deltaPrice} | B:$${a.binanceMid.toFixed(2)} | ` +
+                    `Basis:${(a.emaBasis*100).toFixed(4)}% | ` +
+                    `Gap:${(adjGap*100).toFixed(4)}% (Z:${zScore.toFixed(2)}) | ` +
+                    `Burst:${a.pendingBurst ? (a.pendingBurst.dir > 0 ? 'UP' : 'DOWN') : 'None'}`
+                );
+            });
+            this.logger.info(`=================================================\n`);
+        }, 10000); // 10 Seconds
     }
 
     /**
      * Called by Trader.js when a position is closed.
-     * Resets locks to allow immediate re-entry if conditions persist.
      */
     onPositionClose(asset) {
         this.localInPosition = false;
         if (this.assets[asset]) {
-            this.assets[asset].lockedUntil = 0; // Reset lock
-            this.assets[asset].pendingBurst = null; // Reset pending patterns
+            this.assets[asset].lockedUntil = 0;
+            this.assets[asset].pendingBurst = null;
             this.logger.info(`[Strategy] ${asset} Position Closed. Resetting locks.`);
         }
     }
@@ -122,7 +162,6 @@ class AdvanceStrategy {
      */
     onLaggerTrade(trade) {
         const price = parseFloat(trade.price);
-        // Map symbol (e.g., BTCUSD -> BTC)
         const asset = Object.keys(this.assets).find(k => trade.symbol && trade.symbol.includes(k));
         
         if (asset) {
@@ -136,12 +175,9 @@ class AdvanceStrategy {
     onDepthUpdate(asset, depthPayload) {
         if (!this.assets[asset]) return;
         
-        // Extract Best Bid/Ask from payload formatted by trader.js
-        // depthPayload = { bids: [[p, q]], asks: [[p, q]] }
         const bb = parseFloat(depthPayload.bids[0][0]);
         const ba = parseFloat(depthPayload.asks[0][0]);
 
-        // Construct standard object for internal logic
         const updateData = {
             s: asset,
             bb: bb,
@@ -227,6 +263,25 @@ class AdvanceStrategy {
             assetData.binanceBuffer.shift();
         }
 
+        // --- STATS UPDATE (Always run, even in Warmup) ---
+        // This ensures that when warmup ends, we have valid stdDev
+        const rawGap = (midPrice - assetData.deltaPrice) / assetData.deltaPrice;
+        const adjustedGap = rawGap - assetData.emaBasis;
+        
+        // Feed the stats engine
+        const { stdDev } = assetData.gapStats.getStats();
+        const dynamicThreshold = Math.max(
+            this.MIN_GAP_THRESHOLD, 
+            this.Z_SCORE_THRESHOLD * stdDev
+        );
+
+        // Only add to stats if not in an extreme event (simple filtering)
+        if (Math.abs(adjustedGap) < dynamicThreshold * 2.0) {
+            assetData.gapStats.add(adjustedGap, 3.0); 
+        }
+
+        // --- EXECUTION CHECK (Blocked during Warmup) ---
+        if (now < this.warmupUntil) return;
         if (assetData.binanceBuffer.length < 3) return;
 
         // --- BURST ANALYSIS ---
@@ -265,15 +320,6 @@ class AdvanceStrategy {
         }
 
         // --- TRADING LOGIC ---
-        const { stdDev } = assetData.gapStats.getStats();
-        const dynamicThreshold = Math.max(
-            this.MIN_GAP_THRESHOLD, 
-            this.Z_SCORE_THRESHOLD * stdDev
-        );
-
-        const rawGap = (midPrice - assetData.deltaPrice) / assetData.deltaPrice;
-        const adjustedGap = rawGap - assetData.emaBasis;
-
         let direction = null;
 
         if (Math.abs(adjustedGap) > dynamicThreshold) {
@@ -300,11 +346,6 @@ class AdvanceStrategy {
 
         if (direction) {
             await this.executeSniper(asset, direction, midPrice, assetData.deltaPrice, adjustedGap, dynamicThreshold);
-        } else {
-            // Stats update (Winsorized)
-            if (Math.abs(adjustedGap) < dynamicThreshold * 2.0) {
-                assetData.gapStats.add(adjustedGap, 3.0); 
-            }
         }
     }
 
@@ -319,18 +360,15 @@ class AdvanceStrategy {
             
             this.logger.info(`[Sniper] ⚡ TRIGGER ${asset} ${side.toUpperCase()} | Gap: ${(gap*100).toFixed(4)}% | Thresh: ${(thresholdUsed*100).toFixed(4)}%`);
 
-            // Calculate Trail
             const trailValue = delPrice * (this.TRAILING_PERCENT / 100);
             const trailFixed = trailValue.toFixed(spec.precision);
 
-            // [ALIGNED] Payload matches MicroStrategy strictness
             const payload = { 
                 product_id: spec.deltaId.toString(), 
                 size: spec.lot.toString(), 
                 side: side, 
                 order_type: 'market_order',              
                 bracket_trail_amount: trailFixed, 
-                // Using mark_price for trail trigger is safer and standard in MicroStrategy
                 bracket_stop_trigger_method: 'mark_price', 
                 client_order_id: clientOid
             };
@@ -341,7 +379,6 @@ class AdvanceStrategy {
 
             if (orderResult && orderResult.success) {
                  this.logger.info(`[Sniper] 🎯 FILLED ${asset} | Latency: ${latency}ms | Trail: ${trailFixed}`);
-                 // Don't clear localInPosition immediately; wait for onPositionClose or timeout
                  setTimeout(() => { this.localInPosition = false; }, this.LOCK_DURATION_MS);
             } else {
                 this.logger.error(`[Sniper] 💨 MISS: ${orderResult ? orderResult.error : 'Unknown'}`);
@@ -358,4 +395,3 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
-                
