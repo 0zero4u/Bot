@@ -1,11 +1,10 @@
-
 /**
  * AdvanceStrategy.js
- * v73.0 - [FIX: Negative Trail for Buys]
+ * v74.0 - [FIX: Bracket Order Position Exists]
  * Updates:
- * - Fixes "bracket_trail_amount should be negative" error.
- * - Ensures BUY trails are negative and SELL trails are positive.
- * - Maintains Warmup, Heartbeat, and Stats Engine.
+ * - NOW CHECKS bot.hasOpenPosition(asset) before firing.
+ * - Prevents "bracket_order_position_exists" error.
+ * - Keeps Negative Trail fix for Buys.
  */
 
 class RollingStats {
@@ -46,7 +45,7 @@ class AdvanceStrategy {
         
         // Z-SCORE SETTINGS
         this.Z_SCORE_THRESHOLD = 2.2;    
-        this.MIN_GAP_THRESHOLD = 0.0002; 
+        this.MIN_GAP_THRESHOLD = 0.0004; 
         
         // BURST SETTINGS
         this.MIN_BURST_VELOCITY = 0.0001; 
@@ -96,13 +95,13 @@ class AdvanceStrategy {
         this.warmupUntil = 0; // Set in start()
         this.heartbeatInterval = null;
         
-        this.logger.info(`[Strategy] Loaded V73 (Fix: Negative Trail for Buys)`);
+        this.logger.info(`[Strategy] Loaded V74 (Position Aware)`);
     }
 
     // --- REQUIRED INTERFACE METHODS ---
 
     getName() {
-        return "AdvanceStrategy (V73 Institutional)";
+        return "AdvanceStrategy (V74 Institutional)";
     }
 
     async start() {
@@ -248,8 +247,17 @@ class AdvanceStrategy {
 
     async onPriceUpdate(data) {
         const asset = data.s; 
+        
+        // --- ⚡ CRITICAL FIX: CHECK REAL EXCHANGE POSITION ---
+        // If the bot holds a position on the exchange, DO NOT fire.
         if (this.localInPosition || this.bot.isOrderInProgress) return;
         
+        // Safely check bot.hasOpenPosition if it exists
+        if (this.bot.hasOpenPosition && this.bot.hasOpenPosition(asset)) {
+            // (Optional) Log sparingly if needed, or just return silently
+            return;
+        }
+
         const assetData = this.assets[asset];
         if (!assetData || !assetData.initialized) return;
 
@@ -361,7 +369,7 @@ class AdvanceStrategy {
             
             this.logger.info(`[Sniper] ⚡ TRIGGER ${asset} ${side.toUpperCase()} | Gap: ${(gap*100).toFixed(4)}% | Thresh: ${(thresholdUsed*100).toFixed(4)}%`);
 
-            // --- ⚡ FIX START: HANDLE TRAILING STOP SIGN ---
+            // --- ⚡ HANDLE TRAILING STOP SIGN ---
             // Buy Order: Stop is BELOW price (Negative Offset)
             // Sell Order: Stop is ABOVE price (Positive Offset)
             let trailValue = delPrice * (this.TRAILING_PERCENT / 100);
@@ -371,7 +379,6 @@ class AdvanceStrategy {
             } else {
                 trailValue = Math.abs(trailValue);  // MUST BE POSITIVE FOR SELL
             }
-            // --- ⚡ FIX END ---
             
             const trailFixed = trailValue.toFixed(spec.precision);
 
@@ -386,7 +393,6 @@ class AdvanceStrategy {
             };
             
             const startT = Date.now();
-            // Assuming the bot instance handles the stringify logic for logging errors now
             const orderResult = await this.bot.placeOrder(payload);
             const latency = Date.now() - startT;
 
@@ -394,9 +400,6 @@ class AdvanceStrategy {
                  this.logger.info(`[Sniper] 🎯 FILLED ${asset} | Latency: ${latency}ms | Trail: ${trailFixed}`);
                  setTimeout(() => { this.localInPosition = false; }, this.LOCK_DURATION_MS);
             } else {
-                // If bot.placeOrder throws, it's caught below. If it returns failure, we log it.
-                // Note: The Trader.js v72 we wrote earlier logs the full JSON error, 
-                // but the strategy also logs a summary here.
                 this.logger.error(`[Sniper] 💨 MISS: ${orderResult ? (orderResult.error ? JSON.stringify(orderResult.error) : 'Unknown Error') : 'No Result'}`);
                 this.localInPosition = false; 
             }
@@ -411,3 +414,4 @@ class AdvanceStrategy {
 }
 
 module.exports = AdvanceStrategy;
+            
