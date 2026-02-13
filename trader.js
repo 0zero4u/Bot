@@ -1,6 +1,6 @@
 /**
  * trader.js
- * v69.0 [CLEANED + NO ALL_TRADES + LOCK FIX]
+ * 
  */
 
 const WebSocket = require('ws');
