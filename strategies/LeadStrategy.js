@@ -15,7 +15,7 @@ class LeadStrategy {
         // --- CONFIGURATION ---
         this.WARMUP_MS = 100000;
         this.WINDOW_MS = 30;             
-        this.IMBALANCE_THRESHOLD = 0.50; 
+        this.IMBALANCE_THRESHOLD = 0.60; 
         
         // --- RISK MANAGEMENT (NORMALIZED) ---
         this.SL_PCT = 0.0004; // 0.03% Stop Loss
