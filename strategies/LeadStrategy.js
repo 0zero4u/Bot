@@ -18,7 +18,7 @@ class LeadStrategy {
         this.logger = bot.logger;
 
         // --- 1. CONFIGURATION ---
-        this.WARMUP_MS = 30000;
+        this.WARMUP_MS = 120000;
         this.WINDOW_MS = 30;             
         this.IMBALANCE_THRESHOLD = 0.60; 
         
@@ -39,7 +39,7 @@ class LeadStrategy {
         // FIX: Rank 0.99 allows the top 1% to be "extreme".
         // FIX: Clipping at 6.0 allows the threshold to float above 3.0 naturally.
         this.QUANTILE_RANK = 0.99;       
-        this.BUFFER_SIZE = 50000;         
+        this.BUFFER_SIZE = 100000;         
         this.UPDATE_INTERVAL_MS = 5000;   
         this.MIN_THRESHOLD_FLOOR = 2.5;   
         this.RESET_THRESHOLD_RATIO = 0.7; 
