@@ -18,16 +18,16 @@ class LeadStrategy {
         this.IMBALANCE_THRESHOLD = 0.50; 
         
         // --- RISK MANAGEMENT (NORMALIZED) ---
-        this.SL_PCT = 0.0004; // 0.03% Stop Loss
+        this.SL_PCT = 0.0003; // 0.03% Stop Loss
         this.TP_PCT = 0.0008; // 0.08% Take Profit
         
         // --- VOLATILITY CONFIG (Time Based) ---
-        this.VOL_HALF_LIFE_MS = 10000;    
+        this.VOL_HALF_LIFE_MS = 5000;    
         this.VOL_LAMBDA = Math.LN2 / this.VOL_HALF_LIFE_MS; 
         this.MAX_DT_MS = 100;
 
         // --- ADAPTIVE THRESHOLD ---
-        this.QUANTILE_RANK = 0.9995;      
+        this.QUANTILE_RANK = 0.9990;      
         this.BUFFER_SIZE = 90000;        
         this.UPDATE_INTERVAL_MS = 10000;  
         this.MIN_THRESHOLD_FLOOR = 3.0;  
@@ -298,4 +298,4 @@ class LeadStrategy {
 }
 
 module.exports = LeadStrategy;
-            
+                
