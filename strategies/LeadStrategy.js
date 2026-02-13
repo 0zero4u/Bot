@@ -14,7 +14,7 @@ class LeadStrategy {
 
         // --- CONFIGURATION ---
         this.WARMUP_MS = 100000;
-        this.WINDOW_MS = 13;             
+        this.WINDOW_MS = 30;             
         this.IMBALANCE_THRESHOLD = 0.50; 
         
         // --- RISK MANAGEMENT (NORMALIZED) ---
@@ -22,7 +22,7 @@ class LeadStrategy {
         this.TP_PCT = 0.0008; // 0.08% Take Profit
         
         // --- VOLATILITY CONFIG (Time Based) ---
-        this.VOL_HALF_LIFE_MS = 8000;    
+        this.VOL_HALF_LIFE_MS = 1000;    
         this.VOL_LAMBDA = Math.LN2 / this.VOL_HALF_LIFE_MS; 
         this.MAX_DT_MS = 100;
 
