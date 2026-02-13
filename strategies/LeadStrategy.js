@@ -1,9 +1,7 @@
 /**
  * ============================================================================
- * LEAD STRATEGY: VELOCITY + TRAILING STOP (v5.0 Corrected)
- * 1. Logic: Move > 0.03% in 50ms + 60% Imbalance
- * 2. Exit: Trailing Stop 0.02% (Calculated via Precision)
- * 3. Safety: Async Lock + Random OID + Cooldown
+ * LEAD STRATEGY: VELOCITY + TRAILING STOP
+ * v6.0 [CLEANED LOGS + FIXED TRAIL + ROBUST LOCKING]
  * ============================================================================
  */
 
@@ -13,13 +11,13 @@ class LeadStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.MOVE_THRESHOLD = 0.00025;     // 0.03% price change required
+        this.MOVE_THRESHOLD = 0.00035;     // 0.03% price change required
         this.TIME_LOOKBACK_MS = 30;        // Compare vs price 50ms ago
         this.IMBALANCE_RATIO = 0.60;       // 60% Order Book Support required
         this.COOLDOWN_MS = 1000;           // 1s cooldown after firing
         this.TRAILING_PERCENT = 0.02;      // 0.02% Trailing Stop
 
-        // --- ASSET SPECS (Copied Precision from MicroStrategy) ---
+        // --- ASSET SPECS ---
         this.assets = {
             'XRP': { deltaId: 14969, precision: 4 }, 
             'BTC': { deltaId: 27,    precision: 1 },    
@@ -32,14 +30,13 @@ class LeadStrategy {
         this.lastTriggerTime = {};
         this.latestStats = {};
 
-        // Initialize State
         Object.keys(this.assets).forEach(a => {
             this.priceHistory[a] = [];
             this.lastTriggerTime[a] = 0;
             this.latestStats[a] = { change: 0, imbalance: 0.5, price: 0 };
         });
 
-        this.logger.info(`[LeadStrategy] Loaded (v5.0). 0.02% Trailing Stop Active.`);
+        this.logger.info(`[LeadStrategy] Loaded v6.0 (Clean). 0.02% Trail.`);
         this.startHeartbeat();
     }
 
@@ -53,9 +50,10 @@ class LeadStrategy {
                 const changePct = (stats.change * 100).toFixed(4);
                 const imb = stats.imbalance.toFixed(2);
                 
-                let status = "攄 STABLE";
-                if (Math.abs(stats.change) > (this.MOVE_THRESHOLD * 0.5)) status = "穴 ACTIVITY";
-                if (Math.abs(stats.change) > this.MOVE_THRESHOLD) status = "櫨 TRIGGER ZONE";
+                // [FIX] Removed Chinese characters
+                let status = "[STABLE]";
+                if (Math.abs(stats.change) > (this.MOVE_THRESHOLD * 0.5)) status = "[ACTIVITY]";
+                if (Math.abs(stats.change) > this.MOVE_THRESHOLD) status = "[TRIGGER ZONE]";
 
                 this.logger.info(`[${asset}] ${status} | Price: ${price} | Move: ${changePct}% | Imb: ${imb}`);
             });
@@ -66,7 +64,6 @@ class LeadStrategy {
         if (!this.assets[asset]) return;
         const now = Date.now();
 
-        // 1. Parse Data
         const bid = parseFloat(depth.bids[0][0]);
         const bidQty = parseFloat(depth.bids[0][1]);
         const ask = parseFloat(depth.asks[0][0]);
@@ -77,7 +74,6 @@ class LeadStrategy {
         const bidRatio = bidQty / totalQty; 
         const askRatio = askQty / totalQty;
 
-        // 2. Manage History
         const history = this.priceHistory[asset];
         history.push({ p: currentPrice, t: now });
 
@@ -86,7 +82,6 @@ class LeadStrategy {
              while(history.length > 0 && history[0].t < cutoff) history.shift();
         }
 
-        // 3. Find Comparison Tick
         const targetTime = now - this.TIME_LOOKBACK_MS;
         let pastTick = null;
         for (let i = history.length - 1; i >= 0; i--) {
@@ -101,7 +96,6 @@ class LeadStrategy {
             return;
         }
 
-        // 4. Calculate Stats
         const priceChangePct = (currentPrice - pastTick.p) / pastTick.p;
         const relevantImbalance = priceChangePct >= 0 ? bidRatio : askRatio;
 
@@ -111,7 +105,6 @@ class LeadStrategy {
             price: currentPrice
         };
 
-        // 5. Check Triggers
         if (Math.abs(priceChangePct) > this.MOVE_THRESHOLD) {
             let side = null;
             if (priceChangePct > 0 && bidRatio >= this.IMBALANCE_RATIO) side = 'buy';
@@ -126,67 +119,59 @@ class LeadStrategy {
     async tryExecute(asset, side, price) {
         const now = Date.now();
 
-        // [SAFETY 1] Cooldown Check
+        // 1. Cooldown & Position Check
         if (this.lastTriggerTime[asset] && (now - this.lastTriggerTime[asset] < this.COOLDOWN_MS)) return;
-        
-        // [SAFETY 2] Overlap Lock (CRITICAL ADDITION)
-        if (this.bot.isOrderInProgress) return;
-        
-        // [SAFETY 3] Existing Position Check
         if (this.bot.hasOpenPosition(asset)) return;
+        
+        // 2. Lock Check
+        if (this.bot.isOrderInProgress) return;
 
-        // Set Locks
+        // 3. Set Lock
         this.lastTriggerTime[asset] = now;
-        this.bot.isOrderInProgress = true; // Lock the bot
+        this.bot.isOrderInProgress = true; 
 
         try {
             const spec = this.assets[asset];
 
-            // --- TRAILING STOP LOGIC (From MicroStrategy) ---
-            // 1. Calculate Distance
+            // 4. Trail Calculation
             let trailDistance = price * (this.TRAILING_PERCENT / 100);
-            
-            // 2. Enforce Tick Size
             const tickSize = 1 / Math.pow(10, spec.precision);
             if (trailDistance < tickSize) trailDistance = tickSize;
-
-            // 3. Format String
+            
+            // Format to fixed decimal string
             const trailAmount = trailDistance.toFixed(spec.precision);
-
-            // 4. Generate Robust ID
             const clientOid = `vel_${now}_${Math.floor(Math.random() * 1000)}`;
 
             const payload = {
                 product_id: spec.deltaId.toString(),
                 side: side,
-                size: process.env.ORDER_SIZE || "1",
+                size: (process.env.ORDER_SIZE || "1").toString(), // Ensure string
                 order_type: 'market_order',
                 client_order_id: clientOid,
-                // Bracket Parameters
-                bracket_trail_amount: trailAmount,
+                bracket_trail_amount: trailAmount, // Sent as string "0.0003"
                 bracket_stop_trigger_method: 'last_traded_price' 
             };
 
-            this.logger.info(`[Sniper] 鉢 FIRE ${asset} ${side.toUpperCase()} @ ${price} | Trail: ${trailAmount}`);
+            // [FIX] Clean Log (No Chinese)
+            this.logger.info(`[Sniper] FIRE ${asset} ${side.toUpperCase()} @ ${price} | Trail: ${trailAmount}`);
+            
+            // Execute
             await this.bot.placeOrder(payload);
 
         } catch (e) {
             this.logger.error(`[EXEC ERROR] ${e.message}`);
         } finally {
-            // [CRITICAL] Release Lock
+            // 5. Release Lock
             this.bot.isOrderInProgress = false;
         }
     }
 
-    onLaggerTrade(trade) {}
-    
-    // Reset timer immediately on close so we can re-enter
     onPositionClose(asset) {
         this.lastTriggerTime[asset] = 0;
         this.logger.info(`[LeadStrategy] ${asset} Closed. Cooldown Reset.`);
     }
     
-    getName() { return "LeadStrategy (Velocity + Trail)"; }
+    getName() { return "LeadStrategy (Cleaned)"; }
 }
 
 module.exports = LeadStrategy;
