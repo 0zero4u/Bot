@@ -44,12 +44,12 @@ class AdvanceStrategy {
         this.WARMUP_MS = 30000; // 30 Seconds
         
         // Z-SCORE SETTINGS
-        this.Z_SCORE_THRESHOLD = 2.2;    
+        this.Z_SCORE_THRESHOLD = 1.2;    
         this.MIN_GAP_THRESHOLD = 0.0006; 
         
         // BURST SETTINGS
         this.MIN_BURST_VELOCITY = 0.0001; 
-        this.DOMINANCE_RATIO = 0.7;       
+        this.DOMINANCE_RATIO = 0.65;       
 
         // LAG TRACKER SETTINGS
         this.LAG_CATCHUP_RATIO = 0.5;
