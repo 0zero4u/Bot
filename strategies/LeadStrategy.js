@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * LEAD STRATEGY: VELOCITY + TRAILING STOP
- * v6.0 [CLEANED LOGS + FIXED TRAIL + ROBUST LOCKING]
+ * v8.0 [FIXED: HISTORY AMNESIA + LOCKING + TRAIL LOGIC]
  * ============================================================================
  */
 
@@ -11,8 +11,8 @@ class LeadStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.MOVE_THRESHOLD = 0.00030;     // 0.03% price change required
-        this.TIME_LOOKBACK_MS = 40;        // Compare vs price 50ms ago
+        this.MOVE_THRESHOLD = 0.00015;     // 0.03% price change required
+        this.TIME_LOOKBACK_MS = 25;        // Compare vs price 50ms ago
         this.IMBALANCE_RATIO = 0.60;       // 60% Order Book Support required
         this.COOLDOWN_MS = 1000;           // 1s cooldown after firing
         this.TRAILING_PERCENT = 0.02;      // 0.02% Trailing Stop
@@ -36,7 +36,7 @@ class LeadStrategy {
             this.latestStats[a] = { change: 0, imbalance: 0.5, price: 0 };
         });
 
-        this.logger.info(`[LeadStrategy] Loaded v6.0 (Clean). 0.02% Trail.`);
+        this.logger.info(`[LeadStrategy] Loaded v8.0 (History Fix). 0.02% Trail.`);
         this.startHeartbeat();
     }
 
@@ -50,7 +50,6 @@ class LeadStrategy {
                 const changePct = (stats.change * 100).toFixed(4);
                 const imb = stats.imbalance.toFixed(2);
                 
-                // [FIX] Removed Chinese characters
                 let status = "[STABLE]";
                 if (Math.abs(stats.change) > (this.MOVE_THRESHOLD * 0.5)) status = "[ACTIVITY]";
                 if (Math.abs(stats.change) > this.MOVE_THRESHOLD) status = "[TRIGGER ZONE]";
@@ -77,13 +76,17 @@ class LeadStrategy {
         const history = this.priceHistory[asset];
         history.push({ p: currentPrice, t: now });
 
-        if (history.length > 50) {
-             const cutoff = now - 200;
-             while(history.length > 0 && history[0].t < cutoff) history.shift();
+        // [CRITICAL FIX] Memory Retention
+        // Keep 2000ms of history to handle slow feed updates (prevents 0% move errors)
+        if (history.length > 200) { 
+             const cutoff = now - 2000; 
+             while(history.length > 10 && history[0].t < cutoff) history.shift();
         }
 
         const targetTime = now - this.TIME_LOOKBACK_MS;
         let pastTick = null;
+        
+        // Find the tick closest to (but not newer than) targetTime
         for (let i = history.length - 1; i >= 0; i--) {
             if (history[i].t <= targetTime) {
                 pastTick = history[i];
@@ -123,7 +126,7 @@ class LeadStrategy {
         if (this.lastTriggerTime[asset] && (now - this.lastTriggerTime[asset] < this.COOLDOWN_MS)) return;
         if (this.bot.hasOpenPosition(asset)) return;
         
-        // 2. Lock Check
+        // 2. Lock Check (Prevents multiple orders firing at once)
         if (this.bot.isOrderInProgress) return;
 
         // 3. Set Lock
@@ -133,29 +136,26 @@ class LeadStrategy {
         try {
             const spec = this.assets[asset];
 
-            // 4. Trail Calculation
+            // 4. Trailing Stop Calculation
             let trailDistance = price * (this.TRAILING_PERCENT / 100);
             const tickSize = 1 / Math.pow(10, spec.precision);
             if (trailDistance < tickSize) trailDistance = tickSize;
             
-            // Format to fixed decimal string
+            // Format for API
             const trailAmount = trailDistance.toFixed(spec.precision);
             const clientOid = `vel_${now}_${Math.floor(Math.random() * 1000)}`;
 
             const payload = {
                 product_id: spec.deltaId.toString(),
                 side: side,
-                size: (process.env.ORDER_SIZE || "1").toString(), // Ensure string
+                size: (process.env.ORDER_SIZE || "1").toString(),
                 order_type: 'market_order',
                 client_order_id: clientOid,
-                bracket_trail_amount: trailAmount, // Sent as string "0.0003"
+                bracket_trail_amount: trailAmount,
                 bracket_stop_trigger_method: 'last_traded_price' 
             };
 
-            // [FIX] Clean Log (No Chinese)
             this.logger.info(`[Sniper] FIRE ${asset} ${side.toUpperCase()} @ ${price} | Trail: ${trailAmount}`);
-            
-            // Execute
             await this.bot.placeOrder(payload);
 
         } catch (e) {
@@ -171,8 +171,8 @@ class LeadStrategy {
         this.logger.info(`[LeadStrategy] ${asset} Closed. Cooldown Reset.`);
     }
     
-    getName() { return "LeadStrategy (Cleaned)"; }
+    getName() { return "LeadStrategy (History Fixed)"; }
 }
 
 module.exports = LeadStrategy;
-                
+                               
