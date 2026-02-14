@@ -10,7 +10,7 @@
 
 class TimeWeightedEMV {
     // Replaced tick count with timeWindowMs (e.g., 60000ms = 60 seconds)
-    constructor(timeWindowMs = 500) { 
+    constructor(timeWindowMs = 50) { 
         this.timeWindow = timeWindowMs;
         this.mean = 0;
         this.variance = 0;
@@ -18,7 +18,7 @@ class TimeWeightedEMV {
         this.lastTimestamp = 0;
     }
 
-    add(val, timestamp, limitSigma = 3) {
+    add(val, timestamp, limitSigma = 2) {
         let safeVal = val;
         
         // Winsorization: Clamp extreme outliers
@@ -54,7 +54,7 @@ class TimeWeightedEMV {
 
     getStats() {
         // Require at least 50 ticks to establish initial confidence before trading
-        if (this.count < 50) return { mean: 0, stdDev: 0 }; 
+        if (this.count < 5) return { mean: 0, stdDev: 0 }; 
         
         return { 
             mean: this.mean, 
@@ -69,7 +69,7 @@ class AdvanceStrategy {
         this.logger = bot.logger;
 
         // --- PURE ARBITRAGE CONFIGURATION ---
-        this.WARMUP_MS = 500; // 30 Seconds
+        this.WARMUP_MS = 50; // 30 Seconds
         
         // Z-SCORE SETTINGS
         this.Z_SCORE_THRESHOLD = 0.5;    // Tune this for sensitivity
