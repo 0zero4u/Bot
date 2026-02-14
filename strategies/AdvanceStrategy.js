@@ -7,7 +7,7 @@
  */
 
 class TimeWeightedEMV {
-    constructor(timeWindowMs = 100) { 
+    constructor(timeWindowMs = 300) { 
         this.timeWindow = timeWindowMs;
         this.mean = 0;
         this.variance = 0;
@@ -61,11 +61,11 @@ class AdvanceStrategy {
         this.logger = bot.logger;
 
         // --- PURE ARBITRAGE CONFIGURATION ---
-        this.WARMUP_MS = 100; 
+        this.WARMUP_MS = 300; 
         
         // Z-SCORE SETTINGS
         this.Z_SCORE_THRESHOLD = 3.0;    
-        this.MIN_GAP_THRESHOLD = 0.0003; 
+        this.MIN_GAP_THRESHOLD = 0.0009; 
         
         // TRAILING STOP & TAKE PROFIT
         this.TRAILING_PERCENT = 0.035; 
@@ -90,7 +90,7 @@ class AdvanceStrategy {
                     deltaLastUpdate: 0,
                     binanceMid: 0,
                     lockedUntil: 0,
-                    gapStats: new TimeWeightedEMV(100), 
+                    gapStats: new TimeWeightedEMV(300), 
                     emaBasis: 0,
                     initialized: false
                 };
