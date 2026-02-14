@@ -68,7 +68,7 @@ class AdvanceStrategy {
         this.MIN_GAP_THRESHOLD = 0.0003; 
         
         // TRAILING STOP & TAKE PROFIT
-        this.TRAILING_PERCENT = 0.023; 
+        this.TRAILING_PERCENT = 0.035; 
         this.TP_PERCENT = 0.00120; // 0.06%
         this.LOCK_DURATION_MS = 5000;    
 
