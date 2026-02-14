@@ -2,9 +2,10 @@
  * trader.js
  * ALIGNED WITH LEAD STRATEGY v16 + MARKET LISTENER v3
  * Fixes:
- * 1. LOGGING: Inspects and logs full JSON of order failures (Fixes "MISS: [object Object]" blindness).
- * 2. DATA: Automatically appends "USD" to assets for 'all_trades' subscription.
+ * 1. LOGGING: Inspects and logs full JSON of order failures.
+ * 2. DATA: Automatically appends "USD" to assets for 'all_trades'.
  * 3. SETUP: Explicitly starts Strategy (enables Heartbeat/Warmup).
+ * 4. STATE: Added hasOpenPosition() check.
  */
 
 const WebSocket = require('ws');
@@ -78,7 +79,6 @@ class TradingBot {
         this.orderLatencies = new Map(); 
         
         // --- ASSET LOADING ---
-        // 1. Load from Env, Split, Trim, Uppercase
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL')
             .split(',')
             .map(a => a.trim().toUpperCase());
@@ -100,6 +100,11 @@ class TradingBot {
             this.logger.error(`FATAL: Could not load strategy: ${e.message}`);
             process.exit(1);
         }
+    }
+
+    // --- State Check Helper ---
+    hasOpenPosition(asset) {
+        return this.activePositions[asset] === true;
     }
 
     // --- Latency Helper ---
@@ -205,7 +210,6 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        // Maps ['XRP'] -> ['XRPUSD']
         const tradeSymbols = this.targetAssets.map(asset => `${asset}USD`);
         
         this.logger.info(`Subscribing to: Orders, Positions, User Trades`);
@@ -270,7 +274,6 @@ class TradingBot {
         }
     }
 
-    // Forward 'all_trades' to Strategy
     forwardTradeToStrategy(tradeData) {
         if (this.strategy && this.strategy.onLaggerTrade) {
             this.strategy.onLaggerTrade(tradeData);
@@ -327,7 +330,6 @@ class TradingBot {
         }
     }
 
-    // --- SIGNAL HANDLING ---
     async handleSignalMessage(message) {
         if (!this.authenticated) {
             const now = Date.now();
@@ -369,7 +371,6 @@ class TradingBot {
         this.logger.info(`Internal Data Server running on port ${this.config.port}`);
     }
     
-    // ⚡ IMPROVED ORDER PLACEMENT & LOGGING
     async placeOrder(orderData) {
         if (orderData.client_order_id) {
             this.recordOrderPunch(orderData.client_order_id);
@@ -377,15 +378,12 @@ class TradingBot {
         try {
             const result = await this.client.placeOrder(orderData);
             
-            // 🔍 LOG REJECT DETAILS IF FAILED
-            // This prevents "MISS: [object Object]" blindness
             if (result && !result.success) {
                  this.logger.error(`[ORDER REJECT] Native Client returned failure: ${JSON.stringify(result)}`);
             }
             
             return result;
         } catch (error) {
-            // Handle exceptions (e.g., network error, crash)
             const errMsg = error.message || JSON.stringify(error);
             this.logger.error(`[ORDER FAIL] Native Client Exception: ${errMsg}`);
             throw error; 
@@ -412,4 +410,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-    
+                                             
