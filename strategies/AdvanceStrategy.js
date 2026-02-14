@@ -10,7 +10,7 @@
 
 class TimeWeightedEMV {
     // Replaced tick count with timeWindowMs (e.g., 60000ms = 60 seconds)
-    constructor(timeWindowMs = 50) { 
+    constructor(timeWindowMs = 20) { 
         this.timeWindow = timeWindowMs;
         this.mean = 0;
         this.variance = 0;
@@ -69,14 +69,14 @@ class AdvanceStrategy {
         this.logger = bot.logger;
 
         // --- PURE ARBITRAGE CONFIGURATION ---
-        this.WARMUP_MS = 50; // 30 Seconds
+        this.WARMUP_MS = 20; // 30 Seconds
         
         // Z-SCORE SETTINGS
-        this.Z_SCORE_THRESHOLD = 0.5;    // Tune this for sensitivity
+        this.Z_SCORE_THRESHOLD = 0.05;    // Tune this for sensitivity
         this.MIN_GAP_THRESHOLD = 0.0003; // Minimum 0.02% gap to even consider
         
         // TRAILING STOP
-        this.TRAILING_PERCENT = 0.1; 
+        this.TRAILING_PERCENT = 0.07; 
         this.LOCK_DURATION_MS = 500;    
 
         this.specs = {
