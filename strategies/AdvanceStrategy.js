@@ -7,7 +7,7 @@
  */
 
 class TimeWeightedEMV {
-    constructor(timeWindowMs = 10) { 
+    constructor(timeWindowMs = 100) { 
         this.timeWindow = timeWindowMs;
         this.mean = 0;
         this.variance = 0;
@@ -61,7 +61,7 @@ class AdvanceStrategy {
         this.logger = bot.logger;
 
         // --- PURE ARBITRAGE CONFIGURATION ---
-        this.WARMUP_MS = 10; 
+        this.WARMUP_MS = 100; 
         
         // Z-SCORE SETTINGS
         this.Z_SCORE_THRESHOLD = 0.07;    
