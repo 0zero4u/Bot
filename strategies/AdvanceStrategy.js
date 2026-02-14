@@ -73,7 +73,7 @@ class AdvanceStrategy {
         
         // Z-SCORE SETTINGS
         this.Z_SCORE_THRESHOLD = 1.5;    // Tune this for sensitivity
-        this.MIN_GAP_THRESHOLD = 0.0006; // Minimum 0.02% gap to even consider
+        this.MIN_GAP_THRESHOLD = 0.0004; // Minimum 0.02% gap to even consider
         
         // TRAILING STOP
         this.TRAILING_PERCENT = 0.1; 
