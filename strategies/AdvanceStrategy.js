@@ -1,15 +1,12 @@
 /**
  * AdvanceStrategy.js
- * v78.0 - [PURE ARBITRAGE MODE - TIME-WEIGHTED EMV]
+ * v78.1 - [PURE ARBITRAGE MODE - TIME-WEIGHTED EMV + TP & STATE FIX]
  * Updates:
- * - NO BUFFERS: Executes on the exact millisecond the gap threshold is crossed.
- * - TIME-WEIGHTED EMV: Decoupled variance from tick volume. Baseline is now governed strictly by time.
- * - O(1) COMPLEXITY: Zero garbage collection overhead. Mathematically instant execution.
- * - FIX (Tick Compression): Safely handles Binance 600+ tick/sec bursts without baseline distortion.
+ * - ADDED: 0.06% Take profit bracket calculation.
+ * - FIXED: Removed localInPosition blind-spots. Relies on true WS position state.
  */
 
 class TimeWeightedEMV {
-    // Replaced tick count with timeWindowMs (e.g., 60000ms = 60 seconds)
     constructor(timeWindowMs = 20) { 
         this.timeWindow = timeWindowMs;
         this.mean = 0;
@@ -21,7 +18,6 @@ class TimeWeightedEMV {
     add(val, timestamp, limitSigma = 2) {
         let safeVal = val;
         
-        // Winsorization: Clamp extreme outliers
         if (this.count > 1 && this.variance > 0) {
             const stdDev = Math.sqrt(this.variance);
             const upper = this.mean + (limitSigma * stdDev);
@@ -37,23 +33,19 @@ class TimeWeightedEMV {
             return;
         }
 
-        // Calculate time delta (dt) since the last tick
         const dt = Math.max(0, timestamp - this.lastTimestamp);
         this.lastTimestamp = timestamp;
 
-        // Dynamic Alpha: Weight scales with time elapsed, ignoring tick volume
         const alpha = 1 - Math.exp(-dt / this.timeWindow);
 
         const diff = safeVal - this.mean;
         this.mean += alpha * diff;
-        // Time-Weighted Exponential Moving Variance
         this.variance = (1 - alpha) * (this.variance + alpha * diff * diff);
         
         this.count++;
     }
 
     getStats() {
-        // Require at least 50 ticks to establish initial confidence before trading
         if (this.count < 5) return { mean: 0, stdDev: 0 }; 
         
         return { 
@@ -69,14 +61,15 @@ class AdvanceStrategy {
         this.logger = bot.logger;
 
         // --- PURE ARBITRAGE CONFIGURATION ---
-        this.WARMUP_MS = 20; // 30 Seconds
+        this.WARMUP_MS = 20; 
         
         // Z-SCORE SETTINGS
-        this.Z_SCORE_THRESHOLD = 0.05;    // Tune this for sensitivity
-        this.MIN_GAP_THRESHOLD = 0.0003; // Minimum 0.02% gap to even consider
+        this.Z_SCORE_THRESHOLD = 0.05;    
+        this.MIN_GAP_THRESHOLD = 0.0003; 
         
-        // TRAILING STOP
-        this.TRAILING_PERCENT = 0.07; 
+        // TRAILING STOP & TAKE PROFIT
+        this.TRAILING_PERCENT = 0.0003; 
+        this.TP_PERCENT = 0.0006; // 0.06%
         this.LOCK_DURATION_MS = 500;    
 
         this.specs = {
@@ -97,8 +90,6 @@ class AdvanceStrategy {
                     deltaLastUpdate: 0,
                     binanceMid: 0,
                     lockedUntil: 0,
-                    
-                    // STATS ENGINE: 60,000 milliseconds (60 seconds) Time Window
                     gapStats: new TimeWeightedEMV(20), 
                     emaBasis: 0,
                     initialized: false
@@ -106,14 +97,13 @@ class AdvanceStrategy {
             }
         });
 
-        this.localInPosition = false;
         this.warmupUntil = 0; 
         this.heartbeatInterval = null;
         
-        this.logger.info(`[Strategy] Loaded V78.0 (PURE ARBITRAGE MODE - TIME-WEIGHTED)`);
+        this.logger.info(`[Strategy] Loaded V78.1 (PURE ARBITRAGE MODE - TP & STATE FIXED)`);
     }
 
-    getName() { return "AdvanceStrategy (V78.0 Time-Weighted EMV)"; }
+    getName() { return "AdvanceStrategy (V78.1 Time-Weighted EMV)"; }
 
     async start() {
         this.warmupUntil = Date.now() + this.WARMUP_MS;
@@ -144,7 +134,6 @@ class AdvanceStrategy {
     }
 
     onPositionClose(asset) {
-        this.localInPosition = false;
         if (this.assets[asset]) {
             this.assets[asset].lockedUntil = 0;
             this.logger.info(`[Strategy] ${asset} Position Closed. Resetting locks.`);
@@ -174,7 +163,6 @@ class AdvanceStrategy {
 
         if (assetData.binanceMid > 0) {
             const currentDiff = (assetData.binanceMid - price) / price;
-            // The EMA acts as our long-term baseline anchor, ensuring structural differences don't misfire trades
             assetData.emaBasis = (assetData.emaBasis === 0) 
                 ? currentDiff 
                 : (assetData.emaBasis * 0.95) + (currentDiff * 0.05);
@@ -185,7 +173,7 @@ class AdvanceStrategy {
         const asset = data.s; 
         
         // --- 1. SAFETY CHECKS ---
-        if (this.localInPosition || this.bot.isOrderInProgress) return;
+        if (this.bot.isOrderInProgress) return;
         if (this.bot.hasOpenPosition && this.bot.hasOpenPosition(asset)) return;
 
         const assetData = this.assets[asset];
@@ -210,7 +198,6 @@ class AdvanceStrategy {
 
         const isWarmingUp = now < this.warmupUntil;
 
-        // Feed the stats engine (Notice we now pass 'now' as the timestamp)
         if (isWarmingUp || Math.abs(adjustedGap) < dynamicThreshold * 2.0) {
             assetData.gapStats.add(adjustedGap, now, 3.0); 
         }
@@ -218,13 +205,13 @@ class AdvanceStrategy {
         // --- 4. EXECUTION CHECK ---
         if (isWarmingUp) return;
 
-        // --- 5. PURE ARBITRAGE TRIGGER (INSTANT) ---
+        // --- 5. PURE ARBITRAGE TRIGGER ---
         let direction = null;
 
         if (adjustedGap > dynamicThreshold) {
-            direction = 'buy';  // Binance is significantly higher
+            direction = 'buy';  
         } else if (adjustedGap < -dynamicThreshold) {
-            direction = 'sell'; // Binance is significantly lower
+            direction = 'sell'; 
         }
 
         if (direction) {
@@ -233,7 +220,6 @@ class AdvanceStrategy {
     }
 
     async executeSniper(asset, side, binPrice, delPrice, gap, thresholdUsed) {
-        this.localInPosition = true;
         this.bot.isOrderInProgress = true;
         const spec = this.specs[asset];
 
@@ -243,15 +229,20 @@ class AdvanceStrategy {
             
             this.logger.info(`[Sniper] ⚡ TRIGGER ${asset} ${side.toUpperCase()} | Gap: ${(gap*100).toFixed(4)}% | Thresh: ${(thresholdUsed*100).toFixed(4)}%`);
 
-            // --- TRAILING STOP SIGN FIX (REVERTED TO DELTA STANDARD) ---
+            // --- TRAILING STOP CALCULATION ---
             let trailValue = delPrice * (this.TRAILING_PERCENT / 100);
             if (side === 'buy') {
                 trailValue = -Math.abs(trailValue); 
             } else {
                 trailValue = Math.abs(trailValue);
             }
-            
             const trailFixed = trailValue.toFixed(spec.precision);
+
+            // --- TAKE PROFIT CALCULATION ---
+            let tpPrice = (side === 'buy') 
+                ? delPrice * (1 + this.TP_PERCENT) 
+                : delPrice * (1 - this.TP_PERCENT);
+            const tpFixed = tpPrice.toFixed(spec.precision);
 
             const payload = { 
                 product_id: spec.deltaId.toString(), 
@@ -259,6 +250,7 @@ class AdvanceStrategy {
                 side: side, 
                 order_type: 'market_order',              
                 bracket_trail_amount: trailFixed, 
+                bracket_take_profit_price: tpFixed, 
                 bracket_stop_trigger_method: 'mark_price', 
                 client_order_id: clientOid
             };
@@ -268,20 +260,17 @@ class AdvanceStrategy {
             const latency = Date.now() - startT;
 
             if (orderResult && orderResult.success) {
-                 this.logger.info(`[Sniper] 🎯 FILLED ${asset} | Latency: ${latency}ms | Trail: ${trailFixed}`);
-                 setTimeout(() => { this.localInPosition = false; }, this.LOCK_DURATION_MS);
+                 this.logger.info(`[Sniper] 🎯 FILLED ${asset} | Latency: ${latency}ms | Trail: ${trailFixed} | TP: ${tpFixed}`);
             } else {
                 this.logger.error(`[Sniper] 💨 MISS: ${orderResult ? (orderResult.error ? JSON.stringify(orderResult.error) : 'Unknown Error') : 'No Result'}`);
-                this.localInPosition = false; 
             }
 
         } catch (error) {
             this.logger.error(`[Sniper] ❌ EXEC FAIL: ${error.message}`);
-            this.localInPosition = false; 
         } finally {
             this.bot.isOrderInProgress = false;
         }
     }
 }
 module.exports = AdvanceStrategy;
-                            
+                
