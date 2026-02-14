@@ -10,7 +10,7 @@
 
 class TimeWeightedEMV {
     // Replaced tick count with timeWindowMs (e.g., 60000ms = 60 seconds)
-    constructor(timeWindowMs = 60000) { 
+    constructor(timeWindowMs = 1000) { 
         this.timeWindow = timeWindowMs;
         this.mean = 0;
         this.variance = 0;
