@@ -99,7 +99,7 @@ class AdvanceStrategy {
                     lockedUntil: 0,
                     
                     // STATS ENGINE: 60,000 milliseconds (60 seconds) Time Window
-                    gapStats: new TimeWeightedEMV(60000), 
+                    gapStats: new TimeWeightedEMV(20), 
                     emaBasis: 0,
                     initialized: false
                 };
