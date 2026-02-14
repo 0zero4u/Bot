@@ -72,7 +72,7 @@ class AdvanceStrategy {
         this.WARMUP_MS = 500; // 30 Seconds
         
         // Z-SCORE SETTINGS
-        this.Z_SCORE_THRESHOLD = 1.5;    // Tune this for sensitivity
+        this.Z_SCORE_THRESHOLD = 0.5;    // Tune this for sensitivity
         this.MIN_GAP_THRESHOLD = 0.0003; // Minimum 0.02% gap to even consider
         
         // TRAILING STOP
