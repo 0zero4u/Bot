@@ -46,7 +46,7 @@ class TimeWeightedEMV {
     }
 
     getStats() {
-        if (this.count < 5) return { mean: 0, stdDev: 0 }; 
+        if (this.count < 1) return { mean: 0, stdDev: 0 }; 
         
         return { 
             mean: this.mean, 
