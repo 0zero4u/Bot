@@ -64,8 +64,8 @@ class AdvanceStrategy {
         this.WARMUP_MS = 100; 
         
         // Z-SCORE SETTINGS
-        this.Z_SCORE_THRESHOLD = 4.5;    
-        this.MIN_GAP_THRESHOLD = 0.0004; 
+        this.Z_SCORE_THRESHOLD = 3.0;    
+        this.MIN_GAP_THRESHOLD = 0.0003; 
         
         // TRAILING STOP & TAKE PROFIT
         this.TRAILING_PERCENT = 0.023; 
