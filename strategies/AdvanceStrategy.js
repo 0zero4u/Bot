@@ -1,36 +1,65 @@
 /**
  * AdvanceStrategy.js
- * v74.0 - [FIX: Bracket Order Position Exists]
+ * v78.0 - [PURE ARBITRAGE MODE - TIME-WEIGHTED EMV]
  * Updates:
- * - NOW CHECKS bot.hasOpenPosition(asset) before firing.
- * - Prevents "bracket_order_position_exists" error.
- * - Keeps Negative Trail fix for Buys.
+ * - NO BUFFERS: Executes on the exact millisecond the gap threshold is crossed.
+ * - TIME-WEIGHTED EMV: Decoupled variance from tick volume. Baseline is now governed strictly by time.
+ * - O(1) COMPLEXITY: Zero garbage collection overhead. Mathematically instant execution.
+ * - FIX (Tick Compression): Safely handles Binance 600+ tick/sec bursts without baseline distortion.
  */
 
-class RollingStats {
-    constructor(windowSize = 25) {
-        this.size = windowSize;
-        this.values = [];
+class TimeWeightedEMV {
+    // Replaced tick count with timeWindowMs (e.g., 60000ms = 60 seconds)
+    constructor(timeWindowMs = 60000) { 
+        this.timeWindow = timeWindowMs;
+        this.mean = 0;
+        this.variance = 0;
+        this.count = 0;
+        this.lastTimestamp = 0;
     }
 
-    add(val, limitSigma = 2) {
-        const stats = this.getStats();
+    add(val, timestamp, limitSigma = 3) {
         let safeVal = val;
-        // Winsorization: Clamp outliers to 3 stdDevs to prevent regime destruction
-        if (stats.stdDev > 0) {
-            const upper = stats.mean + (limitSigma * stats.stdDev);
-            const lower = stats.mean - (limitSigma * stats.stdDev);
+        
+        // Winsorization: Clamp extreme outliers
+        if (this.count > 1 && this.variance > 0) {
+            const stdDev = Math.sqrt(this.variance);
+            const upper = this.mean + (limitSigma * stdDev);
+            const lower = this.mean - (limitSigma * stdDev);
             safeVal = Math.max(Math.min(val, upper), lower);
         }
-        this.values.push(safeVal);
-        if (this.values.length > this.size) this.values.shift();
+
+        if (this.count === 0) {
+            this.mean = safeVal;
+            this.variance = 0;
+            this.lastTimestamp = timestamp;
+            this.count++;
+            return;
+        }
+
+        // Calculate time delta (dt) since the last tick
+        const dt = Math.max(0, timestamp - this.lastTimestamp);
+        this.lastTimestamp = timestamp;
+
+        // Dynamic Alpha: Weight scales with time elapsed, ignoring tick volume
+        const alpha = 1 - Math.exp(-dt / this.timeWindow);
+
+        const diff = safeVal - this.mean;
+        this.mean += alpha * diff;
+        // Time-Weighted Exponential Moving Variance
+        this.variance = (1 - alpha) * (this.variance + alpha * diff * diff);
+        
+        this.count++;
     }
 
     getStats() {
-        if (this.values.length < 5) return { mean: 0, stdDev: 0 }; 
-        const mean = this.values.reduce((a, b) => a + b, 0) / this.values.length;
-        const variance = this.values.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / this.values.length;
-        return { mean, stdDev: Math.sqrt(variance) };
+        // Require at least 50 ticks to establish initial confidence before trading
+        if (this.count < 50) return { mean: 0, stdDev: 0 }; 
+        
+        return { 
+            mean: this.mean, 
+            stdDev: Math.sqrt(this.variance) 
+        };
     }
 }
 
@@ -39,21 +68,13 @@ class AdvanceStrategy {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- CONFIGURATION ---
-        this.BURST_WINDOW_MS = 25;       
+        // --- PURE ARBITRAGE CONFIGURATION ---
         this.WARMUP_MS = 30000; // 30 Seconds
         
         // Z-SCORE SETTINGS
-        this.Z_SCORE_THRESHOLD = 1.0;    
-        this.MIN_GAP_THRESHOLD = 0.0004; 
+        this.Z_SCORE_THRESHOLD = 2.0;    // Tune this for sensitivity
+        this.MIN_GAP_THRESHOLD = 0.0002; // Minimum 0.02% gap to even consider
         
-        // BURST SETTINGS
-        this.MIN_BURST_VELOCITY = 0.0001; 
-        this.DOMINANCE_RATIO = 0.53;       
-
-        // LAG TRACKER SETTINGS
-        this.LAG_CATCHUP_RATIO = 0.5;
-
         // TRAILING STOP
         this.TRAILING_PERCENT = 0.1; 
         this.LOCK_DURATION_MS = 500;    
@@ -65,7 +86,6 @@ class AdvanceStrategy {
             'SOL': { deltaId: 417,   precision: 3, lot: 0.1 }
         };
 
-        // Initialize Assets
         const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         this.assets = {};
         
@@ -76,118 +96,73 @@ class AdvanceStrategy {
                     deltaPrice: 0,       
                     deltaLastUpdate: 0,
                     binanceMid: 0,
-                    binanceBuffer: [], 
                     lockedUntil: 0,
                     
-                    // LAG TRACKING STATE
-                    pendingBurst: null, 
-                    
-                    // STATS ENGINE
-                    gapStats: new RollingStats(60), 
+                    // STATS ENGINE: 60,000 milliseconds (60 seconds) Time Window
+                    gapStats: new TimeWeightedEMV(60000), 
                     emaBasis: 0,
-                    initialized: false,
-                    lastLogTime: 0
+                    initialized: false
                 };
             }
         });
 
         this.localInPosition = false;
-        this.warmupUntil = 0; // Set in start()
+        this.warmupUntil = 0; 
         this.heartbeatInterval = null;
         
-        this.logger.info(`[Strategy] Loaded V74 (Position Aware)`);
+        this.logger.info(`[Strategy] Loaded V78.0 (PURE ARBITRAGE MODE - TIME-WEIGHTED)`);
     }
 
-    // --- REQUIRED INTERFACE METHODS ---
-
-    getName() {
-        return "AdvanceStrategy (V74 Institutional)";
-    }
+    getName() { return "AdvanceStrategy (V78.0 Time-Weighted EMV)"; }
 
     async start() {
         this.warmupUntil = Date.now() + this.WARMUP_MS;
-        this.logger.info(`[Strategy] ⏳ WARMUP STARTED. Execution locked for 30s (Until: ${new Date(this.warmupUntil).toLocaleTimeString()})`);
-        
-        // Start Heartbeat Logger
+        this.logger.info(`[Strategy] ⏳ WARMUP STARTED. Execution locked for 30s...`);
         this.startHeartbeat();
     }
 
     startHeartbeat() {
         if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-        
         this.heartbeatInterval = setInterval(() => {
             const now = Date.now();
             const isWarming = now < this.warmupUntil;
             
             this.logger.info(`\n=== 🫀 STRATEGY HEARTBEAT (${isWarming ? 'WARMUP' : 'ACTIVE'}) ===`);
-            
             Object.keys(this.assets).forEach(key => {
                 const a = this.assets[key];
-                if (!a.initialized) {
-                    this.logger.info(`[${key}] Waiting for data...`);
-                    return;
-                }
-
+                if (!a.initialized) return;
+                
                 const stats = a.gapStats.getStats();
                 const rawGap = (a.binanceMid - a.deltaPrice) / (a.deltaPrice || 1);
                 const adjGap = rawGap - a.emaBasis;
                 const zScore = stats.stdDev > 0 ? (adjGap / stats.stdDev) : 0;
                 
-                this.logger.info(
-                    `[${key}] ` +
-                    `Δ:$${a.deltaPrice} | B:$${a.binanceMid.toFixed(2)} | ` +
-                    `Basis:${(a.emaBasis*100).toFixed(4)}% | ` +
-                    `Gap:${(adjGap*100).toFixed(4)}% (Z:${zScore.toFixed(2)}) | ` +
-                    `Burst:${a.pendingBurst ? (a.pendingBurst.dir > 0 ? 'UP' : 'DOWN') : 'None'}`
-                );
+                this.logger.info(`[${key}] Δ:$${a.deltaPrice} | B:$${a.binanceMid.toFixed(4)} | Basis:${(a.emaBasis*100).toFixed(4)}% | Gap:${(adjGap*100).toFixed(4)}% (Z:${zScore.toFixed(2)})`);
             });
             this.logger.info(`=================================================\n`);
-        }, 10000); // 10 Seconds
+        }, 10000);
     }
 
-    /**
-     * Called by Trader.js when a position is closed.
-     */
     onPositionClose(asset) {
         this.localInPosition = false;
         if (this.assets[asset]) {
             this.assets[asset].lockedUntil = 0;
-            this.assets[asset].pendingBurst = null;
             this.logger.info(`[Strategy] ${asset} Position Closed. Resetting locks.`);
         }
     }
 
-    /**
-     * Called by Trader.js when 'all_trades' arrives (Delta Lagger Feed)
-     */
     onLaggerTrade(trade) {
         const price = parseFloat(trade.price);
         const asset = Object.keys(this.assets).find(k => trade.symbol && trade.symbol.includes(k));
-        
-        if (asset) {
-            this.onDeltaUpdate(asset, price);
-        }
+        if (asset) this.onDeltaUpdate(asset, price);
     }
 
-    /**
-     * Called by Trader.js when 'B' type (Binance Fast Feed) arrives
-     */
     onDepthUpdate(asset, depthPayload) {
         if (!this.assets[asset]) return;
-        
         const bb = parseFloat(depthPayload.bids[0][0]);
         const ba = parseFloat(depthPayload.asks[0][0]);
-
-        const updateData = {
-            s: asset,
-            bb: bb,
-            ba: ba
-        };
-
-        this.onPriceUpdate(updateData);
+        this.onPriceUpdate({ s: asset, bb: bb, ba: ba });
     }
-
-    // --- INTERNAL LOGIC ---
 
     onDeltaUpdate(asset, price) {
         const assetData = this.assets[asset];
@@ -197,66 +172,21 @@ class AdvanceStrategy {
         assetData.deltaLastUpdate = Date.now();
         assetData.initialized = true;
 
-        // 1. UPDATE BASIS (Slow Drift)
         if (assetData.binanceMid > 0) {
             const currentDiff = (assetData.binanceMid - price) / price;
-            // Slow EMA to track structural basis
+            // The EMA acts as our long-term baseline anchor, ensuring structural differences don't misfire trades
             assetData.emaBasis = (assetData.emaBasis === 0) 
                 ? currentDiff 
                 : (assetData.emaBasis * 0.95) + (currentDiff * 0.05);
-            
-            // 2. CHECK LAG CLOSURE
-            this.checkLagClosure(asset, price);
-        }
-    }
-
-    checkLagClosure(asset, currentDeltaPrice) {
-        const data = this.assets[asset];
-        if (!data.pendingBurst) return;
-
-        const burst = data.pendingBurst;
-        const elapsed = Date.now() - burst.t;
-
-        if (elapsed > 2000) {
-            data.pendingBurst = null;
-            return;
-        }
-
-        const deltaMove = (currentDeltaPrice - burst.deltaStart);
-        const deltaPct = deltaMove / burst.deltaStart;
-        
-        let catchUpRatio = 0;
-        
-        if (burst.dir === 1 && deltaPct > 0) {
-            catchUpRatio = deltaPct / burst.binBurstSize;
-        } else if (burst.dir === -1 && deltaPct < 0) {
-            catchUpRatio = deltaPct / burst.binBurstSize; 
-        }
-
-        if (catchUpRatio >= this.LAG_CATCHUP_RATIO) {
-            this.logLag(asset, elapsed, catchUpRatio);
-            data.pendingBurst = null; 
-        }
-    }
-
-    logLag(asset, ms, ratio) {
-        if (ms > 50 || Math.random() < 0.1) {
-            this.logger.info(`[LagTracker] ${asset} caught up ${(ratio*100).toFixed(0)}% in ${ms}ms`);
         }
     }
 
     async onPriceUpdate(data) {
         const asset = data.s; 
         
-        // --- ⚡ CRITICAL FIX: CHECK REAL EXCHANGE POSITION ---
-        // If the bot holds a position on the exchange, DO NOT fire.
+        // --- 1. SAFETY CHECKS ---
         if (this.localInPosition || this.bot.isOrderInProgress) return;
-        
-        // Safely check bot.hasOpenPosition if it exists
-        if (this.bot.hasOpenPosition && this.bot.hasOpenPosition(asset)) {
-            // (Optional) Log sparingly if needed, or just return silently
-            return;
-        }
+        if (this.bot.hasOpenPosition && this.bot.hasOpenPosition(asset)) return;
 
         const assetData = this.assets[asset];
         if (!assetData || !assetData.initialized) return;
@@ -264,93 +194,37 @@ class AdvanceStrategy {
         const now = Date.now();
         if (now < assetData.lockedUntil) return;
 
+        // --- 2. GET CURRENT PRICE ---
         const midPrice = (data.bb + data.ba) / 2;
         assetData.binanceMid = midPrice;
 
-        assetData.binanceBuffer.push({ p: midPrice, t: now });
-        while (assetData.binanceBuffer.length > 0 && (now - assetData.binanceBuffer[0].t > this.BURST_WINDOW_MS)) {
-            assetData.binanceBuffer.shift();
-        }
-
-        // --- STATS UPDATE (Always run, even in Warmup) ---
-        // This ensures that when warmup ends, we have valid stdDev
+        // --- 3. CALCULATE STATISTICAL GAP ---
         const rawGap = (midPrice - assetData.deltaPrice) / assetData.deltaPrice;
         const adjustedGap = rawGap - assetData.emaBasis;
         
-        // Feed the stats engine
         const { stdDev } = assetData.gapStats.getStats();
         const dynamicThreshold = Math.max(
             this.MIN_GAP_THRESHOLD, 
             this.Z_SCORE_THRESHOLD * stdDev
         );
 
-        // Only add to stats if not in an extreme event (simple filtering)
-        if (Math.abs(adjustedGap) < dynamicThreshold * 2.0) {
-            assetData.gapStats.add(adjustedGap, 3.0); 
+        const isWarmingUp = now < this.warmupUntil;
+
+        // Feed the stats engine (Notice we now pass 'now' as the timestamp)
+        if (isWarmingUp || Math.abs(adjustedGap) < dynamicThreshold * 2.0) {
+            assetData.gapStats.add(adjustedGap, now, 3.0); 
         }
 
-        // --- EXECUTION CHECK (Blocked during Warmup) ---
-        if (now < this.warmupUntil) return;
-        if (assetData.binanceBuffer.length < 3) return;
+        // --- 4. EXECUTION CHECK ---
+        if (isWarmingUp) return;
 
-        // --- BURST ANALYSIS ---
-        const buffer = assetData.binanceBuffer;
-        const startPrice = buffer[0].p;
-        let maxP = -Infinity, minP = Infinity;
-        
-        for (let b of buffer) {
-            if (b.p > maxP) maxP = b.p;
-            if (b.p < minP) minP = b.p;
-        }
-
-        const upImpulse = maxP - startPrice;
-        const downImpulse = startPrice - minP;
-        const totalRange = upImpulse + downImpulse;
-
-        // --- LAG TRACKER REGISTRATION ---
-        if (!assetData.pendingBurst) {
-            const burstThreshold = this.MIN_BURST_VELOCITY * startPrice * 2.0; 
-            
-            if (upImpulse > burstThreshold) {
-                assetData.pendingBurst = { 
-                    t: now, 
-                    dir: 1, 
-                    deltaStart: assetData.deltaPrice,
-                    binBurstSize: upImpulse / startPrice 
-                };
-            } else if (downImpulse > burstThreshold) {
-                assetData.pendingBurst = { 
-                    t: now, 
-                    dir: -1, 
-                    deltaStart: assetData.deltaPrice,
-                    binBurstSize: -(downImpulse / startPrice) 
-                };
-            }
-        }
-
-        // --- TRADING LOGIC ---
+        // --- 5. PURE ARBITRAGE TRIGGER (INSTANT) ---
         let direction = null;
 
-        if (Math.abs(adjustedGap) > dynamicThreshold) {
-            if (adjustedGap > 0) { // BUY
-                const dominance = upImpulse / (totalRange || 1);
-                const retracement = (maxP - midPrice) / (upImpulse || 1);
-                
-                if (dominance > this.DOMINANCE_RATIO && 
-                    upImpulse > this.MIN_BURST_VELOCITY * startPrice &&
-                    retracement < 0.3) {
-                    direction = 'buy';
-                }
-            } else { // SELL
-                const dominance = downImpulse / (totalRange || 1);
-                const retracement = (midPrice - minP) / (downImpulse || 1);
-
-                if (dominance > this.DOMINANCE_RATIO && 
-                    downImpulse > this.MIN_BURST_VELOCITY * startPrice &&
-                    retracement < 0.3) {
-                    direction = 'sell';
-                }
-            }
+        if (adjustedGap > dynamicThreshold) {
+            direction = 'buy';  // Binance is significantly higher
+        } else if (adjustedGap < -dynamicThreshold) {
+            direction = 'sell'; // Binance is significantly lower
         }
 
         if (direction) {
@@ -369,15 +243,12 @@ class AdvanceStrategy {
             
             this.logger.info(`[Sniper] ⚡ TRIGGER ${asset} ${side.toUpperCase()} | Gap: ${(gap*100).toFixed(4)}% | Thresh: ${(thresholdUsed*100).toFixed(4)}%`);
 
-            // --- ⚡ HANDLE TRAILING STOP SIGN ---
-            // Buy Order: Stop is BELOW price (Negative Offset)
-            // Sell Order: Stop is ABOVE price (Positive Offset)
+            // --- TRAILING STOP SIGN FIX (REVERTED TO DELTA STANDARD) ---
             let trailValue = delPrice * (this.TRAILING_PERCENT / 100);
-            
             if (side === 'buy') {
-                trailValue = -Math.abs(trailValue); // MUST BE NEGATIVE FOR BUY
+                trailValue = -Math.abs(trailValue); 
             } else {
-                trailValue = Math.abs(trailValue);  // MUST BE POSITIVE FOR SELL
+                trailValue = Math.abs(trailValue);
             }
             
             const trailFixed = trailValue.toFixed(spec.precision);
@@ -412,6 +283,5 @@ class AdvanceStrategy {
         }
     }
 }
-
 module.exports = AdvanceStrategy;
-            
+                            
