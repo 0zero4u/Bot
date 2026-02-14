@@ -70,7 +70,7 @@ class AdvanceStrategy {
         // TRAILING STOP & TAKE PROFIT
         this.TRAILING_PERCENT = 0.023; 
         this.TP_PERCENT = 0.00120; // 0.06%
-        this.LOCK_DURATION_MS = 500;    
+        this.LOCK_DURATION_MS = 5000;    
 
         this.specs = {
             'BTC': { deltaId: 27,    precision: 1, lot: 0.001 },
