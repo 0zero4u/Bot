@@ -15,7 +15,7 @@ class TimeWeightedEMV {
         this.lastTimestamp = 0;
     }
 
-    add(val, timestamp, limitSigma = 2) {
+    add(val, timestamp, limitSigma = 1) {
         let safeVal = val;
         
         if (this.count > 1 && this.variance > 0) {
@@ -65,7 +65,7 @@ class AdvanceStrategy {
         
         // Z-SCORE SETTINGS
         this.Z_SCORE_THRESHOLD = 0.07;    
-        this.MIN_GAP_THRESHOLD = 0.00065; 
+        this.MIN_GAP_THRESHOLD = 0.00035; 
         
         // TRAILING STOP & TAKE PROFIT
         this.TRAILING_PERCENT = 0.023; 
