@@ -10,7 +10,7 @@
 
 class TimeWeightedEMV {
     // Replaced tick count with timeWindowMs (e.g., 60000ms = 60 seconds)
-    constructor(timeWindowMs = 1000) { 
+    constructor(timeWindowMs = 15000) { 
         this.timeWindow = timeWindowMs;
         this.mean = 0;
         this.variance = 0;
@@ -69,7 +69,7 @@ class AdvanceStrategy {
         this.logger = bot.logger;
 
         // --- PURE ARBITRAGE CONFIGURATION ---
-        this.WARMUP_MS = 30000; // 30 Seconds
+        this.WARMUP_MS = 15000; // 30 Seconds
         
         // Z-SCORE SETTINGS
         this.Z_SCORE_THRESHOLD = 1.5;    // Tune this for sensitivity
