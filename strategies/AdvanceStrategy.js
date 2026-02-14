@@ -90,7 +90,7 @@ class AdvanceStrategy {
                     deltaLastUpdate: 0,
                     binanceMid: 0,
                     lockedUntil: 0,
-                    gapStats: new TimeWeightedEMV(20), 
+                    gapStats: new TimeWeightedEMV(100), 
                     emaBasis: 0,
                     initialized: false
                 };
