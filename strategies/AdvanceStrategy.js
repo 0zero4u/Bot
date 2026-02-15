@@ -51,8 +51,8 @@ class AdvanceStrategy {
 
         // --- RISK SETTINGS ---
         this.ENTRY_BUFFER_TICKS = 3;   
-        this.TRAILING_PERCENT = 0.0035; 
-        this.TP_PERCENT = 0.00020; 
+        this.TRAILING_PERCENT = 0.00015; 
+        this.TP_PERCENT = 0.00100; 
         this.LOCK_DURATION_MS = 5000;    
 
         // --- DYNAMIC ENV SIZE ---
