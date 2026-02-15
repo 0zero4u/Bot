@@ -43,15 +43,15 @@ class AdvanceStrategy {
         this.logger = bot.logger;
 
         // --- BINARY TIMING (STRICT) ---
-        this.TIME_NOISE = 15;      // Wait for WS jitter to settle
-        this.TIME_KILL = 65;       // HARD CUTOFF. 66ms+ = NO TRADE.
+        this.TIME_NOISE = 4;      // Wait for WS jitter to settle
+        this.TIME_KILL = 40;       // HARD CUTOFF. 66ms+ = NO TRADE.
         
         this.FRESHNESS_LIMIT_MS = 10; 
         this.DEPLETION_RATIO = 2.0; 
 
         // --- RISK SETTINGS ---
-        this.ENTRY_BUFFER_TICKS = 10;   
-        this.TRAILING_PERCENT = 0.00900; 
+        this.ENTRY_BUFFER_TICKS = 4;   
+        this.TRAILING_PERCENT = 0.00300; 
         // Bracket Take Profit removed per request
         this.LOCK_DURATION_MS = 5000;    
 
