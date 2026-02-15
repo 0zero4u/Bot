@@ -1,11 +1,13 @@
+
 /**
  * AdvanceStrategy.js
- * v83.1 - BINARY SNIPER (ENV ORDER SIZE)
+ * v83.2 - BINARY SNIPER (ENV ORDER SIZE + DYNAMIC TRAIL FIX)
  * * LOGIC:
  * 1. BINARY ENTRY: Either we are in the safe window (15-60ms) or we don't trade.
  * 2. NO GAMBLING: No "half size" trades in the danger zone.
  * 3. LIQUIDITY SYNC: Size is capped by BBO quantity to prevent slippage.
  * 4. DYNAMIC SIZING: Base lot size can be overridden via process.env.ORDER_SIZE
+ * 5. TRAILING FIX: Trail amount is strictly absolute, TP widened to allow trailing.
  */
 
 class PriceHistory {
@@ -51,8 +53,8 @@ class AdvanceStrategy {
 
         // --- RISK SETTINGS ---
         this.ENTRY_BUFFER_TICKS = 10;   
-        this.TRAILING_PERCENT = 0.00900; 
-        this.TP_PERCENT = 0.00100; 
+        this.TRAILING_PERCENT = 0.03;    // Set to 0.03% to track peak trailing 
+        this.TP_PERCENT = 0.05000;       // Set wide to 5% so trailing stop has room to work
         this.LOCK_DURATION_MS = 5000;    
 
         // --- DYNAMIC ENV SIZE ---
@@ -89,13 +91,13 @@ class AdvanceStrategy {
         });
 
         this.stats = { signals: 0, fills: 0, misses: 0 };
-        this.logger.info(`[Strategy] Loaded V83.1 (BINARY SNIPER) | ENV Size: ${envSize ? envSize : 'Default'}`);
+        this.logger.info(`[Strategy] Loaded V83.2 (BINARY SNIPER) | ENV Size: ${envSize ? envSize : 'Default'} | Trail: ${this.TRAILING_PERCENT}%`);
     }
 
-    getName() { return "AdvanceStrategy (V83.1 Binary)"; }
+    getName() { return "AdvanceStrategy (V83.2 Binary)"; }
 
     async start() {
-        this.logger.info(`[Strategy] 🟢 V83.1 Engine Started.`);
+        this.logger.info(`[Strategy] 🟢 V83.2 Engine Started.`);
     }
 
     onExchange1Quote(msg) {
@@ -217,14 +219,19 @@ class AdvanceStrategy {
 
             const quotePrice = side === 'buy' ? data.ex1Ask : data.ex1Bid;
             
-            this.logger.info(`[Sniper] ⚡ ${asset} ${side.toUpperCase()} | Type: ${type} | T+${dt}ms | Size: ${finalSize.toFixed(4)}`);
-
+            // --- BRACKET CALCULATIONS ---
+            // Calculate absolute trail distance 
             let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
-            trailValue = side === 'buy' ? -Math.abs(trailValue) : Math.abs(trailValue);
             
+            // API expects absolute price difference, strictly positive
+            trailValue = Math.abs(trailValue);
+            
+            // Wide Take-Profit so trailing stop functions unhindered
             let tpPrice = (side === 'buy') 
                 ? quotePrice * (1 + this.TP_PERCENT) 
                 : quotePrice * (1 - this.TP_PERCENT);
+
+            this.logger.info(`[Sniper] ⚡ ${asset} ${side.toUpperCase()} | Type: ${type} | T+${dt}ms | Size: ${finalSize.toFixed(4)} | Trail Dist: ${trailValue.toFixed(spec.precision)}`);
 
             const payload = { 
                 product_id: spec.deltaId.toString(), 
@@ -257,4 +264,3 @@ class AdvanceStrategy {
     }
 }
 module.exports = AdvanceStrategy;
-                
