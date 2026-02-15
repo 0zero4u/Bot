@@ -8,20 +8,18 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Node.js Interface
-# [FIX] Added "serde-json" feature here so we can return JSON objects to JS
-napi = { version = "2.14", features = ["async", "napi4", "serde-json"] }
+# [FIXED]: Added 'tokio_rt' and 'threadsafe_function' back for the Binance WebSocket background thread
+napi = { version = "2.14", features = ["async", "napi4", "serde-json", "tokio_rt", "threadsafe_function"] }
 napi-derive = "2.14"
 
 # --- THE HFT COMBO ---
 fast_websocket_client = "0.4.1"
 simd-json = "0.13"
-serde = { version = "1.0", features = ["derive"] }
 
 # Async Runtime (The engine)
 tokio = { version = "1", features = ["full"] }
 
 # High-Performance HTTP Client
-# We use 'rustls-tls' because it's often faster and easier to compile than OpenSSL
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 
 # Cryptography (HMAC SHA256)
@@ -29,7 +27,7 @@ hmac = "0.12.1"
 sha2 = "0.10.8"
 hex = "0.4.3"
 
-# JSON Parsing (Fastest in the west)
+# JSON Parsing
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
