@@ -50,7 +50,7 @@ class AdvanceStrategy {
         this.DEPLETION_RATIO = 2.0; 
 
         // --- RISK SETTINGS ---
-        this.ENTRY_BUFFER_TICKS = 4;   
+        this.ENTRY_BUFFER_TICKS = 5;   
         this.TRAILING_PERCENT = 0.035; 
         this.TP_PERCENT = 0.00035; 
         this.LOCK_DURATION_MS = 5000;    
