@@ -44,7 +44,7 @@ class AdvanceStrategy {
 
         // --- BINARY TIMING (STRICT) ---
         this.TIME_NOISE = 4;      // Wait for WS jitter to settle
-        this.TIME_KILL = 40;       // HARD CUTOFF. 66ms+ = NO TRADE.
+        this.TIME_KILL = 20;       // HARD CUTOFF. 66ms+ = NO TRADE.
         
         this.FRESHNESS_LIMIT_MS = 10; 
         this.DEPLETION_RATIO = 2.0; 
