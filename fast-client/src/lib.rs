@@ -37,8 +37,8 @@ impl DeltaNativeClient {
         .tcp_nodelay(true) 
         .pool_idle_timeout(None) 
         .pool_max_idle_per_host(10)
-        .connect_timeout(Duration::from_millis(2500)) 
-        .timeout(Duration::from_millis(2500))         
+        .connect_timeout(Duration::from_millis(2500)) // Fail fast configuration
+        .timeout(Duration::from_millis(2500))         // Fail fast configuration
         .user_agent("Mozilla/5.0 (compatible; DeltaBot/Native)")
         .build()
         .map_err(|e| Error::new(Status::GenericFailure, format!("Client build failed: {}", e)))?;
@@ -199,7 +199,10 @@ impl BinanceListener {
 
         let url = format!("wss://fstream.binance.com/stream?streams={}", streams);
 
+        // Isolate the HFT listener into its own OS Thread.
         std::thread::spawn(move || {
+            
+            // Build a dedicated async engine exclusively for this thread
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -213,13 +216,23 @@ impl BinanceListener {
                         Ok(mut client) => {
                             println!("[Rust-Listener] ✅ Connected & Streaming at SIMD speed.");
 
+                            // --- THE HFT FIX: REUSABLE SCRATCH BUFFER ---
+                            // Allocate memory exactly ONCE to prevent GC spikes and borrow checker errors
+                            let mut scratch_buffer: Vec<u8> = Vec::with_capacity(1024);
+
                             loop {
                                 match client.receive_frame().await {
                                     Ok(frame) => {
                                         if frame.opcode == OpCode::Text {
-                                            let mut payload = frame.payload; 
+                                            
+                                            // 1. Clear old data without deallocating memory
+                                            scratch_buffer.clear();
+                                            
+                                            // 2. Fast-copy the read-only network bytes into the mutable scratchpad
+                                            scratch_buffer.extend_from_slice(&frame.payload);
 
-                                            if let Ok(parsed) = simd_json::from_slice::<BinanceMsg>(&mut payload) {
+                                            // 3. simd-json safely mutates our scratch buffer using AVX2 registers
+                                            if let Ok(parsed) = simd_json::from_slice::<BinanceMsg>(&mut scratch_buffer) {
                                                 if let Some(data) = parsed.data {
                                                     
                                                     let asset_name = data.s.replace("USDT", "");
@@ -234,7 +247,7 @@ impl BinanceListener {
                                                         bb, bq, ba, aq,
                                                     };
 
-                                                    // [FIX APPLIED]: Wrapped 'update' in Ok()
+                                                    // Fire directly into the Node.js event loop asynchronously
                                                     callback.call(Ok(update), ThreadsafeFunctionCallMode::NonBlocking);
                                                 }
                                             }
@@ -258,5 +271,5 @@ impl BinanceListener {
 
         Ok(())
     }
-      }
-  
+  }
+                                
