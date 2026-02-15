@@ -1,57 +1,45 @@
 /**
  * AdvanceStrategy.js
- * v78.1 - [PURE ARBITRAGE MODE - TIME-WEIGHTED EMV + TP & STATE FIX]
- * Updates:
- * - ADDED: 0.06% Take profit bracket calculation.
- * - FIXED: Removed localInPosition blind-spots. Relies on true WS position state.
+ * v82.0 - FLOW-BASED MICROSTRUCTURE ARBITRAGE
+ * * CORE LOGIC CHANGES:
+ * 1. DEPLETION SIGNAL: Tracks 'Volume Since Update'. If (Vol > Limit), assumes liquidity is ghosted.
+ * 2. HIERARCHY: Trade-Through > Aggressive Trades > Fair Value.
+ * 3. ZONING: 
+ * - GOLD (20-40ms): 1.2x Size
+ * - SILVER (40-60ms): 1.0x Size
+ * - BRONZE (60-75ms): 0.5x Size
+ * 4. 3ms REVERSAL CHECK: Hard abort if Ex2 ticks against us in final moments.
  */
 
-class TimeWeightedEMV {
-    constructor(timeWindowMs = 300) { 
-        this.timeWindow = timeWindowMs;
-        this.mean = 0;
-        this.variance = 0;
-        this.count = 0;
-        this.lastTimestamp = 0;
+class PriceHistory {
+    constructor(retentionMs = 200) {
+        this.buffer = []; 
+        this.retentionMs = retentionMs;
     }
 
-    add(val, timestamp, limitSigma = 1) {
-        let safeVal = val;
-        
-        if (this.count > 1 && this.variance > 0) {
-            const stdDev = Math.sqrt(this.variance);
-            const upper = this.mean + (limitSigma * stdDev);
-            const lower = this.mean - (limitSigma * stdDev);
-            safeVal = Math.max(Math.min(val, upper), lower);
-        }
-
-        if (this.count === 0) {
-            this.mean = safeVal;
-            this.variance = 0;
-            this.lastTimestamp = timestamp;
-            this.count++;
-            return;
-        }
-
-        const dt = Math.max(0, timestamp - this.lastTimestamp);
-        this.lastTimestamp = timestamp;
-
-        const alpha = 1 - Math.exp(-dt / this.timeWindow);
-
-        const diff = safeVal - this.mean;
-        this.mean += alpha * diff;
-        this.variance = (1 - alpha) * (this.variance + alpha * diff * diff);
-        
-        this.count++;
+    add(price) {
+        const now = Date.now();
+        this.buffer.push({ price, ts: now });
+        if (this.buffer.length > 50) this.buffer.shift(); // Keep buffer small/fast
     }
 
-    getStats() {
-        if (this.count < 1) return { mean: 0, stdDev: 0 }; 
+    // Returns price change in last N ms
+    getTrend(msAgo) {
+        const now = Date.now();
+        const target = now - msAgo;
+        // Find closest snapshot strictly BEFORE or AT target
+        let pastPrice = null;
+        for (let i = this.buffer.length - 1; i >= 0; i--) {
+            if (this.buffer[i].ts <= target) {
+                pastPrice = this.buffer[i].price;
+                break;
+            }
+        }
+        if (pastPrice === null && this.buffer.length > 0) pastPrice = this.buffer[0].price;
+        if (pastPrice === null) return 0;
         
-        return { 
-            mean: this.mean, 
-            stdDev: Math.sqrt(this.variance) 
-        };
+        const currentPrice = this.buffer[this.buffer.length - 1].price;
+        return currentPrice - pastPrice;
     }
 }
 
@@ -60,23 +48,29 @@ class AdvanceStrategy {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- PURE ARBITRAGE CONFIGURATION ---
-        this.WARMUP_MS = 300; 
+        // --- MICROSTRUCTURE SETTINGS ---
+        this.TIME_NOISE = 15;      // Skip < 15ms (Noise)
+        this.TIME_GOLD_END = 40;   // 15-40ms (Best edge)
+        this.TIME_SILVER_END = 60; // 40-60ms (Good edge)
+        this.TIME_BRONZE_END = 75; // 60-75ms (Risk/Late)
         
-        // Z-SCORE SETTINGS
-        this.Z_SCORE_THRESHOLD = 1.0;    
-        this.MIN_GAP_THRESHOLD = 0.0007; 
+        this.FRESHNESS_LIMIT_MS = 20; // Trade-through valid only if < 20ms old
         
-        // TRAILING STOP & TAKE PROFIT
+        // --- DEPLETION SETTINGS ---
+        // If accumulated volume > (OurLot * Ratio), assume level is dead
+        this.DEPLETION_RATIO = 2.0; 
+
+        // --- RISK SETTINGS ---
+        this.ENTRY_BUFFER_TICKS = 2;   
         this.TRAILING_PERCENT = 0.035; 
-        this.TP_PERCENT = 0.0090; // 0.06%
+        this.TP_PERCENT = 0.0090; 
         this.LOCK_DURATION_MS = 5000;    
 
         this.specs = {
-            'BTC': { deltaId: 27,    precision: 1, lot: 0.001 },
-            'ETH': { deltaId: 299,   precision: 2, lot: 0.01 },
-            'XRP': { deltaId: 14969, precision: 4, lot: 1 },
-            'SOL': { deltaId: 417,   precision: 3, lot: 0.1 }
+            'BTC': { deltaId: 27,    precision: 1, lot: 0.002, minLot: 0.001, tickSize: 0.1 },
+            'ETH': { deltaId: 299,   precision: 2, lot: 0.02,  minLot: 0.01,  tickSize: 0.01 },
+            'XRP': { deltaId: 14969, precision: 4, lot: 20,    minLot: 10,    tickSize: 0.0001 },
+            'SOL': { deltaId: 417,   precision: 3, lot: 0.2,   minLot: 0.1,   tickSize: 0.001 }
         };
 
         const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
@@ -85,187 +79,248 @@ class AdvanceStrategy {
         targets.forEach(symbol => {
             if (this.specs[symbol]) {
                 this.assets[symbol] = {
-                    deltaId: this.specs[symbol].deltaId,
-                    deltaPrice: 0,       
-                    deltaLastUpdate: 0,
-                    binanceMid: 0,
+                    // Exchange 1 (Delta)
+                    ex1Bid: 0, ex1Ask: 0,
+                    ex1UpdateTs: 0,
+                    
+                    // FLOW TRACKING (Reset on Quote Update)
+                    volSinceUpdateBuy: 0, // Volume of trades hitting ASK
+                    volSinceUpdateSell: 0,// Volume of trades hitting BID
+                    
+                    // Trade-Through State
+                    lastTradePrice: 0,
+                    lastTradeTs: 0,
+                    
+                    // Exchange 2 (Binance)
+                    ex2Mid: 0,
+                    history: new PriceHistory(100),
+                    
+                    basis: 0,
                     lockedUntil: 0,
-                    gapStats: new TimeWeightedEMV(300), 
-                    emaBasis: 0,
                     initialized: false
                 };
             }
         });
 
-        this.warmupUntil = 0; 
-        this.heartbeatInterval = null;
-        
-        this.logger.info(`[Strategy] Loaded V78.1 (PURE ARBITRAGE MODE - TP & STATE FIXED)`);
+        this.stats = { signals: 0, fills: 0, misses: 0 };
+        this.logger.info(`[Strategy] Loaded V82.0 (FLOW + ZONING)`);
     }
 
-    getName() { return "AdvanceStrategy (V78.1 Time-Weighted EMV)"; }
+    getName() { return "AdvanceStrategy (V82.0 Flow)"; }
 
     async start() {
-        this.warmupUntil = Date.now() + this.WARMUP_MS;
-        this.logger.info(`[Strategy] ⏳ WARMUP STARTED. Execution locked for 30s...`);
-        this.startHeartbeat();
+        this.logger.info(`[Strategy] 🟢 V82 Engine Started.`);
     }
 
-    startHeartbeat() {
-        if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-        this.heartbeatInterval = setInterval(() => {
-            const now = Date.now();
-            const isWarming = now < this.warmupUntil;
-            
-            this.logger.info(`\n=== 🫀 STRATEGY HEARTBEAT (${isWarming ? 'WARMUP' : 'ACTIVE'}) ===`);
-            Object.keys(this.assets).forEach(key => {
-                const a = this.assets[key];
-                if (!a.initialized) return;
-                
-                const stats = a.gapStats.getStats();
-                const rawGap = (a.binanceMid - a.deltaPrice) / (a.deltaPrice || 1);
-                const adjGap = rawGap - a.emaBasis;
-                const zScore = stats.stdDev > 0 ? (adjGap / stats.stdDev) : 0;
-                
-                this.logger.info(`[${key}] Δ:$${a.deltaPrice} | B:$${a.binanceMid.toFixed(4)} | Basis:${(a.emaBasis*100).toFixed(4)}% | Gap:${(adjGap*100).toFixed(4)}% (Z:${zScore.toFixed(2)})`);
-            });
-            this.logger.info(`=================================================\n`);
-        }, 10000);
+    /**
+     * HANDLER 1: Delta Quote Update (The Reset)
+     * When this happens, we know the matching engine has "flushed" previous trades.
+     */
+    onExchange1Quote(msg) {
+        if (!msg.symbol) return;
+        const asset = Object.keys(this.assets).find(k => msg.symbol.includes(k));
+        if (!asset) return;
+
+        const data = this.assets[asset];
+        
+        data.ex1Bid = parseFloat(msg.bid || msg.best_bid || 0);
+        data.ex1Ask = parseFloat(msg.ask || msg.best_ask || 0);
+        
+        // CRITICAL: Reset Volume Counters
+        // New BBO means previous trade volume is now "priced in"
+        data.volSinceUpdateBuy = 0;
+        data.volSinceUpdateSell = 0;
+        
+        data.ex1UpdateTs = Date.now(); 
+        if (!data.initialized && data.ex1Bid > 0) data.initialized = true;
     }
 
-    onPositionClose(asset) {
-        if (this.assets[asset]) {
-            this.assets[asset].lockedUntil = 0;
-            this.logger.info(`[Strategy] ${asset} Position Closed. Resetting locks.`);
-        }
-    }
-
+    /**
+     * HANDLER 2: Delta Trade Execution (The Depletion Tracker)
+     */
     onLaggerTrade(trade) {
         const price = parseFloat(trade.price);
+        const size = parseFloat(trade.size || trade.qty || 0);
+        const side = trade.side; // 'buy' or 'sell'
+        
         const asset = Object.keys(this.assets).find(k => trade.symbol && trade.symbol.includes(k));
-        if (asset) this.onDeltaUpdate(asset, price);
-    }
+        if (!asset) return;
 
-    onDepthUpdate(asset, depthPayload) {
-        if (!this.assets[asset]) return;
-        const bb = parseFloat(depthPayload.bids[0][0]);
-        const ba = parseFloat(depthPayload.asks[0][0]);
-        this.onPriceUpdate({ s: asset, bb: bb, ba: ba });
-    }
-
-    onDeltaUpdate(asset, price) {
-        const assetData = this.assets[asset];
-        if (!assetData) return;
-
-        assetData.deltaPrice = price;
-        assetData.deltaLastUpdate = Date.now();
-        assetData.initialized = true;
-
-        if (assetData.binanceMid > 0) {
-            const currentDiff = (assetData.binanceMid - price) / price;
-            assetData.emaBasis = (assetData.emaBasis === 0) 
-                ? currentDiff 
-                : (assetData.emaBasis * 0.95) + (currentDiff * 0.05);
-        }
-    }
-
-    async onPriceUpdate(data) {
-        const asset = data.s; 
+        const data = this.assets[asset];
         
-        // --- 1. SAFETY CHECKS ---
-        if (this.bot.isOrderInProgress) return;
-        if (this.bot.hasOpenPosition && this.bot.hasOpenPosition(asset)) return;
+        // Update Trade-Through State
+        data.lastTradePrice = price;
+        data.lastTradeTs = Date.now();
 
-        const assetData = this.assets[asset];
-        if (!assetData || !assetData.initialized) return;
+        // Update Basis
+        if (data.ex2Mid > 0) data.basis = price - data.ex2Mid;
 
-        const now = Date.now();
-        if (now < assetData.lockedUntil) return;
-
-        // --- 2. GET CURRENT PRICE ---
-        const midPrice = (data.bb + data.ba) / 2;
-        assetData.binanceMid = midPrice;
-
-        // --- 3. CALCULATE STATISTICAL GAP ---
-        const rawGap = (midPrice - assetData.deltaPrice) / assetData.deltaPrice;
-        const adjustedGap = rawGap - assetData.emaBasis;
-        
-        const { stdDev } = assetData.gapStats.getStats();
-        const dynamicThreshold = Math.max(
-            this.MIN_GAP_THRESHOLD, 
-            this.Z_SCORE_THRESHOLD * stdDev
-        );
-
-        const isWarmingUp = now < this.warmupUntil;
-
-        if (isWarmingUp || Math.abs(adjustedGap) < dynamicThreshold * 2.0) {
-            assetData.gapStats.add(adjustedGap, now, 3.0); 
-        }
-
-        // --- 4. EXECUTION CHECK ---
-        if (isWarmingUp) return;
-
-        // --- 5. PURE ARBITRAGE TRIGGER ---
-        let direction = null;
-
-        if (adjustedGap > dynamicThreshold) {
-            direction = 'buy';  
-        } else if (adjustedGap < -dynamicThreshold) {
-            direction = 'sell'; 
-        }
-
-        if (direction) {
-            await this.executeSniper(asset, direction, midPrice, assetData.deltaPrice, adjustedGap, dynamicThreshold);
+        // ACCUMULATE AGGRESSIVE VOLUME
+        // Note: A 'buy' side trade on Delta means someone lifted the ASK.
+        if (side === 'buy') {
+            data.volSinceUpdateBuy += size;
+        } else {
+            data.volSinceUpdateSell += size;
         }
     }
 
-    async executeSniper(asset, side, binPrice, delPrice, gap, thresholdUsed) {
-        this.bot.isOrderInProgress = true;
+    /**
+     * HANDLER 3: Binance Depth Update (The Driver)
+     */
+    onDepthUpdate(update) {
+        const asset = update.s;
+        const data = this.assets[asset];
         const spec = this.specs[asset];
+        
+        if (!data || !data.initialized || this.bot.isOrderInProgress) return;
+        if (this.bot.hasOpenPosition(asset)) return;
+        
+        const now = Date.now();
+        if (now < data.lockedUntil) return;
+
+        // 1. Update Binance State
+        const bb = parseFloat(update.bb);
+        const ba = parseFloat(update.ba);
+        data.ex2Mid = (bb + ba) / 2;
+        data.history.add(data.ex2Mid);
+
+        // 2. CHECK TIME ZONE
+        const dt = now - data.ex1UpdateTs;
+
+        // Filter Noise & Late
+        if (dt < this.TIME_NOISE || dt > this.TIME_BRONZE_END) return;
+
+        // 3. DEPLETION CHECK (Ghost Liquidity)
+        // If we want to BUY, we check if others have already bought too much
+        const maxVol = spec.lot * this.DEPLETION_RATIO;
+        const isAskDepleted = data.volSinceUpdateBuy > maxVol;
+        const isBidDepleted = data.volSinceUpdateSell > maxVol;
+
+        // 4. SIGNAL GENERATION
+        let signal = null;
+        let signalType = '';
+
+        const bufferVal = spec.tickSize * this.ENTRY_BUFFER_TICKS;
+        const fairEx1 = data.ex2Mid + data.basis;
+        const isFreshTrade = (now - data.lastTradeTs) < this.FRESHNESS_LIMIT_MS;
+
+        // --- HIERARCHY 1: TRADE-THROUGH (The "Gold" Signal) ---
+        if (isFreshTrade) {
+            if (data.lastTradePrice >= data.ex1Ask) {
+                // Price moved UP. Check if ask is still alive.
+                if (!isAskDepleted) {
+                    signal = 'buy';
+                    signalType = 'TRADE_THROUGH';
+                }
+            } else if (data.lastTradePrice <= data.ex1Bid && data.lastTradePrice > 0) {
+                // Price moved DOWN. Check if bid is still alive.
+                if (!isBidDepleted) {
+                    signal = 'sell';
+                    signalType = 'TRADE_THROUGH';
+                }
+            }
+        }
+
+        // --- HIERARCHY 2: FAIR VALUE DEVIATION ---
+        if (!signal) {
+            if (fairEx1 > (data.ex1Ask + bufferVal)) {
+                 if (!isAskDepleted) {
+                     signal = 'buy';
+                     signalType = 'FV_DEVIATION';
+                 }
+            } else if (fairEx1 < (data.ex1Bid - bufferVal)) {
+                 if (!isBidDepleted) {
+                     signal = 'sell';
+                     signalType = 'FV_DEVIATION';
+                 }
+            }
+        }
+
+        if (!signal) return;
+
+        // 5. MICRO-REVERSAL FILTER (3ms)
+        // "If last 3ms tick opposite -> cancel"
+        const trend3ms = data.history.getTrend(3); // Change in last 3ms
+        
+        if (signal === 'buy') {
+            if (trend3ms < 0) { // Price ticking down in last 3ms
+                // this.logger.debug(`[Filter] 3ms Reversal prevented BUY on ${asset}`);
+                return; 
+            }
+        } else {
+            if (trend3ms > 0) { // Price ticking up in last 3ms
+                // this.logger.debug(`[Filter] 3ms Reversal prevented SELL on ${asset}`);
+                return;
+            }
+        }
+
+        // 6. ZONE SIZING (Time-Weighted Aggression)
+        let sizeMult = 1.0;
+        let zoneName = 'SILVER';
+
+        if (dt <= this.TIME_GOLD_END) {
+            sizeMult = 1.2; // Aggressive Early
+            zoneName = 'GOLD';
+        } else if (dt > this.TIME_SILVER_END) {
+            sizeMult = 0.5; // Conservative Late
+            zoneName = 'BRONZE';
+        }
+
+        // 7. EXECUTE
+        this.executeSniper(asset, signal, fairEx1, dt, sizeMult, signalType, zoneName);
+    }
+
+    async executeSniper(asset, side, fairPrice, dt, sizeMult, type, zone) {
+        this.bot.isOrderInProgress = true;
+        this.stats.signals++;
+
+        const spec = this.specs[asset];
+        const data = this.assets[asset];
 
         try {
-            this.assets[asset].lockedUntil = Date.now() + this.LOCK_DURATION_MS;
-            const clientOid = `adv_${Date.now()}`;
+            data.lockedUntil = Date.now() + this.LOCK_DURATION_MS;
             
-            this.logger.info(`[Sniper] ⚡ TRIGGER ${asset} ${side.toUpperCase()} | Gap: ${(gap*100).toFixed(4)}% | Thresh: ${(thresholdUsed*100).toFixed(4)}%`);
+            // Calculate Sizing
+            let finalSize = spec.lot * sizeMult;
+            if (finalSize < spec.minLot) finalSize = spec.minLot;
 
-            // --- TRAILING STOP CALCULATION ---
-            let trailValue = delPrice * (this.TRAILING_PERCENT / 100);
-            if (side === 'buy') {
-                trailValue = -Math.abs(trailValue); 
-            } else {
-                trailValue = Math.abs(trailValue);
-            }
-            const trailFixed = trailValue.toFixed(spec.precision);
+            // Quote Price for TP/SL ref
+            const quotePrice = side === 'buy' ? data.ex1Ask : data.ex1Bid;
+            
+            this.logger.info(`[Sniper] ⚡ ${asset} ${side.toUpperCase()} | Type: ${type} | Zone: ${zone} (${dt}ms) | Size: ${finalSize.toFixed(3)}`);
 
-            // --- TAKE PROFIT CALCULATION ---
+            // TP & SL Calculation
+            let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
+            trailValue = side === 'buy' ? -Math.abs(trailValue) : Math.abs(trailValue);
+            
             let tpPrice = (side === 'buy') 
-                ? delPrice * (1 + this.TP_PERCENT) 
-                : delPrice * (1 - this.TP_PERCENT);
-            const tpFixed = tpPrice.toFixed(spec.precision);
+                ? quotePrice * (1 + this.TP_PERCENT) 
+                : quotePrice * (1 - this.TP_PERCENT);
 
             const payload = { 
                 product_id: spec.deltaId.toString(), 
-                size: spec.lot.toString(), 
+                size: finalSize.toFixed(6), 
                 side: side, 
                 order_type: 'market_order',              
-                bracket_trail_amount: trailFixed, 
-                bracket_take_profit_price: tpFixed, 
+                bracket_trail_amount: trailValue.toFixed(spec.precision), 
+                bracket_take_profit_price: tpPrice.toFixed(spec.precision), 
                 bracket_stop_trigger_method: 'mark_price', 
-                client_order_id: clientOid
+                client_order_id: `snipe_${Date.now()}`
             };
             
             const startT = Date.now();
             const orderResult = await this.bot.placeOrder(payload);
-            const latency = Date.now() - startT;
+            const execTime = Date.now() - startT;
 
             if (orderResult && orderResult.success) {
-                 this.logger.info(`[Sniper] 🎯 FILLED ${asset} | Latency: ${latency}ms | Trail: ${trailFixed} | TP: ${tpFixed}`);
+                 this.stats.fills++;
+                 this.logger.info(`[Sniper] 🎯 FILLED ${asset} | Exec: ${execTime}ms`);
             } else {
-                this.logger.error(`[Sniper] 💨 MISS: ${orderResult ? (orderResult.error ? JSON.stringify(orderResult.error) : 'Unknown Error') : 'No Result'}`);
+                this.stats.misses++;
             }
 
         } catch (error) {
+            this.stats.misses++;
             this.logger.error(`[Sniper] ❌ EXEC FAIL: ${error.message}`);
         } finally {
             this.bot.isOrderInProgress = false;
@@ -273,4 +328,4 @@ class AdvanceStrategy {
     }
 }
 module.exports = AdvanceStrategy;
-                
+            
