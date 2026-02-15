@@ -51,7 +51,7 @@ class AdvanceStrategy {
 
         // --- RISK SETTINGS ---
         this.ENTRY_BUFFER_TICKS = 3;   
-        this.TRAILING_PERCENT = 0.02500; 
+        this.TRAILING_PERCENT = 0.02000; 
         // Bracket Take Profit removed per request
         this.LOCK_DURATION_MS = 5000;    
 
