@@ -37,8 +37,8 @@ impl DeltaNativeClient {
         .tcp_nodelay(true) 
         .pool_idle_timeout(None) 
         .pool_max_idle_per_host(10)
-        .connect_timeout(Duration::from_secs(5)) 
-        .timeout(Duration::from_secs(5))         
+        .connect_timeout(Duration::from_millis(2500)) // Fail fast configuration
+        .timeout(Duration::from_millis(2500))         // Fail fast configuration
         .user_agent("Mozilla/5.0 (compatible; DeltaBot/Native)")
         .build()
         .map_err(|e| Error::new(Status::GenericFailure, format!("Client build failed: {}", e)))?;
@@ -199,58 +199,71 @@ impl BinanceListener {
 
         let url = format!("wss://fstream.binance.com/stream?streams={}", streams);
 
-        tokio::spawn(async move {
-            loop {
-                println!("[Rust-Listener] ⚡ Connecting to Binance via FastWebsockets...");
+        // [FIX APPLIED]: Isolate the HFT listener into its own OS Thread.
+        // This prevents the "must be called from the context of a Tokio 1.x runtime" panic,
+        // and guarantees Binance parsing never steals CPU time from Delta HTTP requests.
+        std::thread::spawn(move || {
+            
+            // Build a dedicated async engine exclusively for this thread
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
 
-                match connect(&url).await {
-                    Ok(mut client) => {
-                        println!("[Rust-Listener] ✅ Connected & Streaming at SIMD speed.");
+            rt.block_on(async move {
+                loop {
+                    println!("[Rust-Listener] ⚡ Connecting to Binance on dedicated CPU core...");
 
-                        loop {
-                            match client.receive_frame().await {
-                                Ok(frame) => {
-                                    if frame.opcode == OpCode::Text {
-                                        let mut payload = frame.payload; 
+                    match connect(&url).await {
+                        Ok(mut client) => {
+                            println!("[Rust-Listener] ✅ Connected & Streaming at SIMD speed.");
 
-                                        // simd-json parses the bytes in-place using AVX2
-                                        if let Ok(parsed) = simd_json::from_slice::<BinanceMsg>(&mut payload) {
-                                            if let Some(data) = parsed.data {
-                                                
-                                                let asset_name = data.s.replace("USDT", "");
-                                                
-                                                let bb = data.b.parse::<f64>().unwrap_or(0.0);
-                                                let bq = data.B.parse::<f64>().unwrap_or(0.0);
-                                                let ba = data.a.parse::<f64>().unwrap_or(0.0);
-                                                let aq = data.A.parse::<f64>().unwrap_or(0.0);
+                            loop {
+                                match client.receive_frame().await {
+                                    Ok(frame) => {
+                                        if frame.opcode == OpCode::Text {
+                                            let mut payload = frame.payload; 
 
-                                                let update = DepthUpdate {
-                                                    s: asset_name,
-                                                    bb, bq, ba, aq,
-                                                };
+                                            // simd-json parses the bytes in-place using AVX2 hardware instructions
+                                            if let Ok(parsed) = simd_json::from_slice::<BinanceMsg>(&mut payload) {
+                                                if let Some(data) = parsed.data {
+                                                    
+                                                    let asset_name = data.s.replace("USDT", "");
+                                                    
+                                                    let bb = data.b.parse::<f64>().unwrap_or(0.0);
+                                                    let bq = data.B.parse::<f64>().unwrap_or(0.0);
+                                                    let ba = data.a.parse::<f64>().unwrap_or(0.0);
+                                                    let aq = data.A.parse::<f64>().unwrap_or(0.0);
 
-                                                // Fire directly into the Node.js event loop
-                                                callback.call(update, ThreadsafeFunctionCallMode::NonBlocking);
+                                                    let update = DepthUpdate {
+                                                        s: asset_name,
+                                                        bb, bq, ba, aq,
+                                                    };
+
+                                                    // [FIX APPLIED]: Fire directly into the Node.js event loop asynchronously.
+                                                    // NonBlocking ensures V8 never gets overwhelmed; stale ticks are dropped.
+                                                    callback.call(update, ThreadsafeFunctionCallMode::NonBlocking);
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    println!("[Rust-Listener] ⚠️ Stream Frame Error: {:?}", e);
-                                    break; 
+                                    Err(e) => {
+                                        println!("[Rust-Listener] ⚠️ Stream Frame Error: {:?}", e);
+                                        break; 
+                                    }
                                 }
                             }
                         }
+                        Err(e) => {
+                            println!("[Rust-Listener] ❌ Connection Failed: {}. Retrying in 5s...", e);
+                        }
                     }
-                    Err(e) => {
-                        println!("[Rust-Listener] ❌ Connection Failed: {}. Retrying in 5s...", e);
-                    }
+                    sleep(Duration::from_secs(5)).await;
                 }
-                sleep(Duration::from_secs(5)).await;
-            }
+            });
         });
 
         Ok(())
     }
-  }
-                
+                 }
+              
