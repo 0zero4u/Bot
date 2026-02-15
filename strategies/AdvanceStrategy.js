@@ -46,7 +46,7 @@ class AdvanceStrategy {
         this.TIME_NOISE = 15;      // Wait for WS jitter to settle
         this.TIME_KILL = 65;       // HARD CUTOFF. 66ms+ = NO TRADE.
         
-        this.FRESHNESS_LIMIT_MS = 5; 
+        this.FRESHNESS_LIMIT_MS = 10; 
         this.DEPLETION_RATIO = 2.0; 
 
         // --- RISK SETTINGS ---
