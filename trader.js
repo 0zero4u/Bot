@@ -1,10 +1,11 @@
 /**
  * trader.js
- * v73.0 - NATIVE ARCHITECTURE (ENDGAME)
+ * v73.1 - NATIVE ARCHITECTURE (N-API Callback Fix)
  * Updates:
  * 1. DELETED Localhost HTTP Server (No more port 8082 loopback).
  * 2. INTEGRATED Native Rust BinanceListener directly into V8 engine.
- * 3. ALIGNED with AdvanceStrategy (Heartbeat/Warmup enabled).
+ * 3. FIXED N-API Error-First callback pattern.
+ * 4. ALIGNED with AdvanceStrategy (Heartbeat/Warmup enabled).
  */
 
 const WebSocket = require('ws');
@@ -118,7 +119,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v73.0 - NATIVE RUST ARCHITECTURE) ---`);
+        this.logger.info(`--- Bot Initializing (v73.1 - NATIVE RUST ARCHITECTURE) ---`);
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
@@ -135,8 +136,18 @@ class TradingBot {
         this.logger.info("⚡ Booting Native Rust Binance Listener...");
         const binanceFeed = new BinanceListener();
         
-        // The Rust thread directly fires this callback without JSON parsing or HTTP sockets
-        binanceFeed.start(this.targetAssets, (update) => {
+        // [FIX APPLIED]: Added 'err' parameter to properly catch N-API Error-First Callback
+        binanceFeed.start(this.targetAssets, (err, update) => {
+            // 1. Handle potential N-API errors
+            if (err) {
+                this.logger.error(`[Binance Thread Error] ${err}`);
+                return;
+            }
+            
+            // 2. Safety check
+            if (!update) return;
+
+            // 3. Normal Execution
             if (!this.authenticated) {
                 const now = Date.now();
                 if (now - this.lastAuthWarning > 5000) { 
@@ -393,4 +404,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                
+             
