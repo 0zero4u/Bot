@@ -1,12 +1,10 @@
-
 /**
  * trader.js
- * v73.2 - NATIVE ARCHITECTURE (Aligned with AdvanceStrategy V83.0)
+ * v73.3 - NATIVE ARCHITECTURE (Aligned with AdvanceStrategy V83.0)
  * Updates:
- * 1. FIXED: Subscribes to L2 Orderbook updates for Exchange 1 Bid/Ask Liquidity.
- * 2. FIXED: Correctly passes single `update` object to strategy.onDepthUpdate.
- * 3. FIXED: Properly normalizes `all_trades` and forwards to strategy.onLaggerTrade.
- * 4. ADDED: Quote routing via forwardQuoteToStrategy().
+ * 1. FIXED: Subscribes exclusively to L1 Orderbook (100ms interval) for Exchange 1 Liquidity.
+ * 2. FIXED: STRICTLY uses USD pairs (no USDT) for Delta Exchange perps/options.
+ * 3. FIXED: Normalizes 'all_trades' side/taker_side so AdvanceStrategy doesn't miss volume.
  */
 
 const WebSocket = require('ws');
@@ -76,7 +74,6 @@ class TradingBot {
         this.authenticated = false;
         this.lastAuthWarning = 0; 
 
-        // Position & Execution State
         this.activePositions = {};
         this.orderLatencies = new Map(); 
         
@@ -118,7 +115,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v73.2 - NATIVE RUST ARCHITECTURE) ---`);
+        this.logger.info(`--- Bot Initializing (v73.3 - NATIVE RUST ARCHITECTURE) ---`);
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
@@ -150,7 +147,6 @@ class TradingBot {
                 return;
             }
 
-            // FIXED: Passing native object directly to strategy as expected by AdvanceStrategy.js
             if (this.strategy && typeof this.strategy.onDepthUpdate === 'function') {
                 this.strategy.onDepthUpdate(update);
             }
@@ -231,12 +227,11 @@ class TradingBot {
     }
 
     subscribeToChannels() {
-        // Typically Delta uses the USDT suffix for perps (e.g. BTCUSDT) or USD
+        // STRICTLY USING USD SUFFIX AS REQUESTED
         const tradeSymbols = this.targetAssets.map(asset => `${asset}USD`);
-        const orderbookSymbols = this.targetAssets.map(asset => `${asset}USDT`); // Delta perps
         
         this.logger.info(`Subscribing to: Orders, Positions, User Trades`);
-        this.logger.info(`Subscribing to L2 Orderbook & Trades for: ${this.targetAssets.join(', ')}`);
+        this.logger.info(`Subscribing to L1 Orderbook & All Trades for: ${tradeSymbols.join(', ')}`);
         
         this.ws.send(JSON.stringify({ 
             type: 'subscribe', 
@@ -246,9 +241,7 @@ class TradingBot {
                     { name: 'positions', symbols: ['all'] },
                     { name: 'user_trades', symbols: ['all'] },
                     { name: 'all_trades', symbols: tradeSymbols },
-                    // ADDED: Crucial L2 Orderbook subscription for Exchange 1 liquidity tracking
-                    { name: 'l2_updates', symbols: tradeSymbols },
-                    { name: 'l2_updates', symbols: orderbookSymbols } 
+                    { name: 'l1_orderbook', symbols: tradeSymbols } 
                 ]
             }
         }));
@@ -274,14 +267,11 @@ class TradingBot {
         }
 
         switch (message.type) {
-            case 'l2_updates':
-            case 'v2/ticker':
-                // ADDED: Route Exchange 1 Quotes directly to strategy
+            case 'l1_orderbook':
                 this.forwardQuoteToStrategy(message);
                 break;
 
             case 'all_trades':
-                // FIXED: Normalize array vs single trade and map the symbol
                 const tradesData = Array.isArray(message.data) ? message.data : [message.data || message];
                 tradesData.forEach(t => {
                     if (t) {
@@ -311,38 +301,25 @@ class TradingBot {
         }
     }
 
-    // --- ADDED: Forward Quote logic for Exchange 1 Liquidity ---
     forwardQuoteToStrategy(message) {
         if (this.strategy && typeof this.strategy.onExchange1Quote === 'function') {
             const data = message.data || message;
             
-            // Map Delta's nested arrays to flat quote structure
-            let mappedBid = data.best_bid || data.bid || 0;
-            let mappedAsk = data.best_ask || data.ask || 0;
-            let mappedBidSize = data.best_bid_size || data.bid_size || 0;
-            let mappedAskSize = data.best_ask_size || data.ask_size || 0;
-
-            if (data.buy && data.buy.length > 0) {
-                mappedBid = data.buy[0].limit_price || data.buy[0].price;
-                mappedBidSize = data.buy[0].size;
-            }
-            if (data.sell && data.sell.length > 0) {
-                mappedAsk = data.sell[0].limit_price || data.sell[0].price;
-                mappedAskSize = data.sell[0].size;
-            }
-
+            // Map flat L1 orderbook structure
             this.strategy.onExchange1Quote({
                 symbol: message.symbol || data.symbol || message.product_symbol,
-                bid: mappedBid,
-                ask: mappedAsk,
-                bid_size: mappedBidSize,
-                ask_size: mappedAskSize
+                bid: data.best_bid || data.bid || 0,
+                ask: data.best_ask || data.ask || 0,
+                bid_size: data.best_bid_size || data.bid_size || 0,
+                ask_size: data.best_ask_size || data.ask_size || 0
             });
         }
     }
 
     forwardTradeToStrategy(tradeData) {
         if (this.strategy && typeof this.strategy.onLaggerTrade === 'function') {
+            // Normalize side for AdvanceStrategy.js (handles delta's taker_side format)
+            tradeData.side = tradeData.side || tradeData.taker_side || (tradeData.buyer_role === 'taker' ? 'buy' : 'sell');
             this.strategy.onLaggerTrade(tradeData);
         }
     }
@@ -436,3 +413,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
+                                  
