@@ -1,10 +1,11 @@
 /**
  * AdvanceStrategy.js
- * v83.0 - BINARY SNIPER (STRICT CUTOFF)
+ * v83.1 - BINARY SNIPER (ENV ORDER SIZE)
  * * LOGIC:
  * 1. BINARY ENTRY: Either we are in the safe window (15-60ms) or we don't trade.
  * 2. NO GAMBLING: No "half size" trades in the danger zone.
  * 3. LIQUIDITY SYNC: Size is capped by BBO quantity to prevent slippage.
+ * 4. DYNAMIC SIZING: Base lot size can be overridden via process.env.ORDER_SIZE
  */
 
 class PriceHistory {
@@ -54,11 +55,15 @@ class AdvanceStrategy {
         this.TP_PERCENT = 0.0090; 
         this.LOCK_DURATION_MS = 5000;    
 
+        // --- DYNAMIC ENV SIZE ---
+        // Reads ORDER_SIZE from .env, defaults to null if not set
+        const envSize = process.env.ORDER_SIZE ? parseFloat(process.env.ORDER_SIZE) : null;
+
         this.specs = {
-            'BTC': { deltaId: 27,    precision: 1, lot: 0.002, minLot: 0.001, tickSize: 0.1 },
-            'ETH': { deltaId: 299,   precision: 2, lot: 0.02,  minLot: 0.01,  tickSize: 0.01 },
-            'XRP': { deltaId: 14969, precision: 4, lot: 20,    minLot: 10,    tickSize: 0.0001 },
-            'SOL': { deltaId: 417,   precision: 3, lot: 0.2,   minLot: 0.1,   tickSize: 0.001 }
+            'BTC': { deltaId: 27,    precision: 1, lot: envSize || 0.002, minLot: envSize ? envSize * 0.5 : 0.001, tickSize: 0.1 },
+            'ETH': { deltaId: 299,   precision: 2, lot: envSize || 0.02,  minLot: envSize ? envSize * 0.5 : 0.01,  tickSize: 0.01 },
+            'XRP': { deltaId: 14969, precision: 4, lot: envSize || 20,    minLot: envSize ? envSize * 0.5 : 10,    tickSize: 0.0001 },
+            'SOL': { deltaId: 417,   precision: 3, lot: envSize || 0.2,   minLot: envSize ? envSize * 0.5 : 0.1,   tickSize: 0.001 }
         };
 
         const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
@@ -84,13 +89,13 @@ class AdvanceStrategy {
         });
 
         this.stats = { signals: 0, fills: 0, misses: 0 };
-        this.logger.info(`[Strategy] Loaded V83.0 (BINARY SNIPER)`);
+        this.logger.info(`[Strategy] Loaded V83.1 (BINARY SNIPER) | ENV Size: ${envSize ? envSize : 'Default'}`);
     }
 
-    getName() { return "AdvanceStrategy (V83.0 Binary)"; }
+    getName() { return "AdvanceStrategy (V83.1 Binary)"; }
 
     async start() {
-        this.logger.info(`[Strategy] 🟢 V83 Engine Started.`);
+        this.logger.info(`[Strategy] 🟢 V83.1 Engine Started.`);
     }
 
     onExchange1Quote(msg) {
@@ -102,6 +107,7 @@ class AdvanceStrategy {
         
         data.ex1Bid = parseFloat(msg.bid || msg.best_bid || 0);
         data.ex1Ask = parseFloat(msg.ask || msg.best_ask || 0);
+        
         // Capture Liquidity Size for capping
         data.ex1BidSize = parseFloat(msg.bid_size || msg.bid_qty || 0);
         data.ex1AskSize = parseFloat(msg.ask_size || msg.ask_qty || 0);
@@ -203,13 +209,9 @@ class AdvanceStrategy {
             data.lockedUntil = Date.now() + this.LOCK_DURATION_MS;
             
             // --- LIQUIDITY-AWARE SIZING ---
-            // Don't buy more than is on the book (Ask Size)
-            // But don't go below minLot
             let available = (side === 'buy') ? data.ex1AskSize : data.ex1BidSize;
-            // If API didn't provide size, fallback to lot
             if (!available || available <= 0) available = spec.lot;
             
-            // Cap at our max lot, but reduce if book is thin
             let finalSize = Math.min(spec.lot, available); 
             if (finalSize < spec.minLot) finalSize = spec.minLot;
 
@@ -255,4 +257,4 @@ class AdvanceStrategy {
     }
 }
 module.exports = AdvanceStrategy;
-        
+                
