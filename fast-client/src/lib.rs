@@ -171,6 +171,7 @@ struct BinanceMsg {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(non_snake_case)]
 struct BinanceData {
     s: String, 
     b: String, 
