@@ -1,13 +1,11 @@
-
 /**
  * AdvanceStrategy.js
- * v83.2 - BINARY SNIPER (ENV ORDER SIZE + DYNAMIC TRAIL FIX)
+ * v83.1 - BINARY SNIPER (ENV ORDER SIZE)
  * * LOGIC:
  * 1. BINARY ENTRY: Either we are in the safe window (15-60ms) or we don't trade.
  * 2. NO GAMBLING: No "half size" trades in the danger zone.
  * 3. LIQUIDITY SYNC: Size is capped by BBO quantity to prevent slippage.
  * 4. DYNAMIC SIZING: Base lot size can be overridden via process.env.ORDER_SIZE
- * 5. TRAILING FIX: Trail amount is strictly absolute, TP widened to allow trailing.
  */
 
 class PriceHistory {
@@ -53,8 +51,8 @@ class AdvanceStrategy {
 
         // --- RISK SETTINGS ---
         this.ENTRY_BUFFER_TICKS = 10;   
-        this.TRAILING_PERCENT = 0.03;    // Set to 0.03% to track peak trailing 
-        this.TP_PERCENT = 0.05000;       // Set wide to 5% so trailing stop has room to work
+        this.TRAILING_PERCENT = 0.00900; 
+        // Bracket Take Profit removed per request
         this.LOCK_DURATION_MS = 5000;    
 
         // --- DYNAMIC ENV SIZE ---
@@ -91,13 +89,13 @@ class AdvanceStrategy {
         });
 
         this.stats = { signals: 0, fills: 0, misses: 0 };
-        this.logger.info(`[Strategy] Loaded V83.2 (BINARY SNIPER) | ENV Size: ${envSize ? envSize : 'Default'} | Trail: ${this.TRAILING_PERCENT}%`);
+        this.logger.info(`[Strategy] Loaded V83.1 (BINARY SNIPER) | ENV Size: ${envSize ? envSize : 'Default'}`);
     }
 
-    getName() { return "AdvanceStrategy (V83.2 Binary)"; }
+    getName() { return "AdvanceStrategy (V83.1 Binary)"; }
 
     async start() {
-        this.logger.info(`[Strategy] 🟢 V83.2 Engine Started.`);
+        this.logger.info(`[Strategy] 🟢 V83.1 Engine Started.`);
     }
 
     onExchange1Quote(msg) {
@@ -219,27 +217,17 @@ class AdvanceStrategy {
 
             const quotePrice = side === 'buy' ? data.ex1Ask : data.ex1Bid;
             
-            // --- BRACKET CALCULATIONS ---
-            // Calculate absolute trail distance 
+            this.logger.info(`[Sniper] ⚡ ${asset} ${side.toUpperCase()} | Type: ${type} | T+${dt}ms | Size: ${finalSize.toFixed(4)}`);
+
             let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
+            trailValue = side === 'buy' ? -Math.abs(trailValue) : Math.abs(trailValue);
             
-            // API expects absolute price difference, strictly positive
-            trailValue = Math.abs(trailValue);
-            
-            // Wide Take-Profit so trailing stop functions unhindered
-            let tpPrice = (side === 'buy') 
-                ? quotePrice * (1 + this.TP_PERCENT) 
-                : quotePrice * (1 - this.TP_PERCENT);
-
-            this.logger.info(`[Sniper] ⚡ ${asset} ${side.toUpperCase()} | Type: ${type} | T+${dt}ms | Size: ${finalSize.toFixed(4)} | Trail Dist: ${trailValue.toFixed(spec.precision)}`);
-
             const payload = { 
                 product_id: spec.deltaId.toString(), 
                 size: finalSize.toFixed(6), 
                 side: side, 
                 order_type: 'market_order',              
                 bracket_trail_amount: trailValue.toFixed(spec.precision), 
-                bracket_take_profit_price: tpPrice.toFixed(spec.precision), 
                 bracket_stop_trigger_method: 'mark_price', 
                 client_order_id: `snipe_${Date.now()}`
             };
@@ -264,3 +252,4 @@ class AdvanceStrategy {
     }
 }
 module.exports = AdvanceStrategy;
+                    
