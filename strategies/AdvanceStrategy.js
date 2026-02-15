@@ -69,7 +69,7 @@ class AdvanceStrategy {
         
         // TRAILING STOP & TAKE PROFIT
         this.TRAILING_PERCENT = 0.035; 
-        this.TP_PERCENT = 0.00200; // 0.06%
+        this.TP_PERCENT = 0.0090; // 0.06%
         this.LOCK_DURATION_MS = 5000;    
 
         this.specs = {
