@@ -1,14 +1,10 @@
 /**
  * AdvanceStrategy.js
- * v82.0 - FLOW-BASED MICROSTRUCTURE ARBITRAGE
- * * CORE LOGIC CHANGES:
- * 1. DEPLETION SIGNAL: Tracks 'Volume Since Update'. If (Vol > Limit), assumes liquidity is ghosted.
- * 2. HIERARCHY: Trade-Through > Aggressive Trades > Fair Value.
- * 3. ZONING: 
- * - GOLD (20-40ms): 1.2x Size
- * - SILVER (40-60ms): 1.0x Size
- * - BRONZE (60-75ms): 0.5x Size
- * 4. 3ms REVERSAL CHECK: Hard abort if Ex2 ticks against us in final moments.
+ * v83.0 - BINARY SNIPER (STRICT CUTOFF)
+ * * LOGIC:
+ * 1. BINARY ENTRY: Either we are in the safe window (15-60ms) or we don't trade.
+ * 2. NO GAMBLING: No "half size" trades in the danger zone.
+ * 3. LIQUIDITY SYNC: Size is capped by BBO quantity to prevent slippage.
  */
 
 class PriceHistory {
@@ -20,14 +16,13 @@ class PriceHistory {
     add(price) {
         const now = Date.now();
         this.buffer.push({ price, ts: now });
-        if (this.buffer.length > 50) this.buffer.shift(); // Keep buffer small/fast
+        if (this.buffer.length > 50) this.buffer.shift(); 
     }
 
     // Returns price change in last N ms
     getTrend(msAgo) {
         const now = Date.now();
         const target = now - msAgo;
-        // Find closest snapshot strictly BEFORE or AT target
         let pastPrice = null;
         for (let i = this.buffer.length - 1; i >= 0; i--) {
             if (this.buffer[i].ts <= target) {
@@ -37,9 +32,7 @@ class PriceHistory {
         }
         if (pastPrice === null && this.buffer.length > 0) pastPrice = this.buffer[0].price;
         if (pastPrice === null) return 0;
-        
-        const currentPrice = this.buffer[this.buffer.length - 1].price;
-        return currentPrice - pastPrice;
+        return this.buffer[this.buffer.length - 1].price - pastPrice;
     }
 }
 
@@ -48,16 +41,11 @@ class AdvanceStrategy {
         this.bot = bot;
         this.logger = bot.logger;
 
-        // --- MICROSTRUCTURE SETTINGS ---
-        this.TIME_NOISE = 15;      // Skip < 15ms (Noise)
-        this.TIME_GOLD_END = 40;   // 15-40ms (Best edge)
-        this.TIME_SILVER_END = 60; // 40-60ms (Good edge)
-        this.TIME_BRONZE_END = 75; // 60-75ms (Risk/Late)
+        // --- BINARY TIMING (STRICT) ---
+        this.TIME_NOISE = 15;      // Wait for WS jitter to settle
+        this.TIME_KILL = 65;       // HARD CUTOFF. 66ms+ = NO TRADE.
         
-        this.FRESHNESS_LIMIT_MS = 20; // Trade-through valid only if < 20ms old
-        
-        // --- DEPLETION SETTINGS ---
-        // If accumulated volume > (OurLot * Ratio), assume level is dead
+        this.FRESHNESS_LIMIT_MS = 20; 
         this.DEPLETION_RATIO = 2.0; 
 
         // --- RISK SETTINGS ---
@@ -79,22 +67,15 @@ class AdvanceStrategy {
         targets.forEach(symbol => {
             if (this.specs[symbol]) {
                 this.assets[symbol] = {
-                    // Exchange 1 (Delta)
                     ex1Bid: 0, ex1Ask: 0,
+                    ex1BidSize: 0, ex1AskSize: 0, // Track liquidity
                     ex1UpdateTs: 0,
-                    
-                    // FLOW TRACKING (Reset on Quote Update)
-                    volSinceUpdateBuy: 0, // Volume of trades hitting ASK
-                    volSinceUpdateSell: 0,// Volume of trades hitting BID
-                    
-                    // Trade-Through State
+                    volSinceUpdateBuy: 0, 
+                    volSinceUpdateSell: 0,
                     lastTradePrice: 0,
                     lastTradeTs: 0,
-                    
-                    // Exchange 2 (Binance)
                     ex2Mid: 0,
                     history: new PriceHistory(100),
-                    
                     basis: 0,
                     lockedUntil: 0,
                     initialized: false
@@ -103,19 +84,15 @@ class AdvanceStrategy {
         });
 
         this.stats = { signals: 0, fills: 0, misses: 0 };
-        this.logger.info(`[Strategy] Loaded V82.0 (FLOW + ZONING)`);
+        this.logger.info(`[Strategy] Loaded V83.0 (BINARY SNIPER)`);
     }
 
-    getName() { return "AdvanceStrategy (V82.0 Flow)"; }
+    getName() { return "AdvanceStrategy (V83.0 Binary)"; }
 
     async start() {
-        this.logger.info(`[Strategy] 🟢 V82 Engine Started.`);
+        this.logger.info(`[Strategy] 🟢 V83 Engine Started.`);
     }
 
-    /**
-     * HANDLER 1: Delta Quote Update (The Reset)
-     * When this happens, we know the matching engine has "flushed" previous trades.
-     */
     onExchange1Quote(msg) {
         if (!msg.symbol) return;
         const asset = Object.keys(this.assets).find(k => msg.symbol.includes(k));
@@ -125,48 +102,33 @@ class AdvanceStrategy {
         
         data.ex1Bid = parseFloat(msg.bid || msg.best_bid || 0);
         data.ex1Ask = parseFloat(msg.ask || msg.best_ask || 0);
+        // Capture Liquidity Size for capping
+        data.ex1BidSize = parseFloat(msg.bid_size || msg.bid_qty || 0);
+        data.ex1AskSize = parseFloat(msg.ask_size || msg.ask_qty || 0);
         
-        // CRITICAL: Reset Volume Counters
-        // New BBO means previous trade volume is now "priced in"
         data.volSinceUpdateBuy = 0;
         data.volSinceUpdateSell = 0;
-        
         data.ex1UpdateTs = Date.now(); 
         if (!data.initialized && data.ex1Bid > 0) data.initialized = true;
     }
 
-    /**
-     * HANDLER 2: Delta Trade Execution (The Depletion Tracker)
-     */
     onLaggerTrade(trade) {
         const price = parseFloat(trade.price);
         const size = parseFloat(trade.size || trade.qty || 0);
-        const side = trade.side; // 'buy' or 'sell'
-        
+        const side = trade.side; 
         const asset = Object.keys(this.assets).find(k => trade.symbol && trade.symbol.includes(k));
         if (!asset) return;
 
         const data = this.assets[asset];
-        
-        // Update Trade-Through State
         data.lastTradePrice = price;
         data.lastTradeTs = Date.now();
 
-        // Update Basis
         if (data.ex2Mid > 0) data.basis = price - data.ex2Mid;
 
-        // ACCUMULATE AGGRESSIVE VOLUME
-        // Note: A 'buy' side trade on Delta means someone lifted the ASK.
-        if (side === 'buy') {
-            data.volSinceUpdateBuy += size;
-        } else {
-            data.volSinceUpdateSell += size;
-        }
+        if (side === 'buy') data.volSinceUpdateBuy += size;
+        else data.volSinceUpdateSell += size;
     }
 
-    /**
-     * HANDLER 3: Binance Depth Update (The Driver)
-     */
     onDepthUpdate(update) {
         const asset = update.s;
         const data = this.assets[asset];
@@ -178,99 +140,59 @@ class AdvanceStrategy {
         const now = Date.now();
         if (now < data.lockedUntil) return;
 
-        // 1. Update Binance State
         const bb = parseFloat(update.bb);
         const ba = parseFloat(update.ba);
         data.ex2Mid = (bb + ba) / 2;
         data.history.add(data.ex2Mid);
 
-        // 2. CHECK TIME ZONE
         const dt = now - data.ex1UpdateTs;
 
-        // Filter Noise & Late
-        if (dt < this.TIME_NOISE || dt > this.TIME_BRONZE_END) return;
+        // --- BINARY FILTER ---
+        // 1. Too Early? (Noise)
+        if (dt < this.TIME_NOISE) return;
+        // 2. Too Late? (Danger Zone)
+        if (dt > this.TIME_KILL) return;
 
-        // 3. DEPLETION CHECK (Ghost Liquidity)
-        // If we want to BUY, we check if others have already bought too much
+        // Depletion Logic
         const maxVol = spec.lot * this.DEPLETION_RATIO;
         const isAskDepleted = data.volSinceUpdateBuy > maxVol;
         const isBidDepleted = data.volSinceUpdateSell > maxVol;
 
-        // 4. SIGNAL GENERATION
         let signal = null;
         let signalType = '';
-
         const bufferVal = spec.tickSize * this.ENTRY_BUFFER_TICKS;
         const fairEx1 = data.ex2Mid + data.basis;
         const isFreshTrade = (now - data.lastTradeTs) < this.FRESHNESS_LIMIT_MS;
 
-        // --- HIERARCHY 1: TRADE-THROUGH (The "Gold" Signal) ---
+        // SIGNAL 1: FRESH TRADE-THROUGH
         if (isFreshTrade) {
-            if (data.lastTradePrice >= data.ex1Ask) {
-                // Price moved UP. Check if ask is still alive.
-                if (!isAskDepleted) {
-                    signal = 'buy';
-                    signalType = 'TRADE_THROUGH';
-                }
-            } else if (data.lastTradePrice <= data.ex1Bid && data.lastTradePrice > 0) {
-                // Price moved DOWN. Check if bid is still alive.
-                if (!isBidDepleted) {
-                    signal = 'sell';
-                    signalType = 'TRADE_THROUGH';
-                }
+            if (data.lastTradePrice >= data.ex1Ask && !isAskDepleted) {
+                signal = 'buy'; signalType = 'TRADE_THROUGH';
+            } else if (data.lastTradePrice <= data.ex1Bid && data.lastTradePrice > 0 && !isBidDepleted) {
+                signal = 'sell'; signalType = 'TRADE_THROUGH';
             }
         }
 
-        // --- HIERARCHY 2: FAIR VALUE DEVIATION ---
+        // SIGNAL 2: FAIR VALUE
         if (!signal) {
-            if (fairEx1 > (data.ex1Ask + bufferVal)) {
-                 if (!isAskDepleted) {
-                     signal = 'buy';
-                     signalType = 'FV_DEVIATION';
-                 }
-            } else if (fairEx1 < (data.ex1Bid - bufferVal)) {
-                 if (!isBidDepleted) {
-                     signal = 'sell';
-                     signalType = 'FV_DEVIATION';
-                 }
+            if (fairEx1 > (data.ex1Ask + bufferVal) && !isAskDepleted) {
+                signal = 'buy'; signalType = 'FV_DEVIATION';
+            } else if (fairEx1 < (data.ex1Bid - bufferVal) && !isBidDepleted) {
+                signal = 'sell'; signalType = 'FV_DEVIATION';
             }
         }
 
         if (!signal) return;
 
-        // 5. MICRO-REVERSAL FILTER (3ms)
-        // "If last 3ms tick opposite -> cancel"
-        const trend3ms = data.history.getTrend(3); // Change in last 3ms
-        
-        if (signal === 'buy') {
-            if (trend3ms < 0) { // Price ticking down in last 3ms
-                // this.logger.debug(`[Filter] 3ms Reversal prevented BUY on ${asset}`);
-                return; 
-            }
-        } else {
-            if (trend3ms > 0) { // Price ticking up in last 3ms
-                // this.logger.debug(`[Filter] 3ms Reversal prevented SELL on ${asset}`);
-                return;
-            }
-        }
+        // 3ms Reversal Filter
+        const trend3ms = data.history.getTrend(3);
+        if (signal === 'buy' && trend3ms < 0) return; 
+        if (signal === 'sell' && trend3ms > 0) return;
 
-        // 6. ZONE SIZING (Time-Weighted Aggression)
-        let sizeMult = 1.0;
-        let zoneName = 'SILVER';
-
-        if (dt <= this.TIME_GOLD_END) {
-            sizeMult = 1.2; // Aggressive Early
-            zoneName = 'GOLD';
-        } else if (dt > this.TIME_SILVER_END) {
-            sizeMult = 0.5; // Conservative Late
-            zoneName = 'BRONZE';
-        }
-
-        // 7. EXECUTE
-        this.executeSniper(asset, signal, fairEx1, dt, sizeMult, signalType, zoneName);
+        this.executeSniper(asset, signal, fairEx1, dt, signalType);
     }
 
-    async executeSniper(asset, side, fairPrice, dt, sizeMult, type, zone) {
+    async executeSniper(asset, side, fairPrice, dt, type) {
         this.bot.isOrderInProgress = true;
         this.stats.signals++;
 
@@ -280,16 +202,21 @@ class AdvanceStrategy {
         try {
             data.lockedUntil = Date.now() + this.LOCK_DURATION_MS;
             
-            // Calculate Sizing
-            let finalSize = spec.lot * sizeMult;
+            // --- LIQUIDITY-AWARE SIZING ---
+            // Don't buy more than is on the book (Ask Size)
+            // But don't go below minLot
+            let available = (side === 'buy') ? data.ex1AskSize : data.ex1BidSize;
+            // If API didn't provide size, fallback to lot
+            if (!available || available <= 0) available = spec.lot;
+            
+            // Cap at our max lot, but reduce if book is thin
+            let finalSize = Math.min(spec.lot, available); 
             if (finalSize < spec.minLot) finalSize = spec.minLot;
 
-            // Quote Price for TP/SL ref
             const quotePrice = side === 'buy' ? data.ex1Ask : data.ex1Bid;
             
-            this.logger.info(`[Sniper] ⚡ ${asset} ${side.toUpperCase()} | Type: ${type} | Zone: ${zone} (${dt}ms) | Size: ${finalSize.toFixed(3)}`);
+            this.logger.info(`[Sniper] ⚡ ${asset} ${side.toUpperCase()} | Type: ${type} | T+${dt}ms | Size: ${finalSize.toFixed(4)}`);
 
-            // TP & SL Calculation
             let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
             trailValue = side === 'buy' ? -Math.abs(trailValue) : Math.abs(trailValue);
             
@@ -328,4 +255,4 @@ class AdvanceStrategy {
     }
 }
 module.exports = AdvanceStrategy;
-            
+        
