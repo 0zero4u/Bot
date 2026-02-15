@@ -1,12 +1,22 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use reqwest::Client; // [FIX] Removed unused 'header'
+use reqwest::Client;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use serde_json::Value;
 
+// --- NEW IMPORTS FOR BINANCE LISTENER ---
+use fast_websocket_client::{connect, OpCode};
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use serde::Deserialize;
+use tokio::time::sleep;
+
 type HmacSha256 = Hmac<Sha256>;
+
+// ==========================================
+// 1. DELTA EXCHANGE NATIVE REST CLIENT
+// ==========================================
 
 #[napi]
 pub struct DeltaNativeClient {
@@ -23,13 +33,12 @@ impl DeltaNativeClient {
   pub fn new(api_key: String, api_secret: String, base_url: Option<String>) -> Result<Self> {
     let url = base_url.unwrap_or_else(|| "https://api.india.delta.exchange".to_string());
     
-    // [FIX] Added Timeouts for Safety
     let client = Client::builder()
         .tcp_nodelay(true) 
         .pool_idle_timeout(None) 
         .pool_max_idle_per_host(10)
-        .connect_timeout(Duration::from_secs(5)) // Fail fast if Delta is down
-        .timeout(Duration::from_secs(5))         // Fail fast if request hangs
+        .connect_timeout(Duration::from_secs(5)) 
+        .timeout(Duration::from_secs(5))         
         .user_agent("Mozilla/5.0 (compatible; DeltaBot/Native)")
         .build()
         .map_err(|e| Error::new(Status::GenericFailure, format!("Client build failed: {}", e)))?;
@@ -42,9 +51,7 @@ impl DeltaNativeClient {
     })
   }
 
-  // [FIX] Added 'query' support to signature generation
   fn sign(&self, method: &str, path: &str, query: &str, body: &str, timestamp: &str) -> Result<String> {
-    // Delta expects: method + timestamp + path + query_string + body
     let signature_data = format!("{}{}{}{}{}", method, timestamp, path, query, body);
     
     let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes())
@@ -143,5 +150,107 @@ impl DeltaNativeClient {
 
      Ok(json)
   }
-             }
-  
+}
+
+// ==========================================
+// 2. BINANCE HFT WEBSOCKET LISTENER
+// ==========================================
+
+#[napi(object)]
+pub struct DepthUpdate {
+    pub s: String,
+    pub bb: f64,
+    pub bq: f64,
+    pub ba: f64,
+    pub aq: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct BinanceMsg {
+    data: Option<BinanceData>,
+}
+
+#[derive(Deserialize, Debug)]
+struct BinanceData {
+    s: String, 
+    b: String, 
+    B: String, 
+    a: String, 
+    A: String, 
+}
+
+#[napi]
+pub struct BinanceListener {}
+
+#[napi]
+impl BinanceListener {
+    #[napi(constructor)]
+    pub fn new() -> Self {
+        BinanceListener {}
+    }
+
+    #[napi]
+    pub fn start(&self, assets: Vec<String>, callback: ThreadsafeFunction<DepthUpdate>) -> Result<()> {
+        let streams = assets
+            .iter()
+            .map(|a| format!("{}usdt@bookTicker", a.to_lowercase()))
+            .collect::<Vec<_>>()
+            .join("/");
+
+        let url = format!("wss://fstream.binance.com/stream?streams={}", streams);
+
+        tokio::spawn(async move {
+            loop {
+                println!("[Rust-Listener] ⚡ Connecting to Binance via FastWebsockets...");
+
+                match connect(&url).await {
+                    Ok(mut client) => {
+                        println!("[Rust-Listener] ✅ Connected & Streaming at SIMD speed.");
+
+                        loop {
+                            match client.receive_frame().await {
+                                Ok(frame) => {
+                                    if frame.opcode == OpCode::Text {
+                                        let mut payload = frame.payload; 
+
+                                        // simd-json parses the bytes in-place using AVX2
+                                        if let Ok(parsed) = simd_json::from_slice::<BinanceMsg>(&mut payload) {
+                                            if let Some(data) = parsed.data {
+                                                
+                                                let asset_name = data.s.replace("USDT", "");
+                                                
+                                                let bb = data.b.parse::<f64>().unwrap_or(0.0);
+                                                let bq = data.B.parse::<f64>().unwrap_or(0.0);
+                                                let ba = data.a.parse::<f64>().unwrap_or(0.0);
+                                                let aq = data.A.parse::<f64>().unwrap_or(0.0);
+
+                                                let update = DepthUpdate {
+                                                    s: asset_name,
+                                                    bb, bq, ba, aq,
+                                                };
+
+                                                // Fire directly into the Node.js event loop
+                                                callback.call(update, ThreadsafeFunctionCallMode::NonBlocking);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("[Rust-Listener] ⚠️ Stream Frame Error: {:?}", e);
+                                    break; 
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("[Rust-Listener] ❌ Connection Failed: {}. Retrying in 5s...", e);
+                    }
+                }
+                sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        Ok(())
+    }
+  }
+                
