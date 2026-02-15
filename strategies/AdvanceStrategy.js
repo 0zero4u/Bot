@@ -50,7 +50,7 @@ class AdvanceStrategy {
         this.DEPLETION_RATIO = 2.0; 
 
         // --- RISK SETTINGS ---
-        this.ENTRY_BUFFER_TICKS = 4;   
+        this.ENTRY_BUFFER_TICKS = 8;   
         this.TRAILING_PERCENT = 0.01000; 
         // Bracket Take Profit removed per request
         this.LOCK_DURATION_MS = 5000;    
