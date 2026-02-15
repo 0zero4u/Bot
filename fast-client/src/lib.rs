@@ -37,8 +37,8 @@ impl DeltaNativeClient {
         .tcp_nodelay(true) 
         .pool_idle_timeout(None) 
         .pool_max_idle_per_host(10)
-        .connect_timeout(Duration::from_millis(2500)) // Fail fast configuration
-        .timeout(Duration::from_millis(2500))         // Fail fast configuration
+        .connect_timeout(Duration::from_millis(2500)) 
+        .timeout(Duration::from_millis(2500))         
         .user_agent("Mozilla/5.0 (compatible; DeltaBot/Native)")
         .build()
         .map_err(|e| Error::new(Status::GenericFailure, format!("Client build failed: {}", e)))?;
@@ -199,12 +199,7 @@ impl BinanceListener {
 
         let url = format!("wss://fstream.binance.com/stream?streams={}", streams);
 
-        // [FIX APPLIED]: Isolate the HFT listener into its own OS Thread.
-        // This prevents the "must be called from the context of a Tokio 1.x runtime" panic,
-        // and guarantees Binance parsing never steals CPU time from Delta HTTP requests.
         std::thread::spawn(move || {
-            
-            // Build a dedicated async engine exclusively for this thread
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -224,7 +219,6 @@ impl BinanceListener {
                                         if frame.opcode == OpCode::Text {
                                             let mut payload = frame.payload; 
 
-                                            // simd-json parses the bytes in-place using AVX2 hardware instructions
                                             if let Ok(parsed) = simd_json::from_slice::<BinanceMsg>(&mut payload) {
                                                 if let Some(data) = parsed.data {
                                                     
@@ -240,9 +234,8 @@ impl BinanceListener {
                                                         bb, bq, ba, aq,
                                                     };
 
-                                                    // [FIX APPLIED]: Fire directly into the Node.js event loop asynchronously.
-                                                    // NonBlocking ensures V8 never gets overwhelmed; stale ticks are dropped.
-                                                    callback.call(update, ThreadsafeFunctionCallMode::NonBlocking);
+                                                    // [FIX APPLIED]: Wrapped 'update' in Ok()
+                                                    callback.call(Ok(update), ThreadsafeFunctionCallMode::NonBlocking);
                                                 }
                                             }
                                         }
@@ -265,5 +258,5 @@ impl BinanceListener {
 
         Ok(())
     }
-                 }
-              
+      }
+  
