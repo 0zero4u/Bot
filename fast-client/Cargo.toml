@@ -12,6 +12,11 @@ crate-type = ["cdylib"]
 napi = { version = "2.14", features = ["async", "napi4", "serde-json"] }
 napi-derive = "2.14"
 
+# --- THE HFT COMBO ---
+fast_websocket_client = "0.4.1"
+simd-json = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+
 # Async Runtime (The engine)
 tokio = { version = "1", features = ["full"] }
 
