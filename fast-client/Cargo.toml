@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # Node.js Interface
 # [FIXED]: Added 'tokio_rt' and 'threadsafe_function' back for the Binance WebSocket background thread
-napi = { version = "2.14", features = ["async", "napi4", "serde-json", "tokio_rt", "threadsafe_function"] }
+napi = { version = "2.14", features = ["async", "napi4", "serde-json", "tokio_rt"] }
 napi-derive = "2.14"
 
 # --- THE HFT COMBO ---
