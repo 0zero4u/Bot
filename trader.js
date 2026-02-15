@@ -1,11 +1,10 @@
 /**
  * trader.js
- * ALIGNED WITH LEAD STRATEGY v16 + MARKET LISTENER v3
- * Fixes:
- * 1. LOGGING: Inspects and logs full JSON of order failures.
- * 2. DATA: Automatically appends "USD" to assets for 'all_trades'.
- * 3. SETUP: Explicitly starts Strategy (enables Heartbeat/Warmup).
- * 4. STATE: Added hasOpenPosition() check.
+ * v73.0 - NATIVE ARCHITECTURE (ENDGAME)
+ * Updates:
+ * 1. DELETED Localhost HTTP Server (No more port 8082 loopback).
+ * 2. INTEGRATED Native Rust BinanceListener directly into V8 engine.
+ * 3. ALIGNED with AdvanceStrategy (Heartbeat/Warmup enabled).
  */
 
 const WebSocket = require('ws');
@@ -15,18 +14,19 @@ require('dotenv').config();
 
 // --- Rust Native Client Integration ---
 let DeltaClient;
+let BinanceListener; 
 try {
-    const { DeltaNativeClient } = require('fast-client');
-    DeltaClient = DeltaNativeClient;
+    const fastClient = require('fast-client');
+    DeltaClient = fastClient.DeltaNativeClient;
+    BinanceListener = fastClient.BinanceListener; // The new native HFT listener
 } catch (e) {
-    console.warn("Native client not found, please ensure 'fast-client' is installed.");
+    console.warn("Native client not found, please ensure 'fast-client' is installed and built.");
     process.exit(1);
 }
 
 // --- Configuration ---
 const config = {
     strategy: process.env.STRATEGY || 'Advance', 
-    port: parseInt(process.env.INTERNAL_WS_PORT || '8082'),
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
     wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
@@ -118,7 +118,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v72.0 - Debug Enhanced) ---`);
+        this.logger.info(`--- Bot Initializing (v73.0 - NATIVE RUST ARCHITECTURE) ---`);
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
@@ -129,8 +129,32 @@ class TradingBot {
 
         await this.syncPositionState();
         await this.initWebSocket();
-        this.setupHttpServer();
         this.startRestKeepAlive();
+
+        // --- NEW: START NATIVE BINANCE LISTENER ---
+        this.logger.info("⚡ Booting Native Rust Binance Listener...");
+        const binanceFeed = new BinanceListener();
+        
+        // The Rust thread directly fires this callback without JSON parsing or HTTP sockets
+        binanceFeed.start(this.targetAssets, (update) => {
+            if (!this.authenticated) {
+                const now = Date.now();
+                if (now - this.lastAuthWarning > 5000) { 
+                    this.logger.warn(`[Data Drop] ⚠️ Receiving Binance Data but Delta NOT Authenticated yet. Ignoring.`);
+                    this.lastAuthWarning = now;
+                }
+                return;
+            }
+
+            const depthPayload = {
+                bids: [[ update.bb, update.bq ]], 
+                asks: [[ update.ba, update.aq ]]  
+            };
+            
+            if (this.strategy && this.strategy.onDepthUpdate) {
+                this.strategy.onDepthUpdate(update.s, depthPayload);
+            }
+        });
 
         // Start Strategy
         if (this.strategy && typeof this.strategy.start === 'function') {
@@ -329,47 +353,6 @@ class TradingBot {
             this.logger.error(`Failed to sync position state: ${error}`);
         }
     }
-
-    async handleSignalMessage(message) {
-        if (!this.authenticated) {
-            const now = Date.now();
-            if (now - this.lastAuthWarning > 5000) { 
-                this.logger.warn(`[Data Drop] ⚠️ Receiving Market Data but Bot NOT Authenticated yet. Ignoring.`);
-                this.lastAuthWarning = now;
-            }
-            return;
-        }
-
-        try {
-            const data = JSON.parse(message.toString());
-            
-            if (data.type === 'B') {
-                const asset = data.s;
-                if (!this.targetAssets.includes(asset)) return;
-                
-                const depthPayload = {
-                    bids: [[ data.bb, data.bq ]], 
-                    asks: [[ data.ba, data.aq ]]  
-                };
-                
-                if (this.strategy.onDepthUpdate) {
-                    this.strategy.onDepthUpdate(asset, depthPayload);
-                }
-            } 
-        } catch (error) {
-            this.logger.error("Error handling signal message:", error);
-        }
-    }
-    
-    setupHttpServer() {
-        const httpServer = new WebSocket.Server({ port: this.config.port });
-        httpServer.on('connection', ws => {
-            this.logger.info('External Data Feed Connected');
-            ws.on('message', m => this.handleSignalMessage(m));
-            ws.on('error', (err) => this.logger.error('Signal listener error:', err));
-        });
-        this.logger.info(`Internal Data Server running on port ${this.config.port}`);
-    }
     
     async placeOrder(orderData) {
         if (orderData.client_order_id) {
@@ -410,4 +393,4 @@ class TradingBot {
         process.exit(1);
     }
 })();
-                                             
+                
