@@ -1,11 +1,12 @@
+
 /**
  * trader.js
- * v73.1 - NATIVE ARCHITECTURE (N-API Callback Fix)
+ * v73.2 - NATIVE ARCHITECTURE (Aligned with AdvanceStrategy V83.0)
  * Updates:
- * 1. DELETED Localhost HTTP Server (No more port 8082 loopback).
- * 2. INTEGRATED Native Rust BinanceListener directly into V8 engine.
- * 3. FIXED N-API Error-First callback pattern.
- * 4. ALIGNED with AdvanceStrategy (Heartbeat/Warmup enabled).
+ * 1. FIXED: Subscribes to L2 Orderbook updates for Exchange 1 Bid/Ask Liquidity.
+ * 2. FIXED: Correctly passes single `update` object to strategy.onDepthUpdate.
+ * 3. FIXED: Properly normalizes `all_trades` and forwards to strategy.onLaggerTrade.
+ * 4. ADDED: Quote routing via forwardQuoteToStrategy().
  */
 
 const WebSocket = require('ws');
@@ -19,7 +20,7 @@ let BinanceListener;
 try {
     const fastClient = require('fast-client');
     DeltaClient = fastClient.DeltaNativeClient;
-    BinanceListener = fastClient.BinanceListener; // The new native HFT listener
+    BinanceListener = fastClient.BinanceListener; 
 } catch (e) {
     console.warn("Native client not found, please ensure 'fast-client' is installed and built.");
     process.exit(1);
@@ -103,12 +104,10 @@ class TradingBot {
         }
     }
 
-    // --- State Check Helper ---
     hasOpenPosition(asset) {
         return this.activePositions[asset] === true;
     }
 
-    // --- Latency Helper ---
     recordOrderPunch(clientOrderId) {
         this.orderLatencies.set(clientOrderId, Date.now());
         setTimeout(() => {
@@ -119,7 +118,7 @@ class TradingBot {
     }
 
     async start() {
-        this.logger.info(`--- Bot Initializing (v73.1 - NATIVE RUST ARCHITECTURE) ---`);
+        this.logger.info(`--- Bot Initializing (v73.2 - NATIVE RUST ARCHITECTURE) ---`);
         this.logger.info("🔥 Warming up Rust Native Connection...");
         try {
             await this.client.getWalletBalance();
@@ -132,22 +131,16 @@ class TradingBot {
         await this.initWebSocket();
         this.startRestKeepAlive();
 
-        // --- NEW: START NATIVE BINANCE LISTENER ---
         this.logger.info("⚡ Booting Native Rust Binance Listener...");
         const binanceFeed = new BinanceListener();
         
-        // [FIX APPLIED]: Added 'err' parameter to properly catch N-API Error-First Callback
         binanceFeed.start(this.targetAssets, (err, update) => {
-            // 1. Handle potential N-API errors
             if (err) {
                 this.logger.error(`[Binance Thread Error] ${err}`);
                 return;
             }
-            
-            // 2. Safety check
             if (!update) return;
 
-            // 3. Normal Execution
             if (!this.authenticated) {
                 const now = Date.now();
                 if (now - this.lastAuthWarning > 5000) { 
@@ -157,17 +150,12 @@ class TradingBot {
                 return;
             }
 
-            const depthPayload = {
-                bids: [[ update.bb, update.bq ]], 
-                asks: [[ update.ba, update.aq ]]  
-            };
-            
-            if (this.strategy && this.strategy.onDepthUpdate) {
-                this.strategy.onDepthUpdate(update.s, depthPayload);
+            // FIXED: Passing native object directly to strategy as expected by AdvanceStrategy.js
+            if (this.strategy && typeof this.strategy.onDepthUpdate === 'function') {
+                this.strategy.onDepthUpdate(update);
             }
         });
 
-        // Start Strategy
         if (this.strategy && typeof this.strategy.start === 'function') {
             this.logger.info(`🚀 Starting Strategy Logic...`);
             await this.strategy.start();
@@ -183,7 +171,6 @@ class TradingBot {
         }, 29000);
     }
 
-    // --- WebSocket Heartbeat ---
     startHeartbeat() {
         this.resetHeartbeatTimeout();
         this.pingInterval = setInterval(() => {
@@ -206,7 +193,6 @@ class TradingBot {
         clearInterval(this.pingInterval);
     }
 
-    // --- WebSocket Connection ---
     async initWebSocket() {
         this.logger.info(`Connecting to: ${this.config.wsURL}`);
         this.ws = new WebSocket(this.config.wsURL);
@@ -245,10 +231,12 @@ class TradingBot {
     }
 
     subscribeToChannels() {
+        // Typically Delta uses the USDT suffix for perps (e.g. BTCUSDT) or USD
         const tradeSymbols = this.targetAssets.map(asset => `${asset}USD`);
+        const orderbookSymbols = this.targetAssets.map(asset => `${asset}USDT`); // Delta perps
         
         this.logger.info(`Subscribing to: Orders, Positions, User Trades`);
-        this.logger.info(`Subscribing to All Trades for: ${tradeSymbols.join(', ')}`);
+        this.logger.info(`Subscribing to L2 Orderbook & Trades for: ${this.targetAssets.join(', ')}`);
         
         this.ws.send(JSON.stringify({ 
             type: 'subscribe', 
@@ -257,7 +245,10 @@ class TradingBot {
                     { name: 'orders', symbols: ['all'] },
                     { name: 'positions', symbols: ['all'] },
                     { name: 'user_trades', symbols: ['all'] },
-                    { name: 'all_trades', symbols: tradeSymbols } 
+                    { name: 'all_trades', symbols: tradeSymbols },
+                    // ADDED: Crucial L2 Orderbook subscription for Exchange 1 liquidity tracking
+                    { name: 'l2_updates', symbols: tradeSymbols },
+                    { name: 'l2_updates', symbols: orderbookSymbols } 
                 ]
             }
         }));
@@ -283,12 +274,23 @@ class TradingBot {
         }
 
         switch (message.type) {
+            case 'l2_updates':
+            case 'v2/ticker':
+                // ADDED: Route Exchange 1 Quotes directly to strategy
+                this.forwardQuoteToStrategy(message);
+                break;
+
             case 'all_trades':
-                if (Array.isArray(message.data)) {
-                     if(message.data.length > 0) this.forwardTradeToStrategy(message.data[0]);
-                } else {
-                     this.forwardTradeToStrategy(message);
-                }
+                // FIXED: Normalize array vs single trade and map the symbol
+                const tradesData = Array.isArray(message.data) ? message.data : [message.data || message];
+                tradesData.forEach(t => {
+                    if (t) {
+                        this.forwardTradeToStrategy({
+                            ...t,
+                            symbol: message.symbol || t.symbol || message.product_symbol
+                        });
+                    }
+                });
                 break;
 
             case 'orders':
@@ -309,8 +311,38 @@ class TradingBot {
         }
     }
 
+    // --- ADDED: Forward Quote logic for Exchange 1 Liquidity ---
+    forwardQuoteToStrategy(message) {
+        if (this.strategy && typeof this.strategy.onExchange1Quote === 'function') {
+            const data = message.data || message;
+            
+            // Map Delta's nested arrays to flat quote structure
+            let mappedBid = data.best_bid || data.bid || 0;
+            let mappedAsk = data.best_ask || data.ask || 0;
+            let mappedBidSize = data.best_bid_size || data.bid_size || 0;
+            let mappedAskSize = data.best_ask_size || data.ask_size || 0;
+
+            if (data.buy && data.buy.length > 0) {
+                mappedBid = data.buy[0].limit_price || data.buy[0].price;
+                mappedBidSize = data.buy[0].size;
+            }
+            if (data.sell && data.sell.length > 0) {
+                mappedAsk = data.sell[0].limit_price || data.sell[0].price;
+                mappedAskSize = data.sell[0].size;
+            }
+
+            this.strategy.onExchange1Quote({
+                symbol: message.symbol || data.symbol || message.product_symbol,
+                bid: mappedBid,
+                ask: mappedAsk,
+                bid_size: mappedBidSize,
+                ask_size: mappedAskSize
+            });
+        }
+    }
+
     forwardTradeToStrategy(tradeData) {
-        if (this.strategy && this.strategy.onLaggerTrade) {
+        if (this.strategy && typeof this.strategy.onLaggerTrade === 'function') {
             this.strategy.onLaggerTrade(tradeData);
         }
     }
@@ -404,4 +436,3 @@ class TradingBot {
         process.exit(1);
     }
 })();
-             
