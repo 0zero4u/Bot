@@ -11,7 +11,7 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- STRATEGY PARAMETERS ---
-        this.DECAY_ALPHA = 0.5;
+        this.DECAY_ALPHA = 0.7;
         this.WELFORD_ALPHA = 0.00015 ;
         this.ENTRY_Z = 3.5;
         this.EXIT_Z = 0.5;
