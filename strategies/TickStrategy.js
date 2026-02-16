@@ -12,7 +12,7 @@ class TickStrategy {
 
         // --- STRATEGY PARAMETERS ---
         this.DECAY_ALPHA = 0.7;
-        this.WELFORD_ALPHA = 0.00015 ;
+        this.WELFORD_ALPHA = 0.00011 ;
         this.ENTRY_Z = 3.5;
         this.EXIT_Z = 0.5;
         this.MIN_NOISE_FLOOR = 0.05;
