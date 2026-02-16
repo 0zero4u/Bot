@@ -1,12 +1,11 @@
 /**
  * AdvanceStrategy.js
- * v83.2 - BINARY SNIPER (ENV ORDER SIZE) + 0.01% SAFETY SL
+ * v83.3 - BINARY SNIPER (HARD SL + TRAIL TP)
  * * LOGIC:
- * 1. BINARY ENTRY: Either we are in the safe window (15-60ms) or we don't trade.
- * 2. NO GAMBLING: No "half size" trades in the danger zone.
- * 3. LIQUIDITY SYNC: Size is capped by BBO quantity to prevent slippage.
- * 4. DYNAMIC SIZING: Base lot size can be overridden via process.env.ORDER_SIZE
- * 5. SAFETY: Added 0.01% Hard Stop Loss Bracket.
+ * 1. BINARY ENTRY: Safe window (15-60ms) execution only.
+ * 2. SAFETY FIRST: 0.01% "Hard" Trail. Acts as Hard SL at entry, then trails profit.
+ * 3. LIQUIDITY SYNC: Sizes capped by orderbook depth.
+ * 4. DYNAMIC SIZING: Env-controlled lot sizes.
  */
 
 class PriceHistory {
@@ -44,20 +43,22 @@ class AdvanceStrategy {
         this.logger = bot.logger;
 
         // --- BINARY TIMING (STRICT) ---
-        this.TIME_NOISE = 4;      // Wait for WS jitter to settle
+        this.TIME_NOISE = 4;       // Wait for WS jitter to settle
         this.TIME_KILL = 20;       // HARD CUTOFF. 66ms+ = NO TRADE.
         
         this.FRESHNESS_LIMIT_MS = 10; 
         this.DEPLETION_RATIO = 2.0; 
 
         // --- RISK SETTINGS ---
-        this.ENTRY_BUFFER_TICKS = 5;   
-        this.TRAILING_PERCENT = 0.02000; 
-        this.STOP_LOSS_PERCENT = 0.01; // 0.01% Hard Stop Loss
+        this.ENTRY_BUFFER_TICKS = 12;   
+        
+        // "Hard SL + Trail TP" Configuration
+        // We set this to 0.01%. It acts as a Hard Stop initially, then trails.
+        this.TRAILING_PERCENT = 0.02; 
+        
         this.LOCK_DURATION_MS = 5000;    
 
         // --- DYNAMIC ENV SIZE ---
-        // Reads ORDER_SIZE from .env, defaults to null if not set
         const envSize = process.env.ORDER_SIZE ? parseFloat(process.env.ORDER_SIZE) : null;
 
         this.specs = {
@@ -74,7 +75,7 @@ class AdvanceStrategy {
             if (this.specs[symbol]) {
                 this.assets[symbol] = {
                     ex1Bid: 0, ex1Ask: 0,
-                    ex1BidSize: 0, ex1AskSize: 0, // Track liquidity
+                    ex1BidSize: 0, ex1AskSize: 0,
                     ex1UpdateTs: 0,
                     volSinceUpdateBuy: 0, 
                     volSinceUpdateSell: 0,
@@ -90,13 +91,13 @@ class AdvanceStrategy {
         });
 
         this.stats = { signals: 0, fills: 0, misses: 0 };
-        this.logger.info(`[Strategy] Loaded V83.2 (BINARY SNIPER + SL) | ENV Size: ${envSize ? envSize : 'Default'}`);
+        this.logger.info(`[Strategy] Loaded V83.3 (Hard SL + Trail TP) | SL/Trail: ${this.TRAILING_PERCENT}%`);
     }
 
-    getName() { return "AdvanceStrategy (V83.2 Binary+SL)"; }
+    getName() { return "AdvanceStrategy (V83.3 HardSL+TrailTP)"; }
 
     async start() {
-        this.logger.info(`[Strategy] 🟢 V83.2 Engine Started.`);
+        this.logger.info(`[Strategy] 🟢 V83.3 Engine Started.`);
     }
 
     onExchange1Quote(msg) {
@@ -155,9 +156,7 @@ class AdvanceStrategy {
         const dt = now - data.ex1UpdateTs;
 
         // --- BINARY FILTER ---
-        // 1. Too Early? (Noise)
         if (dt < this.TIME_NOISE) return;
-        // 2. Too Late? (Danger Zone)
         if (dt > this.TIME_KILL) return;
 
         // Depletion Logic
@@ -212,7 +211,6 @@ class AdvanceStrategy {
             // --- LIQUIDITY-AWARE SIZING ---
             let available = (side === 'buy') ? data.ex1AskSize : data.ex1BidSize;
             if (!available || available <= 0) available = spec.lot;
-            
             let finalSize = Math.min(spec.lot, available); 
             if (finalSize < spec.minLot) finalSize = spec.minLot;
 
@@ -220,26 +218,27 @@ class AdvanceStrategy {
             
             this.logger.info(`[Sniper] ⚡ ${asset} ${side.toUpperCase()} | Type: ${type} | T+${dt}ms | Size: ${finalSize.toFixed(4)}`);
 
-            // --- TRAILING STOP CALCULATION ---
-            let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
-            trailValue = side === 'buy' ? -Math.abs(trailValue) : Math.abs(trailValue);
-
-            // --- STOP LOSS CALCULATION (0.01%) ---
-            const slOffset = quotePrice * (this.STOP_LOSS_PERCENT / 100);
-            // Buy: Stop is Below (Price - Offset). Sell: Stop is Above (Price + Offset)
-            const slPrice = side === 'buy' ? (quotePrice - slOffset) : (quotePrice + slOffset);
+            // --- HARD SL + TRAIL TP LOGIC ---
+            // Logic: A tight trailing stop (0.01%) serves both purposes.
+            // 1. At T=0, it sets a stop at Entry +/- 0.01% (Hard SL).
+            // 2. At T>0, if price moves in favor, the stop moves with it (Trail TP).
             
+            let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
+            
+            // Ensure trail value is positive absolute number for the API
+            const trailAmountAbs = Math.abs(trailValue).toFixed(spec.precision);
+
             const payload = { 
                 product_id: spec.deltaId.toString(), 
                 size: finalSize.toFixed(6), 
                 side: side, 
                 order_type: 'market_order',              
-                // Existing Trailing Stop
-                bracket_trail_amount: trailValue.toFixed(spec.precision), 
+                
+                // --- SAFETY + PROFIT MECHANISM ---
+                // This single parameter creates the "Moving Safety Net"
+                bracket_trail_amount: trailAmountAbs,
                 bracket_stop_trigger_method: 'last_traded_price', 
-                // New 0.01% Stop Loss (Safety)
-                bracket_stop_loss_price: slPrice.toFixed(spec.precision),
-                bracket_stop_loss_limit_price: slPrice.toFixed(spec.precision), // Ensuring SL limit is set
+                
                 client_order_id: `snipe_${Date.now()}`
             };
             
@@ -249,7 +248,7 @@ class AdvanceStrategy {
 
             if (orderResult && orderResult.success) {
                  this.stats.fills++;
-                 this.logger.info(`[Sniper] 🎯 FILLED ${asset} | Exec: ${execTime}ms`);
+                 this.logger.info(`[Sniper] 🎯 FILLED ${asset} | Exec: ${execTime}ms | Trail: ${trailAmountAbs}`);
             } else {
                 this.stats.misses++;
             }
@@ -262,5 +261,6 @@ class AdvanceStrategy {
         }
     }
 }
+
 module.exports = AdvanceStrategy;
-                
+    
