@@ -16,7 +16,7 @@ class TickStrategy {
         this.ENTRY_Z = 3.5;
         this.EXIT_Z = 0.5;
         this.MIN_NOISE_FLOOR = 0.05;
-        this.WARMUP_TICKS = 600; 
+        this.WARMUP_TICKS = 20000; 
         
         // --- RISK SETTINGS (Aligned with AdvanceStrategy) ---
         // 0.02% (Stored as percentage like AdvanceStrategy)
