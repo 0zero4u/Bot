@@ -1,6 +1,8 @@
 /**
  * TickStrategy.js
- * v9.2 [PERCENTAGE TRAIL NORMALIZED]
+ * v9.3 [NATIVE ALIGNMENT + HARD SL TRAIL]
+ * Updated to accept Rust Native Client (Level 1) Data
+ * Aligned SL/TP with AdvanceStrategy v83
  */
 
 class TickStrategy {
@@ -16,10 +18,11 @@ class TickStrategy {
         this.MIN_NOISE_FLOOR = 0.05;
         this.WARMUP_TICKS = 600; 
         
-        // --- RISK SETTINGS (NORMALIZED) ---
-        // 0.02% = 0.0002. Example: BTC 96000 * 0.0002 = $19.2 trail
-        this.TRAIL_PERCENT = 0.0002; 
+        // --- RISK SETTINGS (Aligned with AdvanceStrategy) ---
+        // 0.02% (Stored as percentage like AdvanceStrategy)
+        this.TRAILING_PERCENT = 0.02; 
 
+        // Config aligned with what the Bot expects
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
             'BTC': { deltaId: 27,    precision: 1, tickSize: 0.1 },
@@ -31,7 +34,7 @@ class TickStrategy {
 
         const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
         targets.forEach(symbol => {
-            const cleanSymbol = symbol.replace('_USDT', '');
+            const cleanSymbol = symbol.trim().toUpperCase().replace('_USDT', '');
             if (MASTER_CONFIG[cleanSymbol]) {
                 this.assets[cleanSymbol] = {
                     config: MASTER_CONFIG[cleanSymbol],
@@ -47,10 +50,16 @@ class TickStrategy {
                 };
             }
         });
+        
+        this.logger.info(`[TickStrategy] Loaded v9.3 | SL/Trail: ${this.TRAILING_PERCENT}% | Targets: ${Object.keys(this.assets).join(',')}`);
     }
 
     getName() {
-        return "TickStrategy v9.2 (Percentage Trail)";
+        return "TickStrategy v9.3 (Native+Trail)";
+    }
+
+    async start() {
+        this.logger.info(`[TickStrategy] 🟢 Engine Started (Waiting for Rust Data...)`);
     }
 
     onPositionClose(symbol) {
@@ -61,178 +70,161 @@ class TickStrategy {
         }
     }
 
-    async execute(data) {
-        if (!data || !data.type) return;
-        try {
-            if (data.type === 'depthUpdate') {
-                const cleanSymbol = data.s.replace('_USDT', '');
-                await this.onDepthUpdate(cleanSymbol, data);
-            }
-        } catch (e) {
-            this.logger.error(`[STRATEGY] Execution Error: ${e.message}`);
-        }
-    }
-
-    calcNormalizedVol(levels, pureMidPrice, tickSize) {
-        let weightedTotal = 0;
-        const limit = Math.min(levels.length, 10);
-
-        for (let i = 0; i < limit; i++) {
-            const price = parseFloat(levels[i][0]);
-            const size = parseFloat(levels[i][1]);
-            if (isNaN(size) || isNaN(price)) continue;
-
-            const dist = Math.abs(price - pureMidPrice);
-            const ticksAway = dist / tickSize;
-            const weight = Math.exp(-this.DECAY_ALPHA * ticksAway);
-
-            weightedTotal += size * weight;
-        }
-
-        return weightedTotal;
-    }
-
-    async onDepthUpdate(symbol, depth) {
-        const asset = this.assets[symbol];
-        if (!asset) return;
-        if (!depth.bids.length || !depth.asks.length) return;
-
-        const bestBid = parseFloat(depth.bids[0][0]);
-        const bestAsk = parseFloat(depth.asks[0][0]);
-        if (bestBid >= bestAsk) return;
-
-        const bestBidSize = parseFloat(depth.bids[0][1]);
-        const bestAskSize = parseFloat(depth.asks[0][1]);
-
-        const pureMid = (bestBid + bestAsk) / 2;
-        const microprice = (bestAsk * bestBidSize + bestBid * bestAskSize) / (bestBidSize + bestAskSize);
-        const spread = bestAsk - bestBid;
+    /**
+     * Entry point called by trader.js when Rust sends data
+     * Data format: { s: symbol, bb: best_bid, bq: bid_qty, ba: best_ask, aq: ask_qty }
+     */
+    async onDepthUpdate(data) {
+        if (!data || !data.s) return;
         
-        asset.midPrice = microprice; 
+        const cleanSymbol = data.s.replace('_USDT', '');
+        const asset = this.assets[cleanSymbol];
+        if (!asset) return;
 
+        // Parse Rust Data (Level 1 Only)
+        const bestBid = parseFloat(data.bb);
+        const bestAsk = parseFloat(data.ba);
+        const bestBidSize = parseFloat(data.bq);
+        const bestAskSize = parseFloat(data.aq);
+
+        // Basic validation
+        if (bestBid >= bestAsk || bestBid === 0 || bestAsk === 0) return;
+
+        // --- 1. METRICS CALCULATION (Adapted for Level 1) ---
+        const pureMid = (bestBid + bestAsk) / 2;
+        
+        // Microprice (Level 1 weighted mid)
+        // Formula: (Ask * BidVol + Bid * AskVol) / (BidVol + AskVol)
+        const microprice = (bestAsk * bestBidSize + bestBid * bestAskSize) / (bestBidSize + bestAskSize);
+        
+        const spread = bestAsk - bestBid;
+        asset.midPrice = microprice;
+
+        // Update Average Spread
         if (asset.avgSpread === 0) asset.avgSpread = spread;
         else asset.avgSpread = (asset.avgSpread * 0.99) + (spread * 0.01);
 
-        const wBidVol = this.calcNormalizedVol(depth.bids, pureMid, asset.config.tickSize);
-        const wAskVol = this.calcNormalizedVol(depth.asks, pureMid, asset.config.tickSize);
+        // OBI (Order Book Imbalance) - Level 1 Adaptation
+        // (BidVol - AskVol) / (BidVol + AskVol)
+        const totalVol = bestBidSize + bestAskSize;
+        if (totalVol === 0) return;
+        
+        const currentOBI = (bestBidSize - bestAskSize) / totalVol;
 
-        if (wBidVol + wAskVol === 0) return;
-
-        const currentOBI = (wBidVol - wAskVol) / (wBidVol + wAskVol);
-
+        // --- 2. WELFORD'S ALGORITHM (Volatility/Z-Score) ---
         if (asset.obiCount === 0) {
             asset.obiMean = currentOBI;
             asset.obiVariance = 0;
-            asset.obiCount = 1;
         } else {
             const delta = currentOBI - asset.obiMean;
             asset.obiMean += this.WELFORD_ALPHA * delta;
-            
-            asset.obiVariance =
-                (1 - this.WELFORD_ALPHA) * asset.obiVariance +
-                this.WELFORD_ALPHA * delta * delta;
-
-            asset.obiCount++;
+            asset.obiVariance = (1 - this.WELFORD_ALPHA) * (asset.obiVariance + this.WELFORD_ALPHA * delta * delta);
         }
+        asset.obiCount++;
 
+        // Warmup check
         if (asset.obiCount < this.WARMUP_TICKS) {
-            if (asset.obiCount % 50 === 0) {
-                this.logger.info(`[WARMUP] ${symbol} Gathering Data: ${asset.obiCount}/${this.WARMUP_TICKS}`);
+            if (asset.obiCount % 100 === 0) {
+                this.logger.info(`[WARMUP] ${cleanSymbol} Ticks: ${asset.obiCount}/${this.WARMUP_TICKS}`);
             }
             return;
         }
 
         const stdDev = Math.sqrt(asset.obiVariance);
-        const effectiveStdDev = Math.max(stdDev, this.MIN_NOISE_FLOOR);
-        const zScore = (currentOBI - asset.obiMean) / effectiveStdDev;
+        const effectiveStd = Math.max(stdDev, this.MIN_NOISE_FLOOR); // Noise floor
+        const zScore = (currentOBI - asset.obiMean) / effectiveStd;
 
-        const now = Date.now();
-        if (now - asset.lastLogTime > 4000) {
-            this.logger.info(
-                `[HEARTBEAT] ${symbol} | Z: ${zScore.toFixed(2)} | OBI: ${currentOBI.toFixed(3)} | Vol: ${effectiveStdDev.toFixed(4)}`
-            );
-            asset.lastLogTime = now;
-        }
-
-        this.handleRegime(symbol, zScore, spread, asset.avgSpread, currentOBI, bestBid, bestAsk);
         asset.lastZ = zScore;
-    }
 
-    handleRegime(symbol, zScore, spread, avgSpread, currentOBI, bestBid, bestAsk) {
-        const asset = this.assets[symbol];
-        const absZ = Math.abs(zScore);
-
-        let dynamicEntry = this.ENTRY_Z;
-        if (spread > avgSpread * 2) {
-            dynamicEntry = this.ENTRY_Z * 1.5;
-        }
-
-        const signFlipped = asset.lastZ !== 0 && Math.sign(zScore) !== Math.sign(asset.lastZ);
-
-        if (asset.currentRegime === 0) {
-            if (absZ > dynamicEntry) {
-                const side = zScore > 0 ? 'buy' : 'sell';
-
-                asset.currentRegime = 1;
-                asset.regimeSide = side;
-
-                this.logger.info(`[SNIPER] ${symbol} ${side.toUpperCase()} | Z: ${zScore.toFixed(2)}`);
-                this.executeTrade(symbol, side, bestBid, bestAsk, spread);
+        // --- 3. SIGNAL LOGIC ---
+        
+        // EXIT LOGIC
+        if (asset.currentRegime !== 0) {
+            // If we are LONG (1) and Z drops below EXIT_Z
+            if (asset.currentRegime === 1 && zScore < this.EXIT_Z) {
+                this.logger.info(`[SIGNAL] ${cleanSymbol} EXIT LONG (Z: ${zScore.toFixed(2)})`);
+                // Note: Actual exit is handled by the Trail Stop, but we could force exit here if desired.
+                // For now, we just reset regime to allow re-entry.
+                asset.currentRegime = 0; 
+                asset.regimeSide = null;
             }
-        } else {
-            if (absZ < this.EXIT_Z || signFlipped) {
+            // If we are SHORT (-1) and Z rises above -EXIT_Z
+            else if (asset.currentRegime === -1 && zScore > -this.EXIT_Z) {
+                this.logger.info(`[SIGNAL] ${cleanSymbol} EXIT SHORT (Z: ${zScore.toFixed(2)})`);
                 asset.currentRegime = 0;
                 asset.regimeSide = null;
-                this.logger.info(`[COOLDOWN] ${symbol} | Regime Reset (Exit or Flip)`);
             }
+        }
+
+        // ENTRY LOGIC (Only if no position known in bot)
+        if (asset.currentRegime === 0 && !this.bot.hasOpenPosition(cleanSymbol)) {
+            if (zScore > this.ENTRY_Z) {
+                await this.executeEntry(cleanSymbol, 'buy', bestAsk, asset);
+            } else if (zScore < -this.ENTRY_Z) {
+                await this.executeEntry(cleanSymbol, 'sell', bestBid, asset);
+            }
+        }
+
+        // Extensive Logging (Throttled slightly to prevent disk flood, but detailed)
+        const now = Date.now();
+        if (now - asset.lastLogTime > 2000) { // Log every 2s
+            this.logger.info(`[TICK] ${cleanSymbol} | P: ${pureMid.toFixed(asset.config.precision)} | OBI: ${currentOBI.toFixed(3)} | Z: ${zScore.toFixed(2)} | Vol: ${totalVol.toFixed(2)}`);
+            asset.lastLogTime = now;
         }
     }
 
-    async executeTrade(symbol, side, bestBid, bestAsk, spread) {
-        if (this.bot.isOrderInProgress) return;
-        if (this.bot.hasOpenPosition(symbol)) return;
+    async executeEntry(symbol, side, price, asset) {
+        // Prevent double entry
+        asset.currentRegime = (side === 'buy') ? 1 : -1;
+        asset.regimeSide = side;
+
+        this.logger.info(`[EXECUTE] ${symbol} ${side.toUpperCase()} triggered | Z: ${asset.lastZ.toFixed(2)}`);
 
         try {
-            const asset = this.assets[symbol];
-            const clientOid = `${symbol}_${Date.now()}`;
+            const clientOid = `tick_${Date.now()}`;
             
-            // --- PERCENTAGE BASED NORMALIZATION ---
-            // Estimate entry price (Market Order)
-            const executionPrice = side === 'buy' ? bestAsk : bestBid;
+            // --- TRAIL LOGIC ALIGNED WITH ADVANCE STRATEGY ---
+            // AdvanceStrategy Logic: trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
+            const trailValue = price * (this.TRAILING_PERCENT / 100);
             
-            // Calculate raw trail distance based on 0.02% of price
-            let rawTrail = executionPrice * this.TRAIL_PERCENT; 
+            // Ensure trail is positive absolute number
+            const trailAmountAbs = Math.abs(trailValue).toFixed(asset.config.precision);
             
-            // Round to nearest valid Tick Size (Ceiling to avoid "0" on super low volatility)
-            // Example: XRP 2.50 * 0.0002 = 0.0005. tickSize is 0.0001. Result 0.0005.
-            let trail = Math.ceil(rawTrail / asset.config.tickSize) * asset.config.tickSize;
+            // Safety: Ensure trail isn't smaller than 2 ticks
+            const minSafeTrail = asset.config.tickSize * 2;
+            if (parseFloat(trailAmountAbs) < minSafeTrail) {
+                this.logger.warn(`[SAFETY] Calculated trail ${trailAmountAbs} too small. Using min ${minSafeTrail}`);
+            }
 
-            // Safety: Ensure we never go below 1 tick or a safe minimum
-            const minSafeTrail = asset.config.tickSize * 2; 
-            if (trail < minSafeTrail) trail = minSafeTrail;
-
-            const trailAmount = trail.toFixed(asset.config.precision);
-            
+            // Punch latency record
             this.bot.recordOrderPunch(clientOid);
 
-            await this.bot.placeOrder({
+            const payload = {
                 product_id: asset.config.deltaId.toString(),
                 side: side,
-                size: process.env.ORDER_SIZE || "1",
+                size: process.env.ORDER_SIZE || "10", // Defaulting if env missing
                 order_type: 'market_order', 
-                time_in_force: 'ioc', 
                 client_order_id: clientOid,
-                bracket_trail_amount: trailAmount, // Normalized 0.02%
-                bracket_stop_trigger_method: 'mark_price'
-            });
+                
+                // --- SAFETY + PROFIT MECHANISM (Aligned) ---
+                bracket_trail_amount: trailAmountAbs,
+                bracket_stop_trigger_method: 'last_traded_price' // Aligned with AdvanceStrategy
+            };
 
-            this.logger.info(`[EXECUTE] ${side.toUpperCase()} MARKET | Trail: ${trailAmount} (${(this.TRAIL_PERCENT*100).toFixed(3)}%)`);
+            const result = await this.bot.placeOrder(payload);
 
-        } catch (e) {
-            this.logger.error(`[EXEC_ERROR] ${symbol}: ${e.message}`);
+            if (result && result.success) {
+                this.logger.info(`[FILLED] ${symbol} ${side} | Trail: ${trailAmountAbs} (${this.TRAILING_PERCENT}%)`);
+            } else {
+                this.logger.error(`[ORDER FAIL] ${symbol} ${side} | ${JSON.stringify(result)}`);
+                asset.currentRegime = 0; // Reset on failure
+            }
+
+        } catch (error) {
+            this.logger.error(`[EXEC EXCEPTION] ${error.message}`);
+            asset.currentRegime = 0;
         }
     }
 }
 
 module.exports = TickStrategy;
-                    
