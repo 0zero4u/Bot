@@ -228,7 +228,7 @@ class AdvanceStrategy {
                 side: side, 
                 order_type: 'market_order',              
                 bracket_trail_amount: trailValue.toFixed(spec.precision), 
-                bracket_stop_trigger_method: 'mark_price', 
+                bracket_stop_trigger_method: 'last_traded_price', 
                 client_order_id: `snipe_${Date.now()}`
             };
             
