@@ -1,11 +1,12 @@
 /**
  * AdvanceStrategy.js
- * v83.1 - BINARY SNIPER (ENV ORDER SIZE)
+ * v83.2 - BINARY SNIPER (ENV ORDER SIZE) + 0.01% SAFETY SL
  * * LOGIC:
  * 1. BINARY ENTRY: Either we are in the safe window (15-60ms) or we don't trade.
  * 2. NO GAMBLING: No "half size" trades in the danger zone.
  * 3. LIQUIDITY SYNC: Size is capped by BBO quantity to prevent slippage.
  * 4. DYNAMIC SIZING: Base lot size can be overridden via process.env.ORDER_SIZE
+ * 5. SAFETY: Added 0.01% Hard Stop Loss Bracket.
  */
 
 class PriceHistory {
@@ -50,9 +51,9 @@ class AdvanceStrategy {
         this.DEPLETION_RATIO = 2.0; 
 
         // --- RISK SETTINGS ---
-        this.ENTRY_BUFFER_TICKS = 12;   
+        this.ENTRY_BUFFER_TICKS = 5;   
         this.TRAILING_PERCENT = 0.02000; 
-        // Bracket Take Profit removed per request
+        this.STOP_LOSS_PERCENT = 0.01; // 0.01% Hard Stop Loss
         this.LOCK_DURATION_MS = 5000;    
 
         // --- DYNAMIC ENV SIZE ---
@@ -89,13 +90,13 @@ class AdvanceStrategy {
         });
 
         this.stats = { signals: 0, fills: 0, misses: 0 };
-        this.logger.info(`[Strategy] Loaded V83.1 (BINARY SNIPER) | ENV Size: ${envSize ? envSize : 'Default'}`);
+        this.logger.info(`[Strategy] Loaded V83.2 (BINARY SNIPER + SL) | ENV Size: ${envSize ? envSize : 'Default'}`);
     }
 
-    getName() { return "AdvanceStrategy (V83.1 Binary)"; }
+    getName() { return "AdvanceStrategy (V83.2 Binary+SL)"; }
 
     async start() {
-        this.logger.info(`[Strategy] 🟢 V83.1 Engine Started.`);
+        this.logger.info(`[Strategy] 🟢 V83.2 Engine Started.`);
     }
 
     onExchange1Quote(msg) {
@@ -219,16 +220,26 @@ class AdvanceStrategy {
             
             this.logger.info(`[Sniper] ⚡ ${asset} ${side.toUpperCase()} | Type: ${type} | T+${dt}ms | Size: ${finalSize.toFixed(4)}`);
 
+            // --- TRAILING STOP CALCULATION ---
             let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
             trailValue = side === 'buy' ? -Math.abs(trailValue) : Math.abs(trailValue);
+
+            // --- STOP LOSS CALCULATION (0.01%) ---
+            const slOffset = quotePrice * (this.STOP_LOSS_PERCENT / 100);
+            // Buy: Stop is Below (Price - Offset). Sell: Stop is Above (Price + Offset)
+            const slPrice = side === 'buy' ? (quotePrice - slOffset) : (quotePrice + slOffset);
             
             const payload = { 
                 product_id: spec.deltaId.toString(), 
                 size: finalSize.toFixed(6), 
                 side: side, 
                 order_type: 'market_order',              
+                // Existing Trailing Stop
                 bracket_trail_amount: trailValue.toFixed(spec.precision), 
                 bracket_stop_trigger_method: 'last_traded_price', 
+                // New 0.01% Stop Loss (Safety)
+                bracket_stop_loss_price: slPrice.toFixed(spec.precision),
+                bracket_stop_loss_limit_price: slPrice.toFixed(spec.precision), // Ensuring SL limit is set
                 client_order_id: `snipe_${Date.now()}`
             };
             
@@ -252,4 +263,4 @@ class AdvanceStrategy {
     }
 }
 module.exports = AdvanceStrategy;
-                    
+                
