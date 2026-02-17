@@ -1,6 +1,6 @@
 /**
  * TickStrategy.js
- * v12.5 - STABILITY & COMPLIANCE
+ * v12.6 - STABILITY & COMPLIANCE + COOLDOWN
  * * * QUANT IMPROVEMENTS:
  * 1. Auto-Tuner: Converts "Minutes" -> "HFT Ticks" based on 400 TPS.
  * 2. Contrast: 1m Fast / 15m Slow for max Regime sensitivity.
@@ -11,6 +11,8 @@
  * 1. CRITICAL FIX: Added .toString() to product_id and size to prevent Rust SIGSEGV crash.
  * 2. FIX: Corrected negative bracket_trail_amount for Buy orders.
  * 3. ADDED: process.env.ORDER_SIZE support (Default 1).
+ * * * * NEW (v12.6):
+ * 1. COOLDOWN: Enforced 5000ms silence after any execution attempt.
  */
 
 class TickStrategy {
@@ -57,6 +59,9 @@ class TickStrategy {
         
         // Risk Settings (Preserved from original)
         this.TRAILING_PERCENT = 0.02; 
+        
+        // Cooldown Setting
+        this.COOLDOWN_MS = 5000;
 
         // Exchange Config
         const MASTER_CONFIG = {
@@ -85,6 +90,9 @@ class TickStrategy {
                 // Order State
                 currentRegime: 0, // 0=Neutral, 1=Long, -1=Short
                 
+                // Safety
+                cooldownUntil: 0, // Timestamp to ignore signals until
+                
                 ...details
             };
         }
@@ -93,12 +101,13 @@ class TickStrategy {
     // --- INTERFACE METHODS ---
 
     getName() {
-        return 'TickStrategy (v12.5 Fixed)';
+        return 'TickStrategy (v12.6 Cooldown)';
     }
 
     async start() {
         this.logger.info(`[STRATEGY START] TickStrategy Engine Active.`);
         this.logger.info(`[STRATEGY CONFIG] Warmup Target: ${this.WARMUP_TICKS} ticks per asset.`);
+        this.logger.info(`[STRATEGY CONFIG] Execution Cooldown: ${this.COOLDOWN_MS}ms.`);
         
         // --- GLASS BOX HEARTBEAT ---
         // Logs internal state every 5 seconds so we know what the algo is "thinking"
@@ -124,7 +133,10 @@ class TickStrategy {
             
             // Calculate Warmup %
             const pct = Math.min((asset.tickCounter / this.WARMUP_TICKS) * 100, 100);
-            const statusTag = (pct < 100) ? `[⏳ WARMUP ${pct.toFixed(1)}%]` : `[🟢 ACTIVE]`;
+            
+            // Status Tag logic (Active, Warmup, or Cooldown)
+            let statusTag = (pct < 100) ? `[⏳ WARMUP ${pct.toFixed(1)}%]` : `[🟢 ACTIVE]`;
+            if (Date.now() < asset.cooldownUntil) statusTag = `[❄️ COOLDOWN]`;
 
             this.logger.info(
                 `${statusTag} ${symbol} | Ticks: ${asset.tickCounter} | ` +
@@ -152,6 +164,10 @@ class TickStrategy {
         if (!this.assets[symbol]) return;
         
         const asset = this.assets[symbol];
+
+        // --- COOLDOWN CHECK ---
+        // If we are in cooldown, ignore this tick entirely for trading logic
+        if (Date.now() < asset.cooldownUntil) return;
         
         // Parse Strings to Floats
         const bestBid = parseFloat(depth.bb);
@@ -264,7 +280,11 @@ class TickStrategy {
     async executeTrade(symbol, side, entryPrice) {
         const asset = this.assets[symbol];
         
-        // Lock the asset to prevent double entry
+        // --- COOLDOWN TRIGGER ---
+        // Immediately set cooldown to prevent double-fire during async delay
+        asset.cooldownUntil = Date.now() + this.COOLDOWN_MS;
+
+        // Lock the asset to prevent double entry logic (Redundant but safe)
         asset.currentRegime = (side === 'buy') ? 1 : -1;
 
         // FIX: Support ENV variable for Order Size, default to 1
@@ -286,7 +306,7 @@ class TickStrategy {
         const clientOid = `TICK_${Date.now()}`;
 
         try {
-            this.logger.info(`[EXEC] ${symbol} ${side.toUpperCase()} @ ${entryPrice} | Size: ${size} | Trail: ${finalTrail} (${this.TRAILING_PERCENT}%)`);
+            this.logger.info(`[EXEC] ${symbol} ${side.toUpperCase()} @ ${entryPrice} | Size: ${size} | Trail: ${finalTrail} (${this.TRAILING_PERCENT}%) | Cooldown: 5s`);
 
             const payload = {
                 // FIX: CRITICAL - Convert to String to prevent Rust SIGSEGV
@@ -315,15 +335,17 @@ class TickStrategy {
                 } else {
                     this.logger.error(`[ORDER FAIL] ${symbol} ${side} | ${errorStr}`);
                     asset.currentRegime = 0; // Reset on genuine failure
+                    // Note: Cooldown remains active to prevent rapid-fire retries on errors
                 }
             }
 
         } catch (error) {
             this.logger.error(`[EXEC EXCEPTION] ${error.message}`);
             asset.currentRegime = 0;
+            // Note: Cooldown remains active here too
         }
     }
 }
 
 module.exports = TickStrategy;
-    
+            
