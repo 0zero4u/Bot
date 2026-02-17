@@ -48,11 +48,11 @@ class TickStrategy {
         
         // Base Z-Score (Sniper Mode)
         // Target: 2.0 Base * 0.8 Floor = 1.6 Effective Z (Near Theoretical Max of 1.66)
-        this.BASE_ENTRY_Z = 1.8; 
+        this.BASE_ENTRY_Z = 2.1; 
         
         // Regime Floor (The "Discount Limit")
         // 0.8 = Max 20% discount allowed during quiet markets.
-        this.REGIME_FLOOR = 0.65;
+        this.REGIME_FLOOR = 0.58;
 
         // Risk Settings (Preserved from original)
         this.TRAILING_PERCENT = 0.02; 
