@@ -1,19 +1,11 @@
 /**
  * TickStrategy.js
- * v12.7 - SNIPER CONFIGURATION
- * * * QUANT IMPROVEMENTS:
- * 1. Auto-Tuner: Converts "Minutes" -> "HFT Ticks" based on 400 TPS.
- * 2. Contrast: 1m Fast / 15m Slow for max Regime sensitivity.
- * 3. Sniper Mode: Base Z-Score = 2.0 (Targeting 1.6 effective entry).
- * 4. Microprice Vector: Confirms OBI direction with weighted price.
- * 5. Dynamic Warmup: Fast-Start math eliminates long wait times.
- * * * * LOGGING & FIXES (v12.5):
- * 1. CRITICAL FIX: Added .toString() to product_id and size to prevent Rust SIGSEGV crash.
- * 2. FIX: Corrected negative bracket_trail_amount for Buy orders.
- * 3. ADDED: process.env.ORDER_SIZE support (Default 1).
- * * * * NEW (v12.7):
- * 1. REGIME CONFIG: Added REGIME_FLOOR (0.8) to limit discount to 20% max.
- * 2. COOLDOWN: Enforced 5000ms silence after any execution attempt.
+ * v12.8 - WITH LIVE MATH CALCULATOR
+ * * * FEATURES:
+ * 1. LIVE CALCULATOR: Logs exactly why trades are passing or failing every 5s.
+ * 2. SNIPER CONFIG: Z=2.0, Floor=0.8 (Max 20% discount).
+ * 3. COOLDOWN: 5000ms safety period.
+ * 4. MATH LOGIC: Explicitly calculates mathematical ceilings for Z-Score.
  */
 
 class TickStrategy {
@@ -60,14 +52,13 @@ class TickStrategy {
         
         // Regime Floor (The "Discount Limit")
         // 0.8 = Max 20% discount allowed during quiet markets.
-        // 0.5 = Max 50% discount (Previous Setting).
         this.REGIME_FLOOR = 0.8;
 
         // Risk Settings (Preserved from original)
         this.TRAILING_PERCENT = 0.02; 
         
         // Cooldown Setting
-        this.COOLDOWN_MS = 30000;
+        this.COOLDOWN_MS = 5000;
 
         // Exchange Config
         const MASTER_CONFIG = {
@@ -107,60 +98,68 @@ class TickStrategy {
     // --- INTERFACE METHODS ---
 
     getName() {
-        return 'TickStrategy (v12.7 Sniper)';
+        return 'TickStrategy (v12.8 Calculator)';
     }
 
     async start() {
         this.logger.info(`[STRATEGY START] TickStrategy Engine Active.`);
-        this.logger.info(`[STRATEGY CONFIG] Z-Score: ${this.BASE_ENTRY_Z} | Regime Floor: ${this.REGIME_FLOOR} (Max Discount ${(1 - this.REGIME_FLOOR)*100}%)`);
+        this.logger.info(`[STRATEGY CONFIG] Z-Score: ${this.BASE_ENTRY_Z} | Regime Floor: ${this.REGIME_FLOOR}`);
         this.logger.info(`[STRATEGY CONFIG] Execution Cooldown: ${this.COOLDOWN_MS}ms.`);
         
-        // --- GLASS BOX HEARTBEAT ---
-        // Logs internal state every 5 seconds so we know what the algo is "thinking"
+        // --- LIVE MATH CALCULATOR ---
+        // Runs every 5 seconds to tell you if your settings are possible
         setInterval(() => {
-            this.logHeartbeat();
+            this.runMathCheck();
         }, 5000);
     }
 
-    logHeartbeat() {
-        let activeAssets = 0;
-        // Build a concise log line for each asset to monitor convergence
+    /**
+     * The Traffic Light Calculator
+     * Explains exactly what the market allows vs what you want.
+     */
+    runMathCheck() {
         for (const symbol in this.assets) {
             const asset = this.assets[symbol];
             
-            // Skip logging if data hasn't started flowing
-            if (asset.tickCounter === 0) continue;
-            activeAssets++;
+            // Only check if we have data
+            if (asset.tickCounter < this.WARMUP_TICKS) continue;
 
-            const fastVol = Math.sqrt(asset.fastObiVar).toFixed(5);
-            const slowVol = Math.sqrt(asset.slowObiVar).toFixed(5);
-            const mean = asset.obiMean.toFixed(4);
-            const ratio = asset.regimeRatio.toFixed(2);
+            const vol = Math.sqrt(asset.fastObiVar);
             
-            // Calculate Warmup %
-            const pct = Math.min((asset.tickCounter / this.WARMUP_TICKS) * 100, 100);
+            // Prevent division by zero
+            if (vol < 1e-9) continue;
+
+            // 1. Calculate Maximum Possible Z-Score (The Ceiling)
+            // The OBI signal is physically capped at 1.0 (100% Buyers).
+            // Formula: 1.0 / Current Volatility
+            const maxPossibleZ = 1.0 / vol;
+
+            // 2. Calculate Your Effective Target (The Requirement)
+            // We apply the Regime Floor to see what the bot actually demands.
+            // (e.g., Base 2.0 * Floor 0.8 = 1.6)
+            const currentScaler = Math.min(Math.max(asset.regimeRatio, this.REGIME_FLOOR), 3.0);
+            const yourTargetZ = this.BASE_ENTRY_Z * currentScaler;
+
+            // 3. The Verdict
+            const isPossible = maxPossibleZ > yourTargetZ;
             
-            // Status Tag logic (Active, Warmup, or Cooldown)
-            let statusTag = (pct < 100) ? `[⏳ WARMUP ${pct.toFixed(1)}%]` : `[🟢 ACTIVE]`;
-            if (Date.now() < asset.cooldownUntil) statusTag = `[❄️ COOLDOWN]`;
-
-            this.logger.info(
-                `${statusTag} ${symbol} | Ticks: ${asset.tickCounter} | ` +
-                `Mean: ${mean} | Vol(F/S): ${fastVol}/${slowVol} | Ratio: ${ratio}x | ` +
-                `Regime: ${asset.currentRegime}`
-            );
-        }
-
-        if (activeAssets === 0) {
-            this.logger.info(`[💓 HB] Waiting for market data... (No ticks received yet)`);
+            // 4. Log the Report
+            if (isPossible) {
+                this.logger.info(
+                    `[MATH ✅] ${symbol} | Vol: ${vol.toFixed(4)} | ` +
+                    `MaxLimit: ${maxPossibleZ.toFixed(2)} > Target: ${yourTargetZ.toFixed(2)} | ` +
+                    `Status: TRADING POSSIBLE`
+                );
+            } else {
+                this.logger.warn(
+                    `[MATH ❌] ${symbol} | Vol: ${vol.toFixed(4)} | ` +
+                    `MaxLimit: ${maxPossibleZ.toFixed(2)} < Target: ${yourTargetZ.toFixed(2)} | ` +
+                    `Status: IMPOSSIBLE (Lower Base Z!)`
+                );
+            }
         }
     }
 
-    /**
-     * Main Tick Processor
-     * Called by the Bot on every Level 1 update
-     * FIX: Now correctly handles Rust/BinanceListener compact format
-     */
     async onDepthUpdate(depth) {
         // --- FIX: MAP RUST SHORT-CODES TO STRATEGY VARIABLES ---
         // Rust sends: { s: 'BTC', bb: '90000', ba: '90001', bq: '0.1', aq: '0.2' }
@@ -248,8 +247,7 @@ class TickStrategy {
         asset.regimeRatio = (slowVol > 1e-9) ? (fastVol / slowVol) : 1.0;
         
         // Clamp Ratio: REGIME_FLOOR to 3.0x
-        // FIX: Replaced hardcoded 0.5 with configurable REGIME_FLOOR (0.8)
-        // This ensures the bot never discounts the Z-Score by more than 20%.
+        // This ensures the bot never discounts the Z-Score by more than 20% (if Floor is 0.8).
         const dynamicScaler = Math.min(Math.max(asset.regimeRatio, this.REGIME_FLOOR), 3.0);
 
         // 6. SIGNAL GENERATION
@@ -258,7 +256,6 @@ class TickStrategy {
         
         // Dynamic Entry Threshold
         // Example: Base 2.0 * Floor 0.8 = 1.6 (Required Z)
-        // Example: Base 2.0 * Scaler 1.5 = 3.0 (Required Z during chaos)
         const requiredZ = this.BASE_ENTRY_Z * dynamicScaler;
 
         // Microprice Confirmation (Vector Alignment)
@@ -355,4 +352,3 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-                               
