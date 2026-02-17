@@ -7,7 +7,9 @@
  * 3. Sniper Mode: Base Z-Score = 3.0 (Top 0.1% signals).
  * 4. Microprice Vector: Confirms OBI direction with weighted price.
  * 5. Dynamic Warmup: Fast-Start math eliminates long wait times.
- * 6. Glass Box Logging: 5s Heartbeat for internal state visibility.
+ * * * * LOGGING UPDATES (v12.1):
+ * 1. Added getName() interface.
+ * 2. Added Glass Box Heartbeat (5s interval) for state visibility.
  */
 
 class TickStrategy {
@@ -30,20 +32,20 @@ class TickStrategy {
         // --- 2. AUTOMATIC QUANT TRANSLATION (DO NOT EDIT) ---
         
         // Convert Minutes -> Seconds -> Ticks
-        const FAST_TICKS = FAST_WINDOW_MINS * 60 * EXPECTED_TPS;
-        const SLOW_TICKS = SLOW_WINDOW_MINS * 60 * EXPECTED_TPS;
+        this.FAST_TICKS = FAST_WINDOW_MINS * 60 * EXPECTED_TPS;
+        this.SLOW_TICKS = SLOW_WINDOW_MINS * 60 * EXPECTED_TPS;
 
         // Calculate Alphas (1 / N) for Welford's Algorithm
-        this.ALPHA_FAST = 1 / FAST_TICKS;
-        this.ALPHA_SLOW = 1 / SLOW_TICKS;
+        this.ALPHA_FAST = 1 / this.FAST_TICKS;
+        this.ALPHA_SLOW = 1 / this.SLOW_TICKS;
         
         // Automatic Warmup: Wait exactly as long as the Fast Window to ensure valid variance
-        this.WARMUP_TICKS = FAST_TICKS; 
+        this.WARMUP_TICKS = this.FAST_TICKS; 
 
         // Log the translated values for verification
         this.logger.info(`[STRATEGY INIT] Auto-Tuned for ${EXPECTED_TPS} TPS`);
-        this.logger.info(`[STRATEGY INIT] Fast Window: ${FAST_WINDOW_MINS}m -> ${FAST_TICKS} ticks (Alpha: ${this.ALPHA_FAST.toFixed(8)})`);
-        this.logger.info(`[STRATEGY INIT] Slow Window: ${SLOW_WINDOW_MINS}m -> ${SLOW_TICKS} ticks (Alpha: ${this.ALPHA_SLOW.toFixed(8)})`);
+        this.logger.info(`[STRATEGY INIT] Fast Window: ${FAST_WINDOW_MINS}m -> ${this.FAST_TICKS} ticks (Alpha: ${this.ALPHA_FAST.toFixed(8)})`);
+        this.logger.info(`[STRATEGY INIT] Slow Window: ${SLOW_WINDOW_MINS}m -> ${this.SLOW_TICKS} ticks (Alpha: ${this.ALPHA_SLOW.toFixed(8)})`);
 
 
         // --- 3. CORE PARAMETERS ---
@@ -75,7 +77,6 @@ class TickStrategy {
                 
                 // Counters
                 tickCounter: 0,
-                lastLogTime: 0, // Added for 5s heartbeat
                 
                 // Regime Tracking
                 regimeRatio: 1.0,
@@ -88,9 +89,42 @@ class TickStrategy {
         }
     }
 
-    // --- FIX: Method required by Bot Loader ---
+    // --- INTERFACE METHODS (FIXED) ---
+
     getName() {
-        return "TickStrategy (v12.1 GlassBox)";
+        return 'TickStrategy (v12.1 GlassBox)';
+    }
+
+    async start() {
+        this.logger.info(`[STRATEGY START] TickStrategy Engine Active.`);
+        
+        // --- GLASS BOX HEARTBEAT ---
+        // Logs internal state every 5 seconds so we know what the algo is "thinking"
+        setInterval(() => {
+            this.logHeartbeat();
+        }, 5000);
+    }
+
+    logHeartbeat() {
+        // Build a concise log line for each asset to monitor convergence
+        for (const symbol in this.assets) {
+            const asset = this.assets[symbol];
+            
+            // Skip logging if data hasn't started flowing
+            if (asset.tickCounter === 0) continue;
+
+            const fastVol = Math.sqrt(asset.fastObiVar).toFixed(5);
+            const slowVol = Math.sqrt(asset.slowObiVar).toFixed(5);
+            const mean = asset.obiMean.toFixed(4);
+            const ratio = asset.regimeRatio.toFixed(2);
+            const warmupPct = Math.min((asset.tickCounter / this.WARMUP_TICKS) * 100, 100).toFixed(1);
+
+            this.logger.info(
+                `[💓 HB] ${symbol} | Ticks: ${asset.tickCounter} (${warmupPct}%) | ` +
+                `Mean: ${mean} | Vol(F/S): ${fastVol}/${slowVol} | Ratio: ${ratio}x | ` +
+                `Regime: ${asset.currentRegime}`
+            );
+        }
     }
 
     /**
@@ -154,6 +188,7 @@ class TickStrategy {
         // We do not trade until the Fast Window (1 Minute) is fully populated.
         if (asset.tickCounter < this.WARMUP_TICKS) {
             // Log progress every 5000 ticks (approx 12s) to reduce log spam
+            // (The Heartbeat handles visibility now, but we keep this for specific milestone logging)
             if (asset.tickCounter % 5000 === 0) {
                  this.logger.debug(`[WARMUP] ${symbol}: ${asset.tickCounter}/${this.WARMUP_TICKS} ticks`);
             }
@@ -188,14 +223,6 @@ class TickStrategy {
         // This filters out "Thin Walls" where volume is high but value is low.
         const isMicroUp = microPrice > midPrice;
         const isMicroDown = microPrice < midPrice;
-
-        // --- GLASS BOX MONITORING (HEARTBEAT LOG) ---
-        // Runs every 5 seconds to provide visibility into calculations
-        const now = Date.now();
-        if (now - asset.lastLogTime > 5000) {
-            this.logger.info(`[HEARTBEAT] ${symbol} | Price: ${midPrice.toFixed(asset.precision)} | OBI: ${obi.toFixed(3)} (μ:${asset.obiMean.toFixed(3)}) | Vol: ${fastVol.toFixed(5)}/${slowVol.toFixed(5)} | Ratio: ${asset.regimeRatio.toFixed(2)} | Z: ${zScore.toFixed(2)} (Req: ${requiredZ.toFixed(2)})`);
-            asset.lastLogTime = now;
-        }
 
         // 6. EXECUTION LOGIC
         // Only trade if we are Neutral (Regime 0) and not currently managing a position
@@ -272,4 +299,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-            
+                                       
