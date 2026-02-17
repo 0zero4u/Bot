@@ -32,7 +32,7 @@ class TickStrategy {
         this.BASE_ENTRY_Z = 2.25; 
         
         // 2. Disable the "Quiet Market Discount"
-        this.REGIME_FLOOR = 1.0;
+        this.REGIME_FLOOR = 0.95;
 
         // 3. The Risk Leash
         this.TRAILING_PERCENT = 0.03; 
