@@ -1,12 +1,13 @@
 /**
  * TickStrategy.js
- * v12.0 - AUTO-CALIBRATED HARMONIC ARCHITECTURE
+ * v12.1 - AUTO-CALIBRATED HARMONIC ARCHITECTURE
  * * * QUANT IMPROVEMENTS:
  * 1. Auto-Tuner: Converts "Minutes" -> "HFT Ticks" based on 400 TPS.
  * 2. Contrast: 1m Fast / 15m Slow for max Regime sensitivity.
  * 3. Sniper Mode: Base Z-Score = 3.0 (Top 0.1% signals).
  * 4. Microprice Vector: Confirms OBI direction with weighted price.
  * 5. Dynamic Warmup: Fast-Start math eliminates long wait times.
+ * 6. Glass Box Logging: 5s Heartbeat for internal state visibility.
  */
 
 class TickStrategy {
@@ -74,6 +75,7 @@ class TickStrategy {
                 
                 // Counters
                 tickCounter: 0,
+                lastLogTime: 0, // Added for 5s heartbeat
                 
                 // Regime Tracking
                 regimeRatio: 1.0,
@@ -86,11 +88,10 @@ class TickStrategy {
         }
     }
 
-    // --- FIX START: Added missing method ---
+    // --- FIX: Method required by Bot Loader ---
     getName() {
-        return "TickStrategy (v12.0)";
+        return "TickStrategy (v12.1 GlassBox)";
     }
-    // --- FIX END ---
 
     /**
      * Main Tick Processor
@@ -188,6 +189,14 @@ class TickStrategy {
         const isMicroUp = microPrice > midPrice;
         const isMicroDown = microPrice < midPrice;
 
+        // --- GLASS BOX MONITORING (HEARTBEAT LOG) ---
+        // Runs every 5 seconds to provide visibility into calculations
+        const now = Date.now();
+        if (now - asset.lastLogTime > 5000) {
+            this.logger.info(`[HEARTBEAT] ${symbol} | Price: ${midPrice.toFixed(asset.precision)} | OBI: ${obi.toFixed(3)} (μ:${asset.obiMean.toFixed(3)}) | Vol: ${fastVol.toFixed(5)}/${slowVol.toFixed(5)} | Ratio: ${asset.regimeRatio.toFixed(2)} | Z: ${zScore.toFixed(2)} (Req: ${requiredZ.toFixed(2)})`);
+            asset.lastLogTime = now;
+        }
+
         // 6. EXECUTION LOGIC
         // Only trade if we are Neutral (Regime 0) and not currently managing a position
         if (asset.currentRegime === 0 && !this.bot.activePositions[symbol]) {
@@ -263,4 +272,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-                    
+            
