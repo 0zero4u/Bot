@@ -1,18 +1,19 @@
 /**
  * TickStrategy.js
- * v12.6 - STABILITY & COMPLIANCE + COOLDOWN
+ * v12.7 - SNIPER CONFIGURATION
  * * * QUANT IMPROVEMENTS:
  * 1. Auto-Tuner: Converts "Minutes" -> "HFT Ticks" based on 400 TPS.
  * 2. Contrast: 1m Fast / 15m Slow for max Regime sensitivity.
- * 3. Sniper Mode: Base Z-Score = 3.0 (Top 0.1% signals).
+ * 3. Sniper Mode: Base Z-Score = 2.0 (Targeting 1.6 effective entry).
  * 4. Microprice Vector: Confirms OBI direction with weighted price.
  * 5. Dynamic Warmup: Fast-Start math eliminates long wait times.
  * * * * LOGGING & FIXES (v12.5):
  * 1. CRITICAL FIX: Added .toString() to product_id and size to prevent Rust SIGSEGV crash.
  * 2. FIX: Corrected negative bracket_trail_amount for Buy orders.
  * 3. ADDED: process.env.ORDER_SIZE support (Default 1).
- * * * * NEW (v12.6):
- * 1. COOLDOWN: Enforced 5000ms silence after any execution attempt.
+ * * * * NEW (v12.7):
+ * 1. REGIME CONFIG: Added REGIME_FLOOR (0.8) to limit discount to 20% max.
+ * 2. COOLDOWN: Enforced 5000ms silence after any execution attempt.
  */
 
 class TickStrategy {
@@ -53,15 +54,20 @@ class TickStrategy {
 
         // --- 3. CORE PARAMETERS ---
         
-        // Base Z-Score (Aggressive 3.0 for Top 0.1% signals)
-        // We only trade "Sniper" entries.
+        // Base Z-Score (Sniper Mode)
+        // Target: 2.0 Base * 0.8 Floor = 1.6 Effective Z (Near Theoretical Max of 1.66)
         this.BASE_ENTRY_Z = 2.0; 
         
+        // Regime Floor (The "Discount Limit")
+        // 0.8 = Max 20% discount allowed during quiet markets.
+        // 0.5 = Max 50% discount (Previous Setting).
+        this.REGIME_FLOOR = 0.8;
+
         // Risk Settings (Preserved from original)
         this.TRAILING_PERCENT = 0.02; 
         
         // Cooldown Setting
-        this.COOLDOWN_MS = 30000;
+        this.COOLDOWN_MS = 5000;
 
         // Exchange Config
         const MASTER_CONFIG = {
@@ -101,12 +107,12 @@ class TickStrategy {
     // --- INTERFACE METHODS ---
 
     getName() {
-        return 'TickStrategy (v12.6 Cooldown)';
+        return 'TickStrategy (v12.7 Sniper)';
     }
 
     async start() {
         this.logger.info(`[STRATEGY START] TickStrategy Engine Active.`);
-        this.logger.info(`[STRATEGY CONFIG] Warmup Target: ${this.WARMUP_TICKS} ticks per asset.`);
+        this.logger.info(`[STRATEGY CONFIG] Z-Score: ${this.BASE_ENTRY_Z} | Regime Floor: ${this.REGIME_FLOOR} (Max Discount ${(1 - this.REGIME_FLOOR)*100}%)`);
         this.logger.info(`[STRATEGY CONFIG] Execution Cooldown: ${this.COOLDOWN_MS}ms.`);
         
         // --- GLASS BOX HEARTBEAT ---
@@ -241,17 +247,18 @@ class TickStrategy {
         // Guard against zero division
         asset.regimeRatio = (slowVol > 1e-9) ? (fastVol / slowVol) : 1.0;
         
-        // Clamp Ratio: 0.5x to 3.0x
-        // If market is 3x more volatile than normal, we require 3x stronger signal.
-        const dynamicScaler = Math.min(Math.max(asset.regimeRatio, 0.5), 3.0);
+        // Clamp Ratio: REGIME_FLOOR to 3.0x
+        // FIX: Replaced hardcoded 0.5 with configurable REGIME_FLOOR (0.8)
+        // This ensures the bot never discounts the Z-Score by more than 20%.
+        const dynamicScaler = Math.min(Math.max(asset.regimeRatio, this.REGIME_FLOOR), 3.0);
 
         // 6. SIGNAL GENERATION
         // Calculate Z-Score using Fast Volatility (Current Market State)
         const zScore = (fastVol > 1e-9) ? (obi - asset.obiMean) / fastVol : 0;
         
         // Dynamic Entry Threshold
-        // Example: Base 3.0 * Scaler 1.0 = 3.0 (Required Z)
-        // Example: Base 3.0 * Scaler 2.0 = 6.0 (Required Z during chaos)
+        // Example: Base 2.0 * Floor 0.8 = 1.6 (Required Z)
+        // Example: Base 2.0 * Scaler 1.5 = 3.0 (Required Z during chaos)
         const requiredZ = this.BASE_ENTRY_Z * dynamicScaler;
 
         // Microprice Confirmation (Vector Alignment)
@@ -348,4 +355,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-            
+                               
