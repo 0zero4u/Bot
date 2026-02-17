@@ -1,11 +1,11 @@
 /**
  * TickStrategy.js
- * v12.91 - GLASS BOX EDITION (AUTO-LIMITER + LIVE MATH)
+ * v12.91 - GLASS BOX EDITION (0.01% SNIPER HARMONY)
  * * * FEATURES:
  * 1. GLASS LOGGING: Exposes raw data, model thinking, and warmup status every 5s.
- * 2. SNIPER CONFIG: Z=2.2, Floor=0.52.
+ * 2. 0.01% SNIPER CONFIG: Z=3.8, Floor=1.0.
  * 3. COOLDOWN: 5000ms safety period.
- * 4. AUTO-LIMITER: Dynamically scales down Z-score targets when market volatility makes them mathematically impossible.
+ * 4. AUTO-LIMITER: Dynamically scales down Z-score targets when market volatility makes them mathematically impossible, down to a hard floor of 2.5.
  */
 
 class TickStrategy {
@@ -25,12 +25,28 @@ class TickStrategy {
         this.ALPHA_SLOW = 1 / this.SLOW_TICKS;
         this.WARMUP_TICKS = this.FAST_TICKS; 
 
-        // --- 3. CORE PARAMETERS ---
-        this.BASE_ENTRY_Z = 2.2; 
-        this.REGIME_FLOOR = 0.52;
+        // --- 3. CORE PARAMETERS (0.01% HARMONY) ---
+        
+        // 1. The 0.01% Statistical Target
+        // Demands a 3.8 standard deviation move (1-in-10,000 statistical probability)
+        this.BASE_ENTRY_Z = 3.8; 
+        
+        // 2. Disable the "Quiet Market Discount"
+        // 1.0 means we NEVER discount the Z-score just because the market is quiet.
+        this.REGIME_FLOOR = 1.0;
+
+        // 3. The Risk Leash (Keep it tight to prevent mean-reversion drag)
         this.TRAILING_PERCENT = 0.02; 
-        this.COOLDOWN_MS = 5000;
-        this.MIN_AUTO_LIMIT_Z = 1.2; 
+        
+        // 4. Cooldown (Wait 30 seconds for the shockwave to settle)
+        this.COOLDOWN_MS = 30000;
+
+        // --- 4. SAFETY LIMITS ---
+        
+        // The Ultimate Garbage Filter.
+        // Even if the Auto-Limiter engages, NEVER trade below a 2.5 Z-score. 
+        // 2.5 is the top 0.6%. If the market is so chaotic that a 2.5 is impossible, we lock the bot.
+        this.MIN_AUTO_LIMIT_Z = 2.5; 
 
         // Exchange Config
         const MASTER_CONFIG = {
@@ -58,7 +74,7 @@ class TickStrategy {
     }
 
     getName() {
-        return 'TickStrategy (v12.91 Glass Box)';
+        return 'TickStrategy (v12.91 0.01% Sniper)';
     }
 
     async start() {
@@ -256,4 +272,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-            
+    
