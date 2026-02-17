@@ -55,13 +55,13 @@ class TickStrategy {
         
         // Base Z-Score (Aggressive 3.0 for Top 0.1% signals)
         // We only trade "Sniper" entries.
-        this.BASE_ENTRY_Z = 1.3; 
+        this.BASE_ENTRY_Z = 1.6; 
         
         // Risk Settings (Preserved from original)
         this.TRAILING_PERCENT = 0.02; 
         
         // Cooldown Setting
-        this.COOLDOWN_MS = 5000;
+        this.COOLDOWN_MS = 30000;
 
         // Exchange Config
         const MASTER_CONFIG = {
