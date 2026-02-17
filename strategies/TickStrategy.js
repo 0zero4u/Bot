@@ -13,9 +13,9 @@ class TickStrategy {
         // --- STRATEGY PARAMETERS ---
         this.DECAY_ALPHA = 0.7;
         this.WELFORD_ALPHA = 0.00011 ;
-        this.ENTRY_Z = 1.95;
-        this.EXIT_Z = 0.2;
-        this.MIN_NOISE_FLOOR = 0.05;
+        this.ENTRY_Z = 2.0;
+        this.EXIT_Z = 0.01;
+        this.MIN_NOISE_FLOOR = 0.005;
         this.WARMUP_TICKS = 15000; 
         
         // --- RISK SETTINGS (Aligned with AdvanceStrategy) ---
