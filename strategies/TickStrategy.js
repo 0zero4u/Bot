@@ -1,11 +1,12 @@
 /**
  * TickStrategy.js
- * v12.92 - MID-PRICE PIVOT (TRUE VALUE HARMONY)
+ * v12.93 - MOMENTUM SNIPER (THE FLIP)
  * * * FEATURES:
  * 1. GLASS LOGGING: Exposes raw data, model thinking, and warmup status every 5s.
  * 2. 0.01% SNIPER CONFIG: Z=3.8, Floor=1.0.
- * 3. COOLDOWN: 5000ms safety period.
+ * 3. COOLDOWN: 30000ms safety period.
  * 4. SOURCE: Mid-Price (BestBid + BestAsk / 2) - Immune to Order Book Noise.
+ * 5. LOGIC: MOMENTUM (Buy the Breakout, Sell the Breakdown).
  */
 
 class TickStrategy {
@@ -68,11 +69,11 @@ class TickStrategy {
     }
 
     getName() {
-        return 'TickStrategy (v12.92 Mid-Price Pivot)';
+        return 'TickStrategy (v12.93 Momentum Flip)';
     }
 
     async start() {
-        this.logger.info(`[STRATEGY START] TickStrategy Engine Active (Mid-Price Mode).`);
+        this.logger.info(`[STRATEGY START] TickStrategy Engine Active (Mid-Price Momentum).`);
         this.logger.info(`[STRATEGY CONFIG] Base Z: ${this.BASE_ENTRY_Z}`);
         
         // --- 5s HEARTBEAT ---
@@ -113,7 +114,7 @@ class TickStrategy {
             this.logger.info(
                 `[🧠 THINKING ✅] ${symbol} | Vol: ${vol.toFixed(4)} | ` +
                 `Target Z: ${yourTargetZ.toFixed(2)} | ` +
-                `Status: NORMAL TRADING`
+                `Status: HUNTING MOMENTUM`
             );
         }
     }
@@ -195,17 +196,21 @@ class TickStrategy {
         if (asset.currentRegime === 0 && !this.bot.activePositions[symbol]) {
             const autoTag = isAutoCorrected ? '[AUTO-CORRECTED] ' : '';
 
+            // --- MOMENTUM SNIPER LOGIC (THE FLIP) ---
+            // VERDICT: We are Takers (Market Orders). We must ride the wave, not fight it.
+            
+            // 1. BULLISH BREAKOUT (Ride the Rocket)
+            // Logic: Price is surging (Z > Target) AND Order Book flow is Up
             if (zScore > requiredZ && isMicroUp) {
-                // Short on High Z (Mean Reversion)
-                // Note: If Price is High (Pos Z), we Expect Reversion Down -> SELL
-                this.logger.info(`[SIGNAL SELL] ${autoTag}${symbol} | Price Z: ${zScore.toFixed(2)} > ${requiredZ.toFixed(2)} | MicroPrice: OK`);
-                await this.executeTrade(symbol, 'sell', midPrice);
-            } 
-            else if (zScore < -requiredZ && isMicroDown) {
-                // Long on Low Z (Mean Reversion)
-                // Note: If Price is Low (Neg Z), we Expect Reversion Up -> BUY
-                this.logger.info(`[SIGNAL BUY] ${autoTag}${symbol} | Price Z: ${zScore.toFixed(2)} < -${requiredZ.toFixed(2)} | MicroPrice: OK`);
+                this.logger.info(`[ROCKET BUY] ${autoTag}${symbol} | Z: ${zScore.toFixed(2)} | MicroPrice: UP 🚀 | CHASING MOMENTUM`);
                 await this.executeTrade(symbol, 'buy', midPrice);
+            } 
+            
+            // 2. BEARISH CRASH (Ride the Waterfall)
+            // Logic: Price is crashing (Z < -Target) AND Order Book flow is Down
+            else if (zScore < -requiredZ && isMicroDown) {
+                this.logger.info(`[PANIC SELL] ${autoTag}${symbol} | Z: ${zScore.toFixed(2)} | MicroPrice: DOWN 📉 | CHASING MOMENTUM`);
+                await this.executeTrade(symbol, 'sell', midPrice);
             }
         }
     }
@@ -260,4 +265,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-            
+    
