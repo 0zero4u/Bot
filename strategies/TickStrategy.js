@@ -35,7 +35,7 @@ class TickStrategy {
         this.REGIME_FLOOR = 1.0;
 
         // 3. The Risk Leash
-        this.TRAILING_PERCENT = 0.015; 
+        this.TRAILING_PERCENT = 0.03; 
         
         // 4. Cooldown
         this.COOLDOWN_MS = 30000;
