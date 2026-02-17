@@ -1,18 +1,16 @@
 /**
  * TickStrategy.js
- * v12.4 - AUTO-CALIBRATED HARMONIC ARCHITECTURE
+ * v12.5 - STABILITY & COMPLIANCE
  * * * QUANT IMPROVEMENTS:
  * 1. Auto-Tuner: Converts "Minutes" -> "HFT Ticks" based on 400 TPS.
  * 2. Contrast: 1m Fast / 15m Slow for max Regime sensitivity.
  * 3. Sniper Mode: Base Z-Score = 3.0 (Top 0.1% signals).
  * 4. Microprice Vector: Confirms OBI direction with weighted price.
  * 5. Dynamic Warmup: Fast-Start math eliminates long wait times.
- * * * * LOGGING & FIXES (v12.3 -> v12.4):
- * 1. Fixed: onDepthUpdate now correctly maps Rust/BinanceListener short-codes (s, bb, ba).
- * 2. Added: Explicit [WARMUP] vs [ACTIVE] status in Heartbeat logs.
- * 3. Restored: Full documentation and logic comments.
- * 4. FIX v12.4: Corrected negative bracket_trail_amount for Buy orders.
- * 5. FIX v12.4: Added process.env.ORDER_SIZE support (Default 1).
+ * * * * LOGGING & FIXES (v12.5):
+ * 1. CRITICAL FIX: Added .toString() to product_id and size to prevent Rust SIGSEGV crash.
+ * 2. FIX: Corrected negative bracket_trail_amount for Buy orders.
+ * 3. ADDED: process.env.ORDER_SIZE support (Default 1).
  */
 
 class TickStrategy {
@@ -55,7 +53,7 @@ class TickStrategy {
         
         // Base Z-Score (Aggressive 3.0 for Top 0.1% signals)
         // We only trade "Sniper" entries.
-        this.BASE_ENTRY_Z = 1.6; 
+        this.BASE_ENTRY_Z = 1.3; 
         
         // Risk Settings (Preserved from original)
         this.TRAILING_PERCENT = 0.02; 
@@ -95,7 +93,7 @@ class TickStrategy {
     // --- INTERFACE METHODS ---
 
     getName() {
-        return 'TickStrategy (v12.4 Fixed)';
+        return 'TickStrategy (v12.5 Fixed)';
     }
 
     async start() {
@@ -269,7 +267,7 @@ class TickStrategy {
         // Lock the asset to prevent double entry
         asset.currentRegime = (side === 'buy') ? 1 : -1;
 
-        // FIX: Support ENV variable for Order Size, default to 1 (not 100)
+        // FIX: Support ENV variable for Order Size, default to 1
         const envSize = process.env.ORDER_SIZE ? parseFloat(process.env.ORDER_SIZE) : null;
         const size = envSize || this.bot.config.orderSize || 1;
 
@@ -283,7 +281,6 @@ class TickStrategy {
         }
         
         // Format to correct precision for the exchange
-        // toFixed preserves the sign
         const finalTrail = trailAmount.toFixed(asset.precision);
         
         const clientOid = `TICK_${Date.now()}`;
@@ -292,8 +289,9 @@ class TickStrategy {
             this.logger.info(`[EXEC] ${symbol} ${side.toUpperCase()} @ ${entryPrice} | Size: ${size} | Trail: ${finalTrail} (${this.TRAILING_PERCENT}%)`);
 
             const payload = {
-                product_id: asset.deltaId,
-                size: size,
+                // FIX: CRITICAL - Convert to String to prevent Rust SIGSEGV
+                product_id: asset.deltaId.toString(), 
+                size: size.toString(), 
                 side: side,
                 order_type: 'market_order',
                 client_order_id: clientOid,
