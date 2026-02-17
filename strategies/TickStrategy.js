@@ -36,7 +36,7 @@ class TickStrategy {
         this.REGIME_FLOOR = 0.8;
 
         // 3. The Risk Leash (Keep it tight to prevent mean-reversion drag)
-        this.TRAILING_PERCENT = 0.02; 
+        this.TRAILING_PERCENT = 0.03; 
         
         // 4. Cooldown (Wait 30 seconds for the shockwave to settle)
         this.COOLDOWN_MS = 30000;
