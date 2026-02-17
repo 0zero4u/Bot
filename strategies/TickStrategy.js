@@ -11,9 +11,9 @@ class TickStrategy {
         this.logger = bot.logger;
 
         // --- STRATEGY PARAMETERS ---
-        this.DECAY_ALPHA = 0.5;
+        this.DECAY_ALPHA = 0.2;
         this.WELFORD_ALPHA = 0.00011 ;
-        this.ENTRY_Z = 2.5;
+        this.ENTRY_Z = 1.8;
         this.EXIT_Z = 0.2;
         this.MIN_NOISE_FLOOR = 0.05;
         this.WARMUP_TICKS = 10000; 
