@@ -1,15 +1,16 @@
 /**
  * TickStrategy.js
- * v12.3 - AUTO-CALIBRATED HARMONIC ARCHITECTURE (GLASS BOX)
- * * * * QUANTITATIVE LOGIC:
- * 1. Auto-Tuner: Converts "Minutes" -> "HFT Ticks" based on ~400 TPS (Rust/Delta).
- * 2. Contrast: 1m Fast Window vs 15m Slow Window for maximum Regime sensitivity.
- * 3. Sniper Mode: Base Z-Score = 3.0 (Top 0.1% signals) to reduce false positives.
- * 4. Microprice Vector: Confirms OBI direction using volume-weighted mid-price.
- * 5. Dynamic Warmup: Fast-Start math eliminates long wait times; adapts Alpha instantly.
- * * * * ARCHITECTURE:
- * - "Glass Box" Logging: Heartbeat runs every 5s to show internal math (Mean, Volatility, Ratio).
- * - Dual Welford Accumulators: Tracks Fast (Signal) and Slow (Baseline) variance efficiently.
+ * v12.3 - AUTO-CALIBRATED HARMONIC ARCHITECTURE
+ * * * QUANT IMPROVEMENTS:
+ * 1. Auto-Tuner: Converts "Minutes" -> "HFT Ticks" based on 400 TPS.
+ * 2. Contrast: 1m Fast / 15m Slow for max Regime sensitivity.
+ * 3. Sniper Mode: Base Z-Score = 3.0 (Top 0.1% signals).
+ * 4. Microprice Vector: Confirms OBI direction with weighted price.
+ * 5. Dynamic Warmup: Fast-Start math eliminates long wait times.
+ * * * * LOGGING & FIXES (v12.3):
+ * 1. Fixed: onDepthUpdate now correctly maps Rust/BinanceListener short-codes (s, bb, ba).
+ * 2. Added: Explicit [WARMUP] vs [ACTIVE] status in Heartbeat logs.
+ * 3. Restored: Full documentation and logic comments.
  */
 
 class TickStrategy {
@@ -54,11 +55,10 @@ class TickStrategy {
         // We only trade "Sniper" entries.
         this.BASE_ENTRY_Z = 3.0; 
         
-        // Risk Settings
+        // Risk Settings (Preserved from original)
         this.TRAILING_PERCENT = 0.02; 
 
-        // Exchange Config (Delta ID Mappings)
-        // NOTE: Keys here must match the Normalized Symbol (e.g. 'BTC', not 'BTCUSDT')
+        // Exchange Config
         const MASTER_CONFIG = {
             'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
             'BTC': { deltaId: 27,    precision: 1, tickSize: 0.1 },
@@ -67,7 +67,6 @@ class TickStrategy {
         };
 
         this.assets = {};
-        this.seenSymbols = new Set(); // For debug logging
         
         // Initialize State
         for (const [symbol, details] of Object.entries(MASTER_CONFIG)) {
@@ -91,39 +90,31 @@ class TickStrategy {
         }
     }
 
-    /**
-     * Required by TradingBot to identify the strategy.
-     */
+    // --- INTERFACE METHODS ---
+
     getName() {
-        return 'TickStrategy (v12.3)';
+        return 'TickStrategy (v12.3 Fixed)';
     }
 
-    /**
-     * Starts the Glass Box Heartbeat.
-     * Logs internal state every 5 seconds.
-     */
     async start() {
         this.logger.info(`[STRATEGY START] TickStrategy Engine Active.`);
         this.logger.info(`[STRATEGY CONFIG] Warmup Target: ${this.WARMUP_TICKS} ticks per asset.`);
         
+        // --- GLASS BOX HEARTBEAT ---
+        // Logs internal state every 5 seconds so we know what the algo is "thinking"
         setInterval(() => {
             this.logHeartbeat();
         }, 5000);
     }
 
-    /**
-     * Logs the internal math state of all assets.
-     * Helps visualization of "What the bot is thinking".
-     */
     logHeartbeat() {
         let activeAssets = 0;
-
+        // Build a concise log line for each asset to monitor convergence
         for (const symbol in this.assets) {
             const asset = this.assets[symbol];
             
-            // Skip totally dead assets
+            // Skip logging if data hasn't started flowing
             if (asset.tickCounter === 0) continue;
-
             activeAssets++;
 
             const fastVol = Math.sqrt(asset.fastObiVar).toFixed(5);
@@ -131,127 +122,141 @@ class TickStrategy {
             const mean = asset.obiMean.toFixed(4);
             const ratio = asset.regimeRatio.toFixed(2);
             
-            // Calculate Warmup Percentage
+            // Calculate Warmup %
             const pct = Math.min((asset.tickCounter / this.WARMUP_TICKS) * 100, 100);
             const statusTag = (pct < 100) ? `[⏳ WARMUP ${pct.toFixed(1)}%]` : `[🟢 ACTIVE]`;
 
             this.logger.info(
                 `${statusTag} ${symbol} | Ticks: ${asset.tickCounter} | ` +
-                `Mean: ${mean} | Vol(F/S): ${fastVol}/${slowVol} | Ratio: ${ratio}x`
+                `Mean: ${mean} | Vol(F/S): ${fastVol}/${slowVol} | Ratio: ${ratio}x | ` +
+                `Regime: ${asset.currentRegime}`
             );
         }
 
         if (activeAssets === 0) {
-            // If this persists, check the "Symbol Mismatch" logs in onDepthUpdate
-            this.logger.info(`[💓 HB] Waiting for market data... (No ticks mapped yet)`);
+            this.logger.info(`[💓 HB] Waiting for market data... (No ticks received yet)`);
         }
     }
 
     /**
      * Main Tick Processor
-     * Called by the Bot/Trader on every Level 1 update.
+     * Called by the Bot on every Level 1 update
+     * FIX: Now correctly handles Rust/BinanceListener compact format
      */
     async onDepthUpdate(depth) {
-        let { symbol, bestBid, bestAsk, bestBidSize, bestAskSize } = depth;
+        // --- FIX: MAP RUST SHORT-CODES TO STRATEGY VARIABLES ---
+        // Rust sends: { s: 'BTC', bb: '90000', ba: '90001', bq: '0.1', aq: '0.2' }
+        const symbol = depth.s; 
         
-        // --- 0. SYMBOL NORMALIZATION & DEBUG ---
+        // Safety check for unknown assets
+        if (!this.assets[symbol]) return;
         
-        // Trap: Log the FIRST time we see a raw symbol to debug mismatches
-        if (!this.seenSymbols.has(symbol)) {
-            this.logger.info(`[DATA INCOMING] Received Raw Symbol: '${symbol}'`);
-            this.seenSymbols.add(symbol);
-        }
-
-        // Clean symbol: "BTCUSDT" -> "BTC", "XRPUSD" -> "XRP"
-        const cleanSymbol = symbol.replace('USDT', '').replace('USD', '');
-
-        // Check if we trade this asset
-        if (!this.assets[cleanSymbol]) {
-            // Optional: Log once if we are ignoring a symbol we might want
-            // this.logger.debug(`Ignored symbol: ${symbol} -> ${cleanSymbol}`);
-            return;
-        }
+        const asset = this.assets[symbol];
         
-        const asset = this.assets[cleanSymbol];
+        // Parse Strings to Floats
+        const bestBid = parseFloat(depth.bb);
+        const bestAsk = parseFloat(depth.ba);
+        const bestBidSize = parseFloat(depth.bq); // bq = bid quantity
+        const bestAskSize = parseFloat(depth.aq); // aq = ask quantity
 
-        // Log successful mapping ONCE
+        // 0. FIRST TICK VISIBILITY
         if (asset.tickCounter === 0) {
-             this.logger.info(`[DATA CONNECTED] Mapped '${symbol}' -> '${cleanSymbol}'. Engine Starting.`);
+            this.logger.info(`[DATA FLOW] First tick received for ${symbol}. Engine starting.`);
         }
 
-        // --- 1. STATE SYNC ---
+        // 1. STATE SYNC
         // If the bot says we have no position, unlock the strategy
-        if (!this.bot.activePositions[cleanSymbol]) {
+        if (!this.bot.activePositions[symbol]) {
             asset.currentRegime = 0;
         }
 
-        // --- 2. DATA INGESTION ---
+        // 2. DATA INGESTION & CALCULATIONS
         asset.tickCounter++;
         const midPrice = (bestBid + bestAsk) / 2;
         const totalVol = bestBidSize + bestAskSize;
         
+        // Prevent division by zero
         if (totalVol === 0) return;
 
-        // OBI (Order Book Imbalance): -1.0 (Sell) to 1.0 (Buy)
+        // OBI (Order Book Imbalance)
+        // Range: -1.0 (Full Sell Pressure) to 1.0 (Full Buy Pressure)
         const obi = (bestBidSize - bestAskSize) / totalVol;
 
-        // Microprice: Volume-Weighted Mid Price
+        // Microprice (Weighted Mid-Price)
+        // Formula: (Ask * BidSize + Bid * AskSize) / Total
+        // This tells us the "Center of Gravity" of the order book.
         const microPrice = (bestAsk * bestBidSize + bestBid * bestAskSize) / totalVol;
 
-        // --- 3. DUAL WELFORD PROCESSOR ---
+        // 3. DUAL WELFORD PROCESSOR (The Brain)
         
-        // Dynamic Alpha: Speeds up "Slow" mean calculation during early ticks
+        // FAST START LOGIC:
+        // During warmup, the Slow Alpha is too slow (it expects 15 mins of data).
+        // We force it to adapt instantly by using 1/N until it catches up to the target Alpha.
         const dynamicSlowAlpha = Math.max(this.ALPHA_SLOW, 1 / asset.tickCounter);
 
         const delta = obi - asset.obiMean;
         
-        // Update Mean
+        // Update Mean (Center of Gravity)
         asset.obiMean += dynamicSlowAlpha * delta;
 
-        // Update Variances (Skip tick 1)
+        // Update Variances (Skip tick 1 to avoid zero-variance artifacts)
         if (asset.tickCounter > 1) {
-            // Fast Variance (Signal)
+            // Update Fast Variance (Immediate Noise - 1 Minute)
             asset.fastObiVar = (1 - this.ALPHA_FAST) * (asset.fastObiVar + this.ALPHA_FAST * delta * delta);
             
-            // Slow Variance (Baseline)
+            // Update Slow Variance (Baseline Noise - 15 Minutes)
+            // We use dynamicSlowAlpha here too, ensuring the baseline establishes quickly
             asset.slowObiVar = (1 - dynamicSlowAlpha) * (asset.slowObiVar + dynamicSlowAlpha * delta * delta);
         }
 
-        // --- 4. WARMUP GATE ---
-        // Stop here if we don't have enough data for statistically valid Z-Scores
+        // 4. WARMUP GATE (Auto-Calculated)
+        // We do not trade until the Fast Window (1 Minute) is fully populated.
         if (asset.tickCounter < this.WARMUP_TICKS) {
             return; 
         }
 
-        // --- 5. REGIME CALCULATION ---
+        // 5. REGIME CALCULATION (The Harmony)
         const fastVol = Math.sqrt(asset.fastObiVar);
         const slowVol = Math.sqrt(asset.slowObiVar);
         
-        // Regime Ratio > 1.0 implies High Volatility (Chaos)
+        // Regime Ratio = Current Noise / Normal Noise
+        // Ratio > 1.0 = Volatility Expanding (Chaos)
+        // Ratio < 1.0 = Volatility Compressing (Quiet)
+        // Guard against zero division
         asset.regimeRatio = (slowVol > 1e-9) ? (fastVol / slowVol) : 1.0;
         
-        // Dynamic Scaler: Increases required Z-Score during chaos
+        // Clamp Ratio: 0.5x to 3.0x
+        // If market is 3x more volatile than normal, we require 3x stronger signal.
         const dynamicScaler = Math.min(Math.max(asset.regimeRatio, 0.5), 3.0);
 
-        // --- 6. SIGNAL GENERATION ---
+        // 6. SIGNAL GENERATION
+        // Calculate Z-Score using Fast Volatility (Current Market State)
         const zScore = (fastVol > 1e-9) ? (obi - asset.obiMean) / fastVol : 0;
+        
+        // Dynamic Entry Threshold
+        // Example: Base 3.0 * Scaler 1.0 = 3.0 (Required Z)
+        // Example: Base 3.0 * Scaler 2.0 = 6.0 (Required Z during chaos)
         const requiredZ = this.BASE_ENTRY_Z * dynamicScaler;
 
+        // Microprice Confirmation (Vector Alignment)
+        // If OBI > 0 (Buy pressure), Microprice should be > MidPrice
+        // This filters out "Thin Walls" where volume is high but value is low.
         const isMicroUp = microPrice > midPrice;
         const isMicroDown = microPrice < midPrice;
 
-        // --- 7. EXECUTION ---
-        if (asset.currentRegime === 0 && !this.bot.activePositions[cleanSymbol]) {
+        // 7. EXECUTION LOGIC
+        // Only trade if we are Neutral (Regime 0) and not currently managing a position
+        if (asset.currentRegime === 0 && !this.bot.activePositions[symbol]) {
             
             // BUY SIGNAL
             if (zScore > requiredZ && isMicroUp) {
-                this.logger.info(`[SIGNAL BUY] ${cleanSymbol} | Z: ${zScore.toFixed(2)} | Ratio: ${dynamicScaler.toFixed(2)} | Price: ${midPrice}`);
-                await this.executeTrade(cleanSymbol, 'buy', midPrice);
+                this.logger.info(`[SIGNAL BUY] ${symbol} | Z: ${zScore.toFixed(2)} > ${requiredZ.toFixed(2)} | Ratio: ${dynamicScaler.toFixed(2)} | MicroPrice: OK`);
+                await this.executeTrade(symbol, 'buy', midPrice);
             } 
             // SELL SIGNAL
             else if (zScore < -requiredZ && isMicroDown) {
-                this.logger.info(`[SIGNAL SELL] ${cleanSymbol} | Z: ${zScore.toFixed(2)} | Ratio: ${dynamicScaler.toFixed(2)} | Price: ${midPrice}`);
-                await this.executeTrade(cleanSymbol, 'sell', midPrice);
+                this.logger.info(`[SIGNAL SELL] ${symbol} | Z: ${zScore.toFixed(2)} < -${requiredZ.toFixed(2)} | Ratio: ${dynamicScaler.toFixed(2)} | MicroPrice: OK`);
+                await this.executeTrade(symbol, 'sell', midPrice);
             }
         }
     }
@@ -259,18 +264,23 @@ class TickStrategy {
     async executeTrade(symbol, side, entryPrice) {
         const asset = this.assets[symbol];
         
-        // Lock Strategy State
+        // Lock the asset to prevent double entry
         asset.currentRegime = (side === 'buy') ? 1 : -1;
 
+        // Calculate size (Standard logic)
         const size = this.bot.config.orderSize || 100; 
 
-        // Trailing Stop Calculation
+        // --- TRAILING STOP LOGIC ---
+        // Calculate the Trailing Stop Amount based on the static percentage
         const trailAmount = entryPrice * (this.TRAILING_PERCENT / 100);
+        
+        // Format to correct precision for the exchange
         const finalTrail = trailAmount.toFixed(asset.precision);
+        
         const clientOid = `TICK_${Date.now()}`;
 
         try {
-            this.logger.info(`[EXEC] ${symbol} ${side.toUpperCase()} @ ${entryPrice} | Trail: ${finalTrail}`);
+            this.logger.info(`[EXEC] ${symbol} ${side.toUpperCase()} @ ${entryPrice} | Trail: ${finalTrail} (${this.TRAILING_PERCENT}%)`);
 
             const payload = {
                 product_id: asset.deltaId,
@@ -278,6 +288,8 @@ class TickStrategy {
                 side: side,
                 order_type: 'market_order',
                 client_order_id: clientOid,
+                
+                // --- SAFETY + PROFIT MECHANISM ---
                 bracket_trail_amount: finalTrail.toString(), 
                 bracket_stop_trigger_method: 'last_traded_price' 
             };
@@ -285,16 +297,17 @@ class TickStrategy {
             const result = await this.bot.placeOrder(payload);
 
             if (result && result.success) {
-                this.logger.info(`[FILLED] ${symbol} ${side} | ID: ${result.id}`);
+                this.logger.info(`[FILLED] ${symbol} ${side} | OrderID: ${result.id}`);
             } else {
-                // Handle "Position Exists" specifically to sync state
+                // FIX: Handle "Position Exists" specifically
                 const errorStr = JSON.stringify(result || {});
                 if (errorStr.includes("bracket_order_position_exists")) {
-                    this.logger.warn(`[STRATEGY] ${symbol} Position exists. Syncing state.`);
-                    this.bot.activePositions[symbol] = true; 
+                    this.logger.warn(`[STRATEGY] ${symbol} Entry Rejected: Position already exists. Syncing state.`);
+                    this.bot.activePositions[symbol] = true; // Force local state sync
+                    // We leave asset.currentRegime locked so we don't spam
                 } else {
-                    this.logger.error(`[ORDER FAIL] ${symbol} | ${errorStr}`);
-                    asset.currentRegime = 0; // Unlock on failure
+                    this.logger.error(`[ORDER FAIL] ${symbol} ${side} | ${errorStr}`);
+                    asset.currentRegime = 0; // Reset on genuine failure
                 }
             }
 
