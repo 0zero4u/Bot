@@ -1,4 +1,3 @@
-
 /**
  * TickStrategy.js
  * v12.0 - AUTO-CALIBRATED HARMONIC ARCHITECTURE
@@ -86,6 +85,12 @@ class TickStrategy {
             };
         }
     }
+
+    // --- FIX START: Added missing method ---
+    getName() {
+        return "TickStrategy (v12.0)";
+    }
+    // --- FIX END ---
 
     /**
      * Main Tick Processor
@@ -258,4 +263,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-            
+                    
