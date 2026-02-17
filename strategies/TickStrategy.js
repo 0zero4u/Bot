@@ -55,7 +55,7 @@ class TickStrategy {
         
         // Base Z-Score (Aggressive 3.0 for Top 0.1% signals)
         // We only trade "Sniper" entries.
-        this.BASE_ENTRY_Z = 2.405; 
+        this.BASE_ENTRY_Z = 2.4; 
         
         // Risk Settings (Preserved from original)
         this.TRAILING_PERCENT = 0.02; 
