@@ -29,7 +29,7 @@ class TickStrategy {
         
         // 1. The 0.01% Statistical Target
         // Demands a 3.8 standard deviation move (1-in-10,000 statistical probability)
-        this.BASE_ENTRY_Z = 3.8; 
+        this.BASE_ENTRY_Z = 3.1; 
         
         // 2. Disable the "Quiet Market Discount"
         // 1.0 means we NEVER discount the Z-score just because the market is quiet.
@@ -46,7 +46,7 @@ class TickStrategy {
         // The Ultimate Garbage Filter.
         // Even if the Auto-Limiter engages, NEVER trade below a 2.5 Z-score. 
         // 2.5 is the top 0.6%. If the market is so chaotic that a 2.5 is impossible, we lock the bot.
-        this.MIN_AUTO_LIMIT_Z = 2.5; 
+        this.MIN_AUTO_LIMIT_Z = 2.3; 
 
         // Exchange Config
         const MASTER_CONFIG = {
