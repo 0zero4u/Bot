@@ -1,6 +1,6 @@
 /**
  * TickStrategy.js
- * v9.3 [NATIVE ALIGNMENT + HARD SL TRAIL]
+ * v9.4 [FIXED: TRAIL SIGN + POSITION SYNC]
  * Updated to accept Rust Native Client (Level 1) Data
  * Aligned SL/TP with AdvanceStrategy v83
  */
@@ -51,11 +51,11 @@ class TickStrategy {
             }
         });
         
-        this.logger.info(`[TickStrategy] Loaded v9.3 | SL/Trail: ${this.TRAILING_PERCENT}% | Targets: ${Object.keys(this.assets).join(',')}`);
+        this.logger.info(`[TickStrategy] Loaded v9.4 | SL/Trail: ${this.TRAILING_PERCENT}% | Targets: ${Object.keys(this.assets).join(',')}`);
     }
 
     getName() {
-        return "TickStrategy v9.3 (Native+Trail)";
+        return "TickStrategy v9.4 (Fixed)";
     }
 
     async start() {
@@ -184,16 +184,17 @@ class TickStrategy {
             const clientOid = `tick_${Date.now()}`;
             
             // --- TRAIL LOGIC ALIGNED WITH ADVANCE STRATEGY ---
-            // AdvanceStrategy Logic: trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
             const trailValue = price * (this.TRAILING_PERCENT / 100);
             
-            // Ensure trail is positive absolute number
-            const trailAmountAbs = Math.abs(trailValue).toFixed(asset.config.precision);
+            // FIX 1: Correct Sign for Delta Bracket Orders
+            // Buy = Negative Trail, Sell = Positive Trail
+            const trailDist = Math.abs(trailValue).toFixed(asset.config.precision);
+            const finalTrail = side === 'buy' ? -trailDist : trailDist; 
             
-            // Safety: Ensure trail isn't smaller than 2 ticks
+            // Safety: Ensure trail isn't smaller than 2 ticks (ABS check)
             const minSafeTrail = asset.config.tickSize * 2;
-            if (parseFloat(trailAmountAbs) < minSafeTrail) {
-                this.logger.warn(`[SAFETY] Calculated trail ${trailAmountAbs} too small. Using min ${minSafeTrail}`);
+            if (Math.abs(finalTrail) < minSafeTrail) {
+                this.logger.warn(`[SAFETY] Calculated trail ${finalTrail} too small. Using min ${minSafeTrail}`);
             }
 
             // Punch latency record
@@ -202,22 +203,31 @@ class TickStrategy {
             const payload = {
                 product_id: asset.config.deltaId.toString(),
                 side: side,
-                size: process.env.ORDER_SIZE || "10", // Defaulting if env missing
+                size: process.env.ORDER_SIZE || "1", // Defaulting if env missing
                 order_type: 'market_order', 
                 client_order_id: clientOid,
                 
                 // --- SAFETY + PROFIT MECHANISM (Aligned) ---
-                bracket_trail_amount: trailAmountAbs,
-                bracket_stop_trigger_method: 'last_traded_price' // Aligned with AdvanceStrategy
+                bracket_trail_amount: finalTrail.toString(), // Passed as Signed String
+                bracket_stop_trigger_method: 'last_traded_price' 
             };
 
             const result = await this.bot.placeOrder(payload);
 
             if (result && result.success) {
-                this.logger.info(`[FILLED] ${symbol} ${side} | Trail: ${trailAmountAbs} (${this.TRAILING_PERCENT}%)`);
+                this.logger.info(`[FILLED] ${symbol} ${side} | Trail: ${finalTrail} (${this.TRAILING_PERCENT}%)`);
             } else {
-                this.logger.error(`[ORDER FAIL] ${symbol} ${side} | ${JSON.stringify(result)}`);
-                asset.currentRegime = 0; // Reset on failure
+                // FIX 2: Handle "Position Exists" specifically
+                const errorStr = JSON.stringify(result);
+                if (errorStr.includes("bracket_order_position_exists")) {
+                    this.logger.warn(`[STRATEGY] ${symbol} Entry Rejected: Position already exists. Syncing state.`);
+                    this.bot.activePositions[symbol] = true; // Force local state sync
+                    // Do NOT reset asset.currentRegime to 0 here. 
+                    // We leave it locked so the strategy knows we are effectively in a trade.
+                } else {
+                    this.logger.error(`[ORDER FAIL] ${symbol} ${side} | ${errorStr}`);
+                    asset.currentRegime = 0; // Reset on genuine failure
+                }
             }
 
         } catch (error) {
@@ -228,3 +238,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
+                
