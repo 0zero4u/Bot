@@ -67,7 +67,7 @@ class TickStrategy {
         this.TRAILING_PERCENT = 0.02; 
         
         // Cooldown Setting
-        this.COOLDOWN_MS = 5000;
+        this.COOLDOWN_MS = 30000;
 
         // Exchange Config
         const MASTER_CONFIG = {
