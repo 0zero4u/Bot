@@ -1,11 +1,11 @@
 /**
  * TickStrategy.js
- * v12.91 - GLASS BOX EDITION (0.01% SNIPER HARMONY)
+ * v12.92 - MID-PRICE PIVOT (TRUE VALUE HARMONY)
  * * * FEATURES:
  * 1. GLASS LOGGING: Exposes raw data, model thinking, and warmup status every 5s.
  * 2. 0.01% SNIPER CONFIG: Z=3.8, Floor=1.0.
  * 3. COOLDOWN: 5000ms safety period.
- * 4. AUTO-LIMITER: Dynamically scales down Z-score targets when market volatility makes them mathematically impossible, down to a hard floor of 2.5.
+ * 4. SOURCE: Mid-Price (BestBid + BestAsk / 2) - Immune to Order Book Noise.
  */
 
 class TickStrategy {
@@ -28,24 +28,18 @@ class TickStrategy {
         // --- 3. CORE PARAMETERS (0.01% HARMONY) ---
         
         // 1. The 0.01% Statistical Target
-        // Demands a 3.8 standard deviation move (1-in-10,000 statistical probability)
         this.BASE_ENTRY_Z = 2.1; 
         
         // 2. Disable the "Quiet Market Discount"
-        // 1.0 means we NEVER discount the Z-score just because the market is quiet.
         this.REGIME_FLOOR = 0.7;
 
-        // 3. The Risk Leash (Keep it tight to prevent mean-reversion drag)
+        // 3. The Risk Leash
         this.TRAILING_PERCENT = 0.015; 
         
-        // 4. Cooldown (Wait 30 seconds for the shockwave to settle)
+        // 4. Cooldown
         this.COOLDOWN_MS = 30000;
 
         // --- 4. SAFETY LIMITS ---
-        
-        // The Ultimate Garbage Filter.
-        // Even if the Auto-Limiter engages, NEVER trade below a 2.5 Z-score. 
-        // 2.5 is the top 0.6%. If the market is so chaotic that a 2.5 is impossible, we lock the bot.
         this.MIN_AUTO_LIMIT_Z = 1.5; 
 
         // Exchange Config
@@ -60,26 +54,26 @@ class TickStrategy {
         
         for (const [symbol, details] of Object.entries(MASTER_CONFIG)) {
             this.assets[symbol] = {
-                obiMean: 0,
-                fastObiVar: 0,
-                slowObiVar: 0,
+                priceMean: 0,      // UPDATED: Now tracking Price Mean
+                fastPriceVar: 0,   // UPDATED: Now tracking Price Variance
+                slowPriceVar: 0,   // UPDATED: Now tracking Price Variance
                 tickCounter: 0,
                 regimeRatio: 1.0,
                 currentRegime: 0, 
                 cooldownUntil: 0,
-                latestSnapshot: null, // For the Glass Log
+                latestSnapshot: null, 
                 ...details
             };
         }
     }
 
     getName() {
-        return 'TickStrategy (v12.91 0.01% Sniper)';
+        return 'TickStrategy (v12.92 Mid-Price Pivot)';
     }
 
     async start() {
-        this.logger.info(`[STRATEGY START] TickStrategy Engine Active.`);
-        this.logger.info(`[STRATEGY CONFIG] Base Z: ${this.BASE_ENTRY_Z} | Min Floor Z: ${this.MIN_AUTO_LIMIT_Z}`);
+        this.logger.info(`[STRATEGY START] TickStrategy Engine Active (Mid-Price Mode).`);
+        this.logger.info(`[STRATEGY CONFIG] Base Z: ${this.BASE_ENTRY_Z}`);
         
         // --- 5s HEARTBEAT ---
         setInterval(() => {
@@ -95,10 +89,10 @@ class TickStrategy {
             if (asset.tickCounter === 0 || !asset.latestSnapshot) continue;
 
             const snap = asset.latestSnapshot;
-            const vol = Math.sqrt(asset.fastObiVar);
+            const vol = Math.sqrt(asset.fastPriceVar); // Price Volatility
 
             // --- GLASS LOG: WHAT IT SEES ---
-            this.logger.info(`[👀 VISUAL] ${symbol} | Bid: ${snap.bestBid} Ask: ${snap.bestAsk} | OBI: ${snap.obi.toFixed(3)} | Micro: ${snap.microPrice.toFixed(4)} | Mid: ${snap.midPrice.toFixed(4)}`);
+            this.logger.info(`[👀 VISUAL] ${symbol} | Bid: ${snap.bestBid} Ask: ${snap.bestAsk} | Mid: ${snap.midPrice.toFixed(4)} | Vol(Price): ${vol.toFixed(4)}`);
 
             // --- WARMUP HEARTBEAT LOGGING ---
             if (asset.tickCounter < this.WARMUP_TICKS) {
@@ -110,34 +104,17 @@ class TickStrategy {
             if (vol < 1e-9) continue;
 
             // --- MODEL THINKING ---
-            const maxPossibleZ = 1.0 / vol;
+            // NOTE: In Price-Space, there is no "Max Limit" (1.0) like in OBI. Price is unbounded.
+            // We disable the Auto-Limiter logic by setting maxPossibleZ to Infinity.
+            const maxPossibleZ = 999.0; 
             const currentScaler = Math.min(Math.max(asset.regimeRatio, this.REGIME_FLOOR), 3.0);
             const yourTargetZ = this.BASE_ENTRY_Z * currentScaler;
 
-            const isPossible = maxPossibleZ > yourTargetZ;
-            
-            if (isPossible) {
-                this.logger.info(
-                    `[🧠 THINKING ✅] ${symbol} | Vol: ${vol.toFixed(4)} | ` +
-                    `MaxLimit: ${maxPossibleZ.toFixed(2)} > Target: ${yourTargetZ.toFixed(2)} | ` +
-                    `Status: NORMAL TRADING`
-                );
-            } else {
-                const cappedTarget = Math.max(maxPossibleZ * 0.95, this.MIN_AUTO_LIMIT_Z);
-                if (maxPossibleZ < this.MIN_AUTO_LIMIT_Z) {
-                     this.logger.warn(
-                        `[🧠 THINKING 🛑] ${symbol} | Vol: ${vol.toFixed(4)} | ` +
-                        `MaxLimit: ${maxPossibleZ.toFixed(2)} | ` +
-                        `Status: CHAOS (Below min Z of ${this.MIN_AUTO_LIMIT_Z}. Trading locked.)`
-                    );                   
-                } else {
-                    this.logger.info(
-                        `[🧠 THINKING 🔧] ${symbol} | Vol: ${vol.toFixed(4)} | ` +
-                        `MaxLimit: ${maxPossibleZ.toFixed(2)} < Target: ${yourTargetZ.toFixed(2)} | ` +
-                        `Status: AUTO-LIMITER ENGAGED (New Target: ${cappedTarget.toFixed(2)})`
-                    );
-                }
-            }
+            this.logger.info(
+                `[🧠 THINKING ✅] ${symbol} | Vol: ${vol.toFixed(4)} | ` +
+                `Target Z: ${yourTargetZ.toFixed(2)} | ` +
+                `Status: NORMAL TRADING`
+            );
         }
     }
 
@@ -168,6 +145,8 @@ class TickStrategy {
         
         if (totalVol === 0) return;
 
+        // OBI Calculated purely for MicroPrice Logic (Directional Confirmation)
+        // We no longer use OBI for the Z-Score itself.
         const obi = (bestBidSize - bestAskSize) / totalVol;
         const microPrice = (bestAsk * bestBidSize + bestBid * bestAskSize) / totalVol;
 
@@ -176,34 +155,39 @@ class TickStrategy {
             bestBid, bestAsk, obi, microPrice, midPrice
         };
 
-        const dynamicSlowAlpha = Math.max(this.ALPHA_SLOW, 1 / asset.tickCounter);
-        const delta = obi - asset.obiMean;
+        // --- PIVOT: WELFORD ON MID-PRICE ---
         
-        asset.obiMean += dynamicSlowAlpha * delta;
+        // Initialization: On first tick, set mean to current price to avoid explosion
+        if (asset.tickCounter === 1) {
+            asset.priceMean = midPrice;
+        }
+
+        const dynamicSlowAlpha = Math.max(this.ALPHA_SLOW, 1 / asset.tickCounter);
+        const delta = midPrice - asset.priceMean; // PRICE DELTA
+        
+        asset.priceMean += dynamicSlowAlpha * delta;
 
         if (asset.tickCounter > 1) {
-            asset.fastObiVar = (1 - this.ALPHA_FAST) * (asset.fastObiVar + this.ALPHA_FAST * delta * delta);
-            asset.slowObiVar = (1 - dynamicSlowAlpha) * (asset.slowObiVar + dynamicSlowAlpha * delta * delta);
+            // Updating Price Variance
+            asset.fastPriceVar = (1 - this.ALPHA_FAST) * (asset.fastPriceVar + this.ALPHA_FAST * delta * delta);
+            asset.slowPriceVar = (1 - dynamicSlowAlpha) * (asset.slowPriceVar + dynamicSlowAlpha * delta * delta);
         }
 
         if (asset.tickCounter < this.WARMUP_TICKS) return; 
 
-        const fastVol = Math.sqrt(asset.fastObiVar);
-        const slowVol = Math.sqrt(asset.slowObiVar);
+        const fastVol = Math.sqrt(asset.fastPriceVar);
+        const slowVol = Math.sqrt(asset.slowPriceVar);
         
         asset.regimeRatio = (slowVol > 1e-9) ? (fastVol / slowVol) : 1.0;
         const dynamicScaler = Math.min(Math.max(asset.regimeRatio, this.REGIME_FLOOR), 3.0);
 
-        const zScore = (fastVol > 1e-9) ? (obi - asset.obiMean) / fastVol : 0;
+        // --- Z-SCORE CALCULATION (PRICE BASED) ---
+        const zScore = (fastVol > 1e-9) ? (midPrice - asset.priceMean) / fastVol : 0;
         
         let requiredZ = this.BASE_ENTRY_Z * dynamicScaler;
-        const maxPossibleZ = (fastVol > 1e-9) ? (1.0 / fastVol) : 999;
-        let isAutoCorrected = false;
-
-        if (requiredZ >= maxPossibleZ) {
-            requiredZ = Math.max(maxPossibleZ * 0.95, this.MIN_AUTO_LIMIT_Z);
-            isAutoCorrected = true;
-        }
+        
+        // Auto-Limiter removed (Price is unbounded)
+        const isAutoCorrected = false;
 
         const isMicroUp = microPrice > midPrice;
         const isMicroDown = microPrice < midPrice;
@@ -212,12 +196,16 @@ class TickStrategy {
             const autoTag = isAutoCorrected ? '[AUTO-CORRECTED] ' : '';
 
             if (zScore > requiredZ && isMicroUp) {
-                this.logger.info(`[SIGNAL BUY] ${autoTag}${symbol} | Z: ${zScore.toFixed(2)} > ${requiredZ.toFixed(2)} | MicroPrice: OK`);
-                await this.executeTrade(symbol, 'buy', midPrice);
+                // Short on High Z (Mean Reversion)
+                // Note: If Price is High (Pos Z), we Expect Reversion Down -> SELL
+                this.logger.info(`[SIGNAL SELL] ${autoTag}${symbol} | Price Z: ${zScore.toFixed(2)} > ${requiredZ.toFixed(2)} | MicroPrice: OK`);
+                await this.executeTrade(symbol, 'sell', midPrice);
             } 
             else if (zScore < -requiredZ && isMicroDown) {
-                this.logger.info(`[SIGNAL SELL] ${autoTag}${symbol} | Z: ${zScore.toFixed(2)} < -${requiredZ.toFixed(2)} | MicroPrice: OK`);
-                await this.executeTrade(symbol, 'sell', midPrice);
+                // Long on Low Z (Mean Reversion)
+                // Note: If Price is Low (Neg Z), we Expect Reversion Up -> BUY
+                this.logger.info(`[SIGNAL BUY] ${autoTag}${symbol} | Price Z: ${zScore.toFixed(2)} < -${requiredZ.toFixed(2)} | MicroPrice: OK`);
+                await this.executeTrade(symbol, 'buy', midPrice);
             }
         }
     }
@@ -238,7 +226,7 @@ class TickStrategy {
         const clientOid = `TICK_${Date.now()}`;
 
         try {
-            this.logger.info(`[EXEC] ${symbol} ${side.toUpperCase()} @ ${entryPrice} | Size: ${size} | Trail: ${finalTrail} (${this.TRAILING_PERCENT}%) | Cooldown: 5s`);
+            this.logger.info(`[EXEC] ${symbol} ${side.toUpperCase()} @ ${entryPrice} | Size: ${size} | Trail: ${finalTrail} (${this.TRAILING_PERCENT}%) | Cooldown: 30s`);
 
             const payload = {
                 product_id: asset.deltaId.toString(), 
@@ -272,4 +260,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-    
+            
