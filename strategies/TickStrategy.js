@@ -114,7 +114,7 @@ class TickStrategy {
 
         const alphaFast = 1 - Math.exp(-dtMs / this.FAST_TAU_MS);
         const alphaSlow = 1 - Math.exp(-dtMs / this.SLOW_TAU_MS);
-        const alphaMicro = 1 - Math.exp(-dtMs / 500); // 500ms Debounce for OBI Spoofing
+        const alphaMicro = 1 - Math.exp(-dtMs / 100); // 500ms Debounce for OBI Spoofing
 
         // 3. Raw Imbalance & Micro-EMA Filter
         const rawObi = (bidSize - askSize) / totalLiquidity; 
