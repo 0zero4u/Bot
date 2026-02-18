@@ -1,6 +1,6 @@
 /**
  * TickStrategy.js
- * v13.0 - QUANTUM HARMONY (Time-Decay, OBI, Vol-Adjusted Risk)
+ * v13.1 - QUANTUM HARMONY (Time-Decay, OBI, Vol-Adjusted Risk)
  * * * FEATURES ADDED:
  * 1. TIME-SPACE STATIONARITY: EMAs use exact Δt (Delta time), immune to tick-rate fluctuations.
  * 2. CORRECTED Z-SCORE: Threshold mathematically anchored to slow volatility (No double-scaling).
@@ -26,6 +26,22 @@ class TickStrategy {
         this.RISK_MULTIPLIER = 1.5; // Trailing stop distance (1.5 * slow volatility)
         
         this.COOLDOWN_MS = 30000;   // 30s safety period post-trade
+    }
+
+    /**
+     * Required by bot architecture to identify the strategy
+     */
+    getName() {
+        return 'TickStrategy_Quantum';
+    }
+
+    /**
+     * Required by bot architecture to initialize the strategy safely
+     */
+    async start() {
+        this.logger.info(`[STRATEGY] Starting ${this.getName()}...`);
+        this.logger.info(`[STRATEGY] Quantum Parameters Loaded: FastTau=${this.FAST_TAU_MS}ms, SlowTau=${this.SLOW_TAU_MS}ms`);
+        return true;
     }
 
     /**
@@ -190,4 +206,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-    
+        
