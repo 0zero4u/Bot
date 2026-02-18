@@ -1,12 +1,12 @@
 /**
  * TickStrategy.js
- * v13.3 - QUANTUM HARMONY (Rust-Aligned)
+ * v13.4 - QUANTUM HARMONY (Zero-Lag OBI + Hard Brackets)
  * * * FEATURES ADDED:
  * 1. OMNIPRESENT GLASS LOG: Heartbeat runs every 5s regardless of bot state.
  * 2. TIME-SPACE STATIONARITY: EMAs use exact Δt (Delta time), immune to tick-rate fluctuations.
  * 3. CORRECTED Z-SCORE: Threshold mathematically anchored to slow volatility (No double-scaling).
- * 4. MICROSTRUCTURE GATES: Order Book Imbalance (OBI) > 30% + Spread Filters.
- * 5. VOLATILITY RISK: Trailing stops are dynamically sized to 1.5 * σ_slow.
+ * 4. MICROSTRUCTURE GATES: Order Book Imbalance now uses 500ms Micro-EMA to defeat spoofing.
+ * 5. EXCHANGE-LEVEL RISK: Replaced trailing stop with resting Bracket SL (1.5σ) and TP (2.5σ).
  * 6. RUST ALIGNMENT: Perfectly maps to lib.rs `DepthUpdate` struct (bb, ba, bq, aq).
  */
 
@@ -20,11 +20,12 @@ class TickStrategy {
         this.SLOW_TAU_MS = 180000;  // 3 minutes for baseline mean/volatility
         this.WARMUP_MS = 180000;    // 3 minutes warmup
 
-        // --- 2. THRESHOLDS & GATES ---
+        // --- 2. THRESHOLDS & RISK GATES ---
         this.Z_BASE_ENTRY = 2.5;    // Standard Deviations required for breakout
         this.VOL_REGIME_MIN = 1.2;  // Fast Vol must be 20% higher than Slow Vol
         this.MIN_OBI = 0.30;        // 30% minimum order book imbalance
-        this.RISK_MULTIPLIER = 1.5; // Trailing stop distance (1.5 * slow volatility)
+        this.SL_MULTIPLIER = 1.5;   // Hard Stop Loss distance (1.5 * slow volatility)
+        this.TP_MULTIPLIER = 2.5;   // Hard Take Profit distance (2.5 * slow volatility)
         this.COOLDOWN_MS = 30000;   // 30s safety period post-trade
 
         // --- 3. RUST-ALIGNED ASSET INITIALIZATION ---
@@ -47,6 +48,7 @@ class TickStrategy {
                 muSlow: 0,
                 varFast: 0,
                 varSlow: 0,
+                emaObi: 0, // Micro-EMA to filter toxic HFT flow
                 lastLogMs: now,
                 cooldownUntil: 0,
                 ...details
@@ -91,6 +93,7 @@ class TickStrategy {
             asset.muSlow = midPrice;
             asset.varFast = 0;
             asset.varSlow = 0;
+            asset.emaObi = 0; 
             asset.lastLogMs = now;
             asset.isInitialized = true;
             this.logger.info(`[DATA FLOW] First tick received for ${symbol}. Engine starting.`);
@@ -103,8 +106,11 @@ class TickStrategy {
 
         const alphaFast = 1 - Math.exp(-dtMs / this.FAST_TAU_MS);
         const alphaSlow = 1 - Math.exp(-dtMs / this.SLOW_TAU_MS);
+        const alphaMicro = 1 - Math.exp(-dtMs / 500); // 500ms Debounce for OBI Spoofing
 
-        const obi = (bidSize - askSize) / (bidSize + askSize); // Order Book Imbalance
+        // 3. Raw Imbalance & Micro-EMA Filter
+        const rawObi = (bidSize - askSize) / (bidSize + askSize); 
+        asset.emaObi += alphaMicro * (rawObi - asset.emaObi);
 
         // 4. Update Moving Averages & Variances (Incremental EMA Variance)
         const deltaFast = midPrice - asset.muFast;
@@ -150,7 +156,7 @@ class TickStrategy {
                 `📊 Mid: ${midPrice.toFixed(4)} | ` +
                 `🎯 Z-Score: ${zScore > 0 ? '+' : ''}${zScore.toFixed(2)} (Req: ±${this.Z_BASE_ENTRY}) | ` +
                 `🌪️ Vol Regime: ${regimeRatio.toFixed(2)}x (Req: >${this.VOL_REGIME_MIN}) | ` +
-                `⚖️ OBI: ${obi > 0 ? '+' : ''}${(obi * 100).toFixed(1)}% (Req: ±${this.MIN_OBI * 100}%) | ` +
+                `⚖️ OBI(EMA): ${asset.emaObi > 0 ? '+' : ''}${(asset.emaObi * 100).toFixed(1)}% (Req: ±${this.MIN_OBI * 100}%) | ` +
                 `📏 Spread: ${spread.toFixed(4)} (Max allowed: ${(slowVol * 0.5).toFixed(4)})`
             );
 
@@ -158,7 +164,7 @@ class TickStrategy {
             if (isWarm && !isOnCooldown && !hasOpenPosition && regimeRatio > 1.0) {
                 let thoughts = `[THINKING] ${symbol} -> Volatility is waking up... `;
                 if (Math.abs(zScore) > 1.5) thoughts += `Z-Score building (${zScore.toFixed(2)}). `;
-                if (Math.abs(obi) > 0.2) thoughts += `Book is tilting (${(obi*100).toFixed(0)}%). `;
+                if (Math.abs(asset.emaObi) > 0.2) thoughts += `Book is tilting (${(asset.emaObi*100).toFixed(0)}%). `;
                 if (spread > (slowVol * 0.5)) thoughts += `WAITING: Spread too wide.`;
                 this.logger.info(thoughts);
             }
@@ -174,13 +180,13 @@ class TickStrategy {
         if (isVolExpanding && isSpreadTight) {
             
             // LONG HYPOTHESIS
-            if (zScore >= this.Z_BASE_ENTRY && obi >= this.MIN_OBI) {
+            if (zScore >= this.Z_BASE_ENTRY && asset.emaObi >= this.MIN_OBI) {
                 this.executeTrade(symbol, 'buy', midPrice, slowVol, asset);
                 asset.cooldownUntil = now + this.COOLDOWN_MS;
             }
             
             // SHORT HYPOTHESIS
-            else if (zScore <= -this.Z_BASE_ENTRY && obi <= -this.MIN_OBI) {
+            else if (zScore <= -this.Z_BASE_ENTRY && asset.emaObi <= -this.MIN_OBI) {
                 this.executeTrade(symbol, 'sell', midPrice, slowVol, asset);
                 asset.cooldownUntil = now + this.COOLDOWN_MS;
             }
@@ -188,25 +194,37 @@ class TickStrategy {
     }
 
     /**
-     * Executes the trade with Volatility-Adjusted Bracket Trailing
+     * Executes the trade with Exchange-Level Bracket Hard SL & TP
      */
     async executeTrade(symbol, side, entryPrice, slowVol, asset) {
         const envSize = process.env.ORDER_SIZE ? parseFloat(process.env.ORDER_SIZE) : null;
         const size = envSize || (this.bot.config ? this.bot.config.orderSize : 1);
 
-        // VOLATILITY-ADJUSTED RISK: Trail size is dynamically scaled to current market reality
-        let finalTrail = slowVol * this.RISK_MULTIPLIER;
-        
-        // Safety fallback: ensure trail is never exactly 0 due to API constraints
-        if (finalTrail < 0.0001) finalTrail = 0.0001; 
+        // VOLATILITY-ADJUSTED RISK COMPUTATION
+        const riskDistance = slowVol * this.SL_MULTIPLIER;
+        const rewardDistance = slowVol * this.TP_MULTIPLIER;
+
+        let slPrice, tpPrice;
+
+        if (side === 'buy') {
+            slPrice = entryPrice - riskDistance;
+            tpPrice = entryPrice + rewardDistance;
+        } else { // sell
+            slPrice = entryPrice + riskDistance;
+            tpPrice = entryPrice - rewardDistance;
+        }
+
+        // Failsafe to prevent negative price inputs to exchange
+        if (slPrice <= 0) slPrice = asset.tickSize; 
+        if (tpPrice <= 0) tpPrice = asset.tickSize;
 
         const clientOid = `TICK_${Date.now()}`;
 
         try {
             this.logger.info(
-                `[EXEC THINKING] 💥 BREAKOUT DETECTED! ${symbol} ${side.toUpperCase()} @ ${entryPrice}\n` +
-                ` -> Volatility Risk (σ): ${slowVol.toFixed(4)}\n` +
-                ` -> Dynamic Trail Size: ${finalTrail.toFixed(asset.precision)} absolute price distance`
+                `[EXEC THINKING] 💥 BREAKOUT DETECTED! ${symbol} ${side.toUpperCase()} @ ${entryPrice.toFixed(asset.precision)}\n` +
+                ` -> Volatility Risk (σ): ${slowVol.toFixed(asset.precision)}\n` +
+                ` -> Hard SL: ${slPrice.toFixed(asset.precision)} | Hard TP: ${tpPrice.toFixed(asset.precision)}`
             );
 
             const payload = {
@@ -215,7 +233,8 @@ class TickStrategy {
                 side: side,
                 order_type: 'market_order',
                 client_order_id: clientOid,
-                bracket_trail_amount: finalTrail.toFixed(asset.precision).toString(), // Formatted exactly to exchange precision
+                bracket_stop_loss_price: slPrice.toFixed(asset.precision).toString(), 
+                bracket_take_profit_price: tpPrice.toFixed(asset.precision).toString(),
                 bracket_stop_trigger_method: 'last_traded_price' 
             };
 
@@ -242,4 +261,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-    
+            
