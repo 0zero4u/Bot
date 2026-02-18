@@ -29,13 +29,13 @@ class TickStrategy {
         // --- 3. CORE PARAMETERS (0.01% HARMONY) ---
         
         // 1. The 0.01% Statistical Target
-        this.BASE_ENTRY_Z = 2.70; 
+        this.BASE_ENTRY_Z = 2.60; 
         
         // 2. Disable the "Quiet Market Discount"
         this.REGIME_FLOOR = 0.95;
 
         // 3. The Risk Leash
-        this.TRAILING_PERCENT = 0.05; 
+        this.TRAILING_PERCENT = 0.06; 
         
         // 4. Cooldown
         this.COOLDOWN_MS = 30000;
