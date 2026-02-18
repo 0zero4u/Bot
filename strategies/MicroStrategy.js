@@ -24,7 +24,7 @@ class MicroStrategy {
         // We set this to 0.02% (or env). It acts as a Hard Stop initially, then trails.
         this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.035'); 
         
-        this.COOLDOWN_MS = 30000;
+        this.COOLDOWN_MS = 20000;
 
         // --- VELOCITY CONFIG ---
         this.SPIKE_PERCENT = 0.0003;   
