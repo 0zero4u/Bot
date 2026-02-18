@@ -19,7 +19,7 @@ class MicroStrategy {
         this.COOLDOWN_MS = 30000;
 
         // --- ADAPTIVE SETTINGS ---
-        this.VOLATILITY_WINDOW_SIZE = 100; // Look at last ~1.5 seconds (30ms * 50)
+        this.VOLATILITY_WINDOW_SIZE = 500; // Look at last ~1.5 seconds (30ms * 50)
         this.SIGMA_MULTIPLIER = 3.5;      // Trigger = 2 * Volatility
         this.MIN_VOLATILITY = 0.00005;    // Floor: 0.005% (Minimum required move)
         
