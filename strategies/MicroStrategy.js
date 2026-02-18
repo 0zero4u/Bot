@@ -27,7 +27,7 @@ class MicroStrategy {
         this.COOLDOWN_MS = 2000;
 
         // --- VELOCITY CONFIG ---
-        this.SPIKE_PERCENT = 0.0000027;   
+        this.SPIKE_PERCENT = 0.0002;   
         this.SPIKE_WINDOW_MS = 17; // KEPT AT 30ms PER REQUEST
 
         this.assets = {};
