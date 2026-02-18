@@ -20,8 +20,8 @@ class MicroStrategy {
 
         // --- ADAPTIVE SETTINGS ---
         this.VOLATILITY_WINDOW_SIZE = 1000; // Look at last ~1.5 seconds (30ms * 50)
-        this.SIGMA_MULTIPLIER = 2.8;      // Trigger = 2 * Volatility
-        this.MIN_VOLATILITY = 0.00005;    // Floor: 0.005% (Minimum required move)
+        this.SIGMA_MULTIPLIER = 3.1;      // Trigger = 2 * Volatility
+        this.MIN_VOLATILITY = 0.000025;    // Floor: 0.005% (Minimum required move)
         
         // Window for the velocity calculation itself
         this.SPIKE_WINDOW_MS = 30; 
