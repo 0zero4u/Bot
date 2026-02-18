@@ -1,12 +1,5 @@
 /**
- * HybridMicroLeadTickStrategy.js
- *
- * Combines:
- * - TickStrategy: Kalman + dual vol regime + dynamic Z / OBI
- * - LeadStrategy: VWMP-style weighted mid for microstructure
- * - MicroStrategy: velocity window + microprice pressure
- * - Micro/Advance: Hard SL + Trail TP with correct sign and tick floors
- */
+ *  */
 
 class HybridStrategy {
   constructor(bot) {
