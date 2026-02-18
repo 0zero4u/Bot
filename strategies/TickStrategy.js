@@ -1,13 +1,14 @@
 /**
  * TickStrategy.js
- * v13.4 - QUANTUM HARMONY (Zero-Lag OBI + Hard Brackets)
+ * v13.6 - QUANTUM HYBRID (Asset-Scaled Kalman + Risk Floors)
  * * * FEATURES ADDED:
- * 1. OMNIPRESENT GLASS LOG: Heartbeat runs every 5s regardless of bot state.
- * 2. TIME-SPACE STATIONARITY: EMAs use exact Δt (Delta time), immune to tick-rate fluctuations.
- * 3. CORRECTED Z-SCORE: Threshold mathematically anchored to slow volatility (No double-scaling).
- * 4. MICROSTRUCTURE GATES: Order Book Imbalance now uses 500ms Micro-EMA to defeat spoofing.
- * 5. EXCHANGE-LEVEL RISK: Replaced trailing stop with resting Bracket SL (1.5σ) and TP (2.5σ).
- * 6. RUST ALIGNMENT: Perfectly maps to lib.rs `DepthUpdate` struct (bb, ba, bq, aq).
+ * 1. 1D KALMAN FILTER: Cleans raw mid-price microstructure noise before statistical processing.
+ * 2. ASSET-SCALED MATRICES: Q/R noise parameters dynamically scaled per asset price unit.
+ * 3. VOLATILITY SCALING: Dynamically lowers Z-Score & OBI thresholds as market kinetic energy rises.
+ * 4. MICROSTRUCTURE GATES: 500ms Micro-EMA + Absolute Minimum Liquidity Floors to defeat spoofing.
+ * 5. TICK-SIZE FLOORS: Spread and Risk distances have hard minimums (e.g., Min SL = 3 Ticks).
+ * 6. EXCHANGE-LEVEL RISK: Resting Bracket SL (1.5σ) and TP (2.5σ) via Delta Exchange API.
+ * 7. RUST ALIGNMENT: Strictly typed payload mapping for lib.rs `DepthUpdate`.
  */
 
 class TickStrategy {
@@ -20,20 +21,20 @@ class TickStrategy {
         this.SLOW_TAU_MS = 180000;  // 3 minutes for baseline mean/volatility
         this.WARMUP_MS = 180000;    // 3 minutes warmup
 
-        // --- 2. THRESHOLDS & RISK GATES ---
-        this.Z_BASE_ENTRY = 2.5;    // Standard Deviations required for breakout
+        // --- 2. BASE THRESHOLDS & RISK GATES ---
+        this.Z_BASE_ENTRY = 2.5;    // Base StdDev required for breakout (scales down with vol)
         this.VOL_REGIME_MIN = 1.2;  // Fast Vol must be 20% higher than Slow Vol
-        this.MIN_OBI = 0.30;        // 30% minimum order book imbalance
+        this.MIN_OBI = 0.30;        // Base 30% order book imbalance (scales down with vol)
         this.SL_MULTIPLIER = 1.5;   // Hard Stop Loss distance (1.5 * slow volatility)
         this.TP_MULTIPLIER = 2.5;   // Hard Take Profit distance (2.5 * slow volatility)
         this.COOLDOWN_MS = 30000;   // 30s safety period post-trade
 
-        // --- 3. RUST-ALIGNED ASSET INITIALIZATION ---
+        // --- 3. RUST-ALIGNED ASSET INITIALIZATION (With Unit-Scaled Constants) ---
         const MASTER_CONFIG = {
-            'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
-            'BTC': { deltaId: 27,    precision: 1, tickSize: 0.1 },
-            'ETH': { deltaId: 299,   precision: 2, tickSize: 0.01 },
-            'SOL': { deltaId: 417,   precision: 3, tickSize: 0.1 }
+            'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001, minLiquidity: 5000, kalmanQ: 1e-8, kalmanR: 1e-6 },
+            'BTC': { deltaId: 27,    precision: 1, tickSize: 0.1,    minLiquidity: 0.5,  kalmanQ: 1e-2, kalmanR: 1e-0 },
+            'ETH': { deltaId: 299,   precision: 2, tickSize: 0.01,   minLiquidity: 5.0,  kalmanQ: 1e-4, kalmanR: 1e-2 },
+            'SOL': { deltaId: 417,   precision: 3, tickSize: 0.1,    minLiquidity: 50.0, kalmanQ: 1e-2, kalmanR: 1e-0 }
         };
 
         this.assets = {};
@@ -48,7 +49,9 @@ class TickStrategy {
                 muSlow: 0,
                 varFast: 0,
                 varSlow: 0,
-                emaObi: 0, // Micro-EMA to filter toxic HFT flow
+                emaObi: 0, 
+                kalmanX: 0, // Kalman State Estimate (True Price)
+                kalmanP: 1, // Kalman Estimate Uncertainty
                 lastLogMs: now,
                 cooldownUntil: 0,
                 ...details
@@ -57,12 +60,12 @@ class TickStrategy {
     }
 
     getName() {
-        return 'TickStrategy_Quantum';
+        return 'TickStrategy_QuantumHybrid';
     }
 
     async start() {
         this.logger.info(`[STRATEGY] Starting ${this.getName()}...`);
-        this.logger.info(`[STRATEGY] Quantum Parameters Loaded: FastTau=${this.FAST_TAU_MS}ms, SlowTau=${this.SLOW_TAU_MS}ms`);
+        this.logger.info(`[STRATEGY] Quantum Hybrid Parameters Loaded: FastTau=${this.FAST_TAU_MS}ms, SlowTau=${this.SLOW_TAU_MS}ms`);
         return true;
     }
 
@@ -76,11 +79,15 @@ class TickStrategy {
         const asset = this.assets[symbol];
         const now = Date.now();
 
-        // RUST PAYLOAD MAPPING (Matches lib.rs struct DepthUpdate)
-        const bestBid = depth.bb;
-        const bestAsk = depth.ba;
-        const bidSize = depth.bq || 1; 
-        const askSize = depth.aq || 1; 
+        // RUST PAYLOAD MAPPING & STRICT COERCION
+        const bestBid = Number(depth.bb);
+        const bestAsk = Number(depth.ba);
+        const bidSize = Number(depth.bq || 0); 
+        const askSize = Number(depth.aq || 0); 
+
+        // GHOST LIQUIDITY DEFENSE
+        const totalLiquidity = bidSize + askSize;
+        if (totalLiquidity < asset.minLiquidity) return;
 
         const midPrice = (bestBid + bestAsk) / 2;
         const spread = bestAsk - bestBid;
@@ -94,48 +101,64 @@ class TickStrategy {
             asset.varFast = 0;
             asset.varSlow = 0;
             asset.emaObi = 0; 
+            asset.kalmanX = midPrice; // Initialize Kalman state
             asset.lastLogMs = now;
             asset.isInitialized = true;
-            this.logger.info(`[DATA FLOW] First tick received for ${symbol}. Engine starting.`);
+            this.logger.info(`[DATA FLOW] First tick received for ${symbol}. Hybrid Engine starting.`);
             return;
         }
 
-        // 2. Time-Decay (Δt) Alpha Calculation [O(1) continuous time math]
+        // 2. Time-Decay (Δt) Math & Micro-Debounce
         const dtMs = Math.max(1, now - asset.lastTickMs);
         asset.lastTickMs = now;
 
         const alphaFast = 1 - Math.exp(-dtMs / this.FAST_TAU_MS);
         const alphaSlow = 1 - Math.exp(-dtMs / this.SLOW_TAU_MS);
-        const alphaMicro = 1 - Math.exp(-dtMs / 250); // 500ms Debounce for OBI Spoofing
+        const alphaMicro = 1 - Math.exp(-dtMs / 500); // 500ms Debounce for OBI Spoofing
 
         // 3. Raw Imbalance & Micro-EMA Filter
-        const rawObi = (bidSize - askSize) / (bidSize + askSize); 
+        const rawObi = (bidSize - askSize) / totalLiquidity; 
         asset.emaObi += alphaMicro * (rawObi - asset.emaObi);
 
-        // 4. Update Moving Averages & Variances (Incremental EMA Variance)
-        const deltaFast = midPrice - asset.muFast;
+        // --- 4. 1D KALMAN FILTER (Asset-Scaled Noise Matrices) ---
+        // Predict
+        const pPred = asset.kalmanP + asset.kalmanQ;
+        // Update (Kalman Gain)
+        const kalmanGain = pPred / (pPred + asset.kalmanR);
+        asset.kalmanX = asset.kalmanX + kalmanGain * (midPrice - asset.kalmanX);
+        asset.kalmanP = (1 - kalmanGain) * pPred;
+        
+        const truePrice = asset.kalmanX; // The mathematically cleaned price
+
+        // 5. Update Moving Averages & Variances (Using TRUE PRICE, not raw mid)
+        const deltaFast = truePrice - asset.muFast;
         asset.muFast += alphaFast * deltaFast;
         asset.varFast = (1 - alphaFast) * (asset.varFast + alphaFast * deltaFast * deltaFast);
 
-        const deltaSlow = midPrice - asset.muSlow;
+        const deltaSlow = truePrice - asset.muSlow;
         asset.muSlow += alphaSlow * deltaSlow;
         asset.varSlow = (1 - alphaSlow) * (asset.varSlow + alphaSlow * deltaSlow * deltaSlow);
 
-        // 5. Compute Volatility & Statistical Bounds
+        // 6. Compute Volatility & Statistical Bounds
         const fastVol = Math.sqrt(asset.varFast);
         const slowVol = Math.sqrt(asset.varSlow);
 
-        // Z-Score mathematically anchored ONLY to Slow Volatility
-        const zScore = slowVol > 1e-9 ? (midPrice - asset.muSlow) / slowVol : 0;
+        // Z-Score is anchored to TruePrice and Slow Volatility
+        const zScore = slowVol > 1e-9 ? (truePrice - asset.muSlow) / slowVol : 0;
         const regimeRatio = slowVol > 1e-9 ? fastVol / slowVol : 1.0;
 
-        // 6. State Determinations (Warmup, Cooldown, Positions)
+        // --- 7. VOLATILITY-LINKED DYNAMIC SCALING ---
+        const activeRegime = Math.max(1.0, regimeRatio); 
+        const dynamicZ = Math.max(1.5, this.Z_BASE_ENTRY / Math.sqrt(activeRegime));
+        const dynamicObi = Math.max(0.10, this.MIN_OBI / activeRegime);
+
+        // 8. State Determinations (Warmup, Cooldown, Positions)
         const elapsedWarmup = now - asset.startTimeMs;
         const isWarm = elapsedWarmup >= this.WARMUP_MS;
         const isOnCooldown = asset.cooldownUntil && now < asset.cooldownUntil;
         const hasOpenPosition = this.bot.activePositions && this.bot.activePositions[symbol];
 
-        // 7. OMNIPRESENT GLASS LOG (Fires strictly every 5 seconds)
+        // 9. OMNIPRESENT GLASS LOG (Fires strictly every 5 seconds)
         if (now - asset.lastLogMs > 5000) {
             asset.lastLogMs = now;
             
@@ -153,40 +176,45 @@ class TickStrategy {
 
             this.logger.info(
                 `[GLASS LOG] 🔍 ${symbol} ${stateString} | ` +
-                `📊 Mid: ${midPrice.toFixed(4)} | ` +
-                `🎯 Z-Score: ${zScore > 0 ? '+' : ''}${zScore.toFixed(2)} (Req: ±${this.Z_BASE_ENTRY}) | ` +
+                `📊 Mid(Clean): ${truePrice.toFixed(4)} | ` +
+                `🎯 Z-Score: ${zScore > 0 ? '+' : ''}${zScore.toFixed(2)} (Req: ±${dynamicZ.toFixed(2)}) | ` +
                 `🌪️ Vol Regime: ${regimeRatio.toFixed(2)}x (Req: >${this.VOL_REGIME_MIN}) | ` +
-                `⚖️ OBI(EMA): ${asset.emaObi > 0 ? '+' : ''}${(asset.emaObi * 100).toFixed(1)}% (Req: ±${this.MIN_OBI * 100}%) | ` +
-                `📏 Spread: ${spread.toFixed(4)} (Max allowed: ${(slowVol * 0.5).toFixed(4)})`
+                `⚖️ OBI(EMA): ${asset.emaObi > 0 ? '+' : ''}${(asset.emaObi * 100).toFixed(1)}% (Req: ±${(dynamicObi * 100).toFixed(1)}%) | ` +
+                `📏 Spread: ${spread.toFixed(4)} | 🎛️ K-Gain: ${kalmanGain.toFixed(4)}`
             );
 
             // Print inner thoughts only if we are active and searching for a trade
             if (isWarm && !isOnCooldown && !hasOpenPosition && regimeRatio > 1.0) {
                 let thoughts = `[THINKING] ${symbol} -> Volatility is waking up... `;
-                if (Math.abs(zScore) > 1.5) thoughts += `Z-Score building (${zScore.toFixed(2)}). `;
-                if (Math.abs(asset.emaObi) > 0.2) thoughts += `Book is tilting (${(asset.emaObi*100).toFixed(0)}%). `;
-                if (spread > (slowVol * 0.5)) thoughts += `WAITING: Spread too wide.`;
+                if (Math.abs(zScore) > (dynamicZ * 0.6)) thoughts += `Z-Score building (${zScore.toFixed(2)}). `;
+                if (Math.abs(asset.emaObi) > (dynamicObi * 0.6)) thoughts += `Book is tilting (${(asset.emaObi*100).toFixed(0)}%). `;
                 this.logger.info(thoughts);
             }
         }
 
-        // --- 8. STRICT GATEKEEPING: Block logic if warming up, cooling down, or in position ---
+        // --- 10. STRICT GATEKEEPING: Block logic if warming up, cooling down, or in position ---
         if (!isWarm || isOnCooldown || hasOpenPosition) return;
 
-        // 9. LOGICAL HYPOTHESIS EXECUTION (The Harmony)
+        // 11. TICK-SIZE FLOORS & LOGICAL EXECUTION (The Harmony)
         const isVolExpanding = regimeRatio >= this.VOL_REGIME_MIN;
-        const isSpreadTight = spread <= (slowVol * 0.5); // Spread must be less than 50% of typical vol
+        
+        // Spread must be tighter than half typical volatility, but never demand impossible sub-tick spreads
+        const maxSpread = Math.max(asset.tickSize * 1.5, slowVol * 0.5);
+        const isSpreadTight = spread <= maxSpread; 
 
         if (isVolExpanding && isSpreadTight) {
             
             // LONG HYPOTHESIS
-            if (zScore >= this.Z_BASE_ENTRY && asset.emaObi >= this.MIN_OBI) {
+            if (zScore >= dynamicZ && asset.emaObi >= dynamicObi) {
+                this.logger.info(`[DYNAMIC SCALING] 📈 Long Triggered | Target Z: ${dynamicZ.toFixed(2)} | Target OBI: ${(dynamicObi*100).toFixed(1)}%`);
+                // Note: We execute on physical midPrice to ensure API compatibility
                 this.executeTrade(symbol, 'buy', midPrice, slowVol, asset);
                 asset.cooldownUntil = now + this.COOLDOWN_MS;
             }
             
             // SHORT HYPOTHESIS
-            else if (zScore <= -this.Z_BASE_ENTRY && asset.emaObi <= -this.MIN_OBI) {
+            else if (zScore <= -dynamicZ && asset.emaObi <= -dynamicObi) {
+                this.logger.info(`[DYNAMIC SCALING] 📉 Short Triggered | Target Z: ${dynamicZ.toFixed(2)} | Target OBI: ${(dynamicObi*100).toFixed(1)}%`);
                 this.executeTrade(symbol, 'sell', midPrice, slowVol, asset);
                 asset.cooldownUntil = now + this.COOLDOWN_MS;
             }
@@ -200,9 +228,12 @@ class TickStrategy {
         const envSize = process.env.ORDER_SIZE ? parseFloat(process.env.ORDER_SIZE) : null;
         const size = envSize || (this.bot.config ? this.bot.config.orderSize : 1);
 
-        // VOLATILITY-ADJUSTED RISK COMPUTATION
-        const riskDistance = slowVol * this.SL_MULTIPLIER;
-        const rewardDistance = slowVol * this.TP_MULTIPLIER;
+        // VOLATILITY-ADJUSTED RISK COMPUTATION WITH TICK FLOORS
+        const minRiskTicks = 3; 
+        const minRewardTicks = 6;
+        
+        const riskDistance = Math.max(slowVol * this.SL_MULTIPLIER, asset.tickSize * minRiskTicks);
+        const rewardDistance = Math.max(slowVol * this.TP_MULTIPLIER, asset.tickSize * minRewardTicks);
 
         let slPrice, tpPrice;
 
@@ -261,4 +292,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-            
+                    
