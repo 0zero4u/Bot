@@ -23,7 +23,7 @@ class MicroStrategy {
         // --- RISK SETTINGS (Aligned with AdvanceStrategy) ---
         // "Hard SL + Trail TP" Configuration
         // We set this to 0.02% (or env). It acts as a Hard Stop initially, then trails.
-        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.02'); 
+        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.035'); 
         
         this.COOLDOWN_MS = 30000;
 
