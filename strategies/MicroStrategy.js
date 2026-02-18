@@ -1,10 +1,13 @@
 /**
- * Strategy: Volume-Weighted Microprice (VWM)
- * FIXED VERSION:
- * 1. Window maintained at 30ms (User Requirement)
- * 2. Removed "Acceleration Trap" (Allows sustained high velocity)
- * 3. Fixed "Liquidity Laddering" bug (Uses Imbalance instead of raw volume history)
- * 4. Fixed API Payload (Removed limit_price from market_order)
+ * MicroStrategy.js
+ * v13.2 - ALIGNED NATIVE (Binance HFT + Hard SL/Trail TP)
+ * * ALIGNMENT:
+ * 1. Consumes Rust/Trader.js flat 'DepthUpdate' structure.
+ * 2. Implements AdvanceStrategy's "Hard SL + Trail TP" logic.
+ * * LOGIC:
+ * 1. Window maintained at 30ms.
+ * 2. Volume-Weighted Microprice (VWM) with Imbalance checks.
+ * 3. OPTIMIZATION: Removed redundant Liquidity Ratio gates (Math guarantees > 80%).
  */
 
 class MicroStrategy {
@@ -15,7 +18,12 @@ class MicroStrategy {
         // --- CONFIGURATION ---
         this.TRIGGER_THRESHOLD = parseFloat(process.env.MICRO_THRESHOLD || '0.60');
         this.MIN_NOTIONAL_VALUE = parseFloat(process.env.MIN_NOTIONAL || '2000');
-        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.05');
+        
+        // --- RISK SETTINGS (Aligned with AdvanceStrategy) ---
+        // "Hard SL + Trail TP" Configuration
+        // We set this to 0.02% (or env). It acts as a Hard Stop initially, then trails.
+        this.TRAILING_PERCENT = parseFloat(process.env.TRAILING_PERCENT || '0.02'); 
+        
         this.COOLDOWN_MS = 2000;
 
         // --- VELOCITY CONFIG ---
@@ -25,27 +33,36 @@ class MicroStrategy {
         this.assets = {};
 
         // Delta Exchange Specs
+        const envSize = process.env.ORDER_SIZE ? parseFloat(process.env.ORDER_SIZE) : null;
         this.specs = {
-            'BTC': { deltaId: 27,    precision: 1, lot: 0.001 },
-            'ETH': { deltaId: 299,   precision: 2, lot: 0.01 },
-            'XRP': { deltaId: 14969, precision: 4, lot: 1 },
-            'SOL': { deltaId: 417,   precision: 3, lot: 0.1 }
+            'BTC': { deltaId: 27,    precision: 1, lot: envSize || 0.001, minLot: 0.001 },
+            'ETH': { deltaId: 299,   precision: 2, lot: envSize || 0.01,  minLot: 0.01 },
+            'XRP': { deltaId: 14969, precision: 4, lot: envSize || 10,    minLot: 1 },
+            'SOL': { deltaId: 417,   precision: 3, lot: envSize || 0.1,   minLot: 0.1 }
         };
 
-        const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
+        const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
         targets.forEach(symbol => {
-            this.assets[symbol] = {
-                lastTriggerTime: 0,
-                lastLogTime: 0,
-                priceHistory: [],
-                prevVelocity: null,
-                prevHalfSpread: null
-            };
+            if (this.specs[symbol]) {
+                this.assets[symbol] = {
+                    lastTriggerTime: 0,
+                    lastLogTime: 0,
+                    priceHistory: [],
+                    prevVelocity: null,
+                    prevHalfSpread: null
+                };
+            }
         });
+        
+        this.logger.info(`[MicroStrategy] Loaded V13.2 | SL/Trail: ${this.TRAILING_PERCENT}% | Ratio Logic: IMPLIED (Math) | Rust-Aligned`);
     }
 
     getName() {
-        return `MicroStrategy (VWM + 30ms Tick + Corrected Logic)`;
+        return `MicroStrategy (VWM + 30ms Tick + HardSL)`;
+    }
+
+    async start() {
+        this.logger.info(`[MicroStrategy] 🟢 Engine Started.`);
     }
 
     /**
@@ -58,18 +75,30 @@ class MicroStrategy {
         }
     }
 
-    async onDepthUpdate(symbol, depth) {
+    // Unused but required by Trader interface safely
+    onExchange1Quote(msg) {} 
+    onLaggerTrade(trade) {}
+
+    /**
+     * ALIGNED: Receives flat update from Rust Listener
+     * Struct: { s: "BTC", bb: 90000.0, bq: 1.5, ba: 90001.0, aq: 2.0 }
+     */
+    async onDepthUpdate(update) {
+        const symbol = update.s; // Rust sends 'BTC', 'ETH' etc directly
         const asset = this.assets[symbol];
-        if (!asset) return;
-        if (!depth.bids[0] || !depth.asks[0]) return;
+        
+        if (!asset || this.bot.isOrderInProgress || this.bot.hasOpenPosition(symbol)) return;
 
         const now = Date.now();
 
-        // --- L1 Data ---
-        const Pb = parseFloat(depth.bids[0][0]);
-        const Vb = parseFloat(depth.bids[0][1]);
-        const Pa = parseFloat(depth.asks[0][0]);
-        const Va = parseFloat(depth.asks[0][1]);
+        // --- Data Mapping (Rust Flat Struct -> Strategy vars) ---
+        const Pb = parseFloat(update.bb); // Best Bid
+        const Vb = parseFloat(update.bq); // Bid Qty
+        const Pa = parseFloat(update.ba); // Best Ask
+        const Va = parseFloat(update.aq); // Ask Qty
+
+        // Safety check for empty book
+        if (isNaN(Pb) || isNaN(Pa) || Pb === 0 || Pa === 0) return;
 
         const midPrice = (Pa + Pb) / 2;
         
@@ -105,8 +134,6 @@ class MicroStrategy {
         const isVelocityDown = signedChange < 0;
 
         // [CORRECTION 1] Removed "Acceleration Trap"
-        // We track velocity, but we DO NOT require it to be higher than the previous tick.
-        // As long as it is above SPIKE_PERCENT, it is valid.
         asset.prevVelocity = signedChange;
 
         // --- Microprice & Imbalance ---
@@ -134,19 +161,16 @@ class MicroStrategy {
         let side = null;
 
         // [CORRECTION 2] Liquidity Logic (Imbalance vs Raw Volume)
-        // Check if the Order Book supports the move (Ratio) rather than raw volume history
+        // Calculated purely for logging and verification now.
+        // Math Guarantee: If signalStrength > 0.60, bidRatio is ALREADY > 0.80.
         const totalL1Vol = Vb + Va;
         const bidRatio = Vb / totalL1Vol;
 
         if (signalStrength > this.TRIGGER_THRESHOLD && isVelocityUp) {
-            // If buying, we want decent bid support (not < 30%)
-            if (bidRatio < 0.3) return; 
             side = 'buy';
         }
 
         if (signalStrength < -this.TRIGGER_THRESHOLD && isVelocityDown) {
-            // If selling, we want decent ask support (bid ratio shouldn't be huge > 70%)
-            if (bidRatio > 0.7) return; 
             side = 'sell';
         }
 
@@ -159,7 +183,7 @@ class MicroStrategy {
         }
 
         // Execution Trigger
-        if (side && !this.bot.hasOpenPosition(symbol) && !this.bot.isOrderInProgress) {
+        if (side) {
             if (now - asset.lastTriggerTime < this.COOLDOWN_MS) return;
             asset.lastTriggerTime = now;
             await this.executeTrade(symbol, side, Pa, Pb);
@@ -170,34 +194,50 @@ class MicroStrategy {
         this.bot.isOrderInProgress = true;
         try {
             const spec = this.specs[symbol];
-            const entryPrice = side === 'buy' ? bestAsk : bestBid;
+            
+            // Quote price is the price we expect to fill at (Ask for Buy, Bid for Sell)
+            const quotePrice = side === 'buy' ? bestAsk : bestBid;
 
-            let trailDistance = entryPrice * (this.TRAILING_PERCENT / 100);
+            // --- HARD SL + TRAIL TP LOGIC (Aligned with AdvanceStrategy) ---
+            // Logic: A tight trailing stop (0.02%) serves both purposes.
+            // 1. At T=0, it sets a stop at Entry +/- 0.02% (Hard SL).
+            // 2. At T>0, if price moves in favor, the stop moves with it (Trail TP).
+            
+            let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
+            
+            // Ensure trail value is positive absolute number for the API and meets tick size
             const tickSize = 1 / Math.pow(10, spec.precision);
-            if (trailDistance < tickSize) trailDistance = tickSize;
+            if (trailValue < tickSize) trailValue = tickSize;
+            
+            const trailAmountAbs = Math.abs(trailValue).toFixed(spec.precision);
 
-            // Delta expects positive integer for trail amount usually, but string for API
-            const trailAmount = trailDistance.toFixed(spec.precision);
-
-            const clientOid = `c_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+            const clientOid = `micro_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
             this.bot.recordOrderPunch(clientOid);
 
-            // [CORRECTION 3] Cleaned Market Order Payload
-            // Removed 'limit_price' (invalid for market_order)
+            // Using configured lot size
+            const finalSize = spec.lot.toString();
+
             const payload = {
                 product_id: spec.deltaId.toString(),
-                size: process.env.ORDER_SIZE || "1",
+                size: finalSize,
                 side: side,
                 order_type: 'market_order',
-                bracket_trail_amount: trailAmount,
-                bracket_stop_trigger_method: 'mark_price',
+                
+                // --- SAFETY + PROFIT MECHANISM ---
+                // This matches AdvanceStrategy's logic exactly
+                bracket_trail_amount: trailAmountAbs,
+                
+                // CRITICAL: Using 'last_traded_price' acts as the Hard SL anchor immediately.
+                // 'mark_price' can be too slow/smooth for HFT stops.
+                bracket_stop_trigger_method: 'last_traded_price', 
+                
                 client_order_id: clientOid
             };
 
             await this.bot.placeOrder(payload);
 
             this.logger.info(
-                `[EXEC_CONT] ${symbol} ${side} @ ${entryPrice} | Trail:${trailAmount} | OID:${clientOid}`
+                `[EXEC_MICRO] ⚡ ${symbol} ${side} @ ${quotePrice} | Trail:${trailAmountAbs} | OID:${clientOid}`
             );
         } catch (e) {
             this.logger.error(`[EXEC_FAIL] ${e.message}`);
@@ -208,4 +248,4 @@ class MicroStrategy {
 }
 
 module.exports = MicroStrategy;
-    
+        
