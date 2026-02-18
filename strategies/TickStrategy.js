@@ -1,12 +1,13 @@
 /**
  * TickStrategy.js
- * v13.2 - QUANTUM HARMONY (Omnipresent Heartbeat)
+ * v13.3 - QUANTUM HARMONY (Rust-Aligned)
  * * * FEATURES ADDED:
- * 1. OMNIPRESENT GLASS LOG: Heartbeat runs every 5s regardless of bot state (Warmup, Active, Cooldown).
+ * 1. OMNIPRESENT GLASS LOG: Heartbeat runs every 5s regardless of bot state.
  * 2. TIME-SPACE STATIONARITY: EMAs use exact Δt (Delta time), immune to tick-rate fluctuations.
  * 3. CORRECTED Z-SCORE: Threshold mathematically anchored to slow volatility (No double-scaling).
  * 4. MICROSTRUCTURE GATES: Order Book Imbalance (OBI) > 30% + Spread Filters.
  * 5. VOLATILITY RISK: Trailing stops are dynamically sized to 1.5 * σ_slow.
+ * 6. RUST ALIGNMENT: Perfectly maps to lib.rs `DepthUpdate` struct (bb, ba, bq, aq).
  */
 
 class TickStrategy {
@@ -22,22 +23,41 @@ class TickStrategy {
         // --- 2. THRESHOLDS & GATES ---
         this.Z_BASE_ENTRY = 2.5;    // Standard Deviations required for breakout
         this.VOL_REGIME_MIN = 1.2;  // Fast Vol must be 20% higher than Slow Vol
-        this.MIN_OBI = 0.30;        // 30% minimum order book imbalance to confirm direction
+        this.MIN_OBI = 0.30;        // 30% minimum order book imbalance
         this.RISK_MULTIPLIER = 1.5; // Trailing stop distance (1.5 * slow volatility)
-        
         this.COOLDOWN_MS = 30000;   // 30s safety period post-trade
+
+        // --- 3. RUST-ALIGNED ASSET INITIALIZATION ---
+        const MASTER_CONFIG = {
+            'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
+            'BTC': { deltaId: 27,    precision: 1, tickSize: 0.1 },
+            'ETH': { deltaId: 299,   precision: 2, tickSize: 0.01 },
+            'SOL': { deltaId: 417,   precision: 3, tickSize: 0.1 }
+        };
+
+        this.assets = {};
+        const now = Date.now();
+        
+        for (const [symbol, details] of Object.entries(MASTER_CONFIG)) {
+            this.assets[symbol] = {
+                isInitialized: false,
+                lastTickMs: now,
+                startTimeMs: now,
+                muFast: 0,
+                muSlow: 0,
+                varFast: 0,
+                varSlow: 0,
+                lastLogMs: now,
+                cooldownUntil: 0,
+                ...details
+            };
+        }
     }
 
-    /**
-     * Required by bot architecture to identify the strategy
-     */
     getName() {
         return 'TickStrategy_Quantum';
     }
 
-    /**
-     * Required by bot architecture to initialize the strategy safely
-     */
     async start() {
         this.logger.info(`[STRATEGY] Starting ${this.getName()}...`);
         this.logger.info(`[STRATEGY] Quantum Parameters Loaded: FastTau=${this.FAST_TAU_MS}ms, SlowTau=${this.SLOW_TAU_MS}ms`);
@@ -45,21 +65,35 @@ class TickStrategy {
     }
 
     /**
-     * Core update loop called by the WebSocket/Data feed
+     * ALIGNED ENTRY POINT: Matches the lib.rs N-API callback execution
      */
-    async onTick(symbol, update, asset) {
+    async onDepthUpdate(depth) {
+        const symbol = depth.s;
+        if (!this.assets[symbol]) return;
+        
+        const asset = this.assets[symbol];
         const now = Date.now();
 
-        // 1. Initialize State if missing
+        // RUST PAYLOAD MAPPING (Matches lib.rs struct DepthUpdate)
+        const bestBid = depth.bb;
+        const bestAsk = depth.ba;
+        const bidSize = depth.bq || 1; 
+        const askSize = depth.aq || 1; 
+
+        const midPrice = (bestBid + bestAsk) / 2;
+        const spread = bestAsk - bestBid;
+
+        // 1. Initialize State on first tick
         if (!asset.isInitialized) {
             asset.lastTickMs = now;
             asset.startTimeMs = now;
-            asset.muFast = (update.bestBid + update.bestAsk) / 2;
-            asset.muSlow = asset.muFast;
+            asset.muFast = midPrice;
+            asset.muSlow = midPrice;
             asset.varFast = 0;
             asset.varSlow = 0;
             asset.lastLogMs = now;
             asset.isInitialized = true;
+            this.logger.info(`[DATA FLOW] First tick received for ${symbol}. Engine starting.`);
             return;
         }
 
@@ -70,14 +104,6 @@ class TickStrategy {
         const alphaFast = 1 - Math.exp(-dtMs / this.FAST_TAU_MS);
         const alphaSlow = 1 - Math.exp(-dtMs / this.SLOW_TAU_MS);
 
-        // 3. Raw Market Data
-        const bestBid = update.bestBid;
-        const bestAsk = update.bestAsk;
-        const midPrice = (bestBid + bestAsk) / 2;
-        const spread = bestAsk - bestBid;
-
-        const bidSize = update.bestBidSize || 1; 
-        const askSize = update.bestAskSize || 1;
         const obi = (bidSize - askSize) / (bidSize + askSize); // Order Book Imbalance
 
         // 4. Update Moving Averages & Variances (Incremental EMA Variance)
@@ -165,31 +191,31 @@ class TickStrategy {
      * Executes the trade with Volatility-Adjusted Bracket Trailing
      */
     async executeTrade(symbol, side, entryPrice, slowVol, asset) {
-        // Assume bot has a sizing method, default to 1 if not
-        const size = this.bot.calculateSize ? this.bot.calculateSize(symbol) : 1; 
-        const clientOid = `TICK_${Date.now()}`;
+        const envSize = process.env.ORDER_SIZE ? parseFloat(process.env.ORDER_SIZE) : null;
+        const size = envSize || (this.bot.config ? this.bot.config.orderSize : 1);
 
         // VOLATILITY-ADJUSTED RISK: Trail size is dynamically scaled to current market reality
-        // If slowVol is 15.0 (BTC), trail is 22.5. If slowVol is 0.004 (XRP), trail is 0.006.
         let finalTrail = slowVol * this.RISK_MULTIPLIER;
         
         // Safety fallback: ensure trail is never exactly 0 due to API constraints
         if (finalTrail < 0.0001) finalTrail = 0.0001; 
 
+        const clientOid = `TICK_${Date.now()}`;
+
         try {
             this.logger.info(
                 `[EXEC THINKING] 💥 BREAKOUT DETECTED! ${symbol} ${side.toUpperCase()} @ ${entryPrice}\n` +
                 ` -> Volatility Risk (σ): ${slowVol.toFixed(4)}\n` +
-                ` -> Dynamic Trail Size: ${finalTrail.toFixed(4)} absolute price distance`
+                ` -> Dynamic Trail Size: ${finalTrail.toFixed(asset.precision)} absolute price distance`
             );
 
             const payload = {
-                product_id: asset.deltaId ? asset.deltaId.toString() : symbol, 
+                product_id: asset.deltaId.toString(), 
                 size: size.toString(), 
                 side: side,
                 order_type: 'market_order',
                 client_order_id: clientOid,
-                bracket_trail_amount: finalTrail.toFixed(4).toString(), // Absolute amount string
+                bracket_trail_amount: finalTrail.toFixed(asset.precision).toString(), // Formatted exactly to exchange precision
                 bracket_stop_trigger_method: 'last_traded_price' 
             };
 
@@ -198,7 +224,6 @@ class TickStrategy {
             if (result && result.success) {
                 this.logger.info(`[FILLED] 🎯 ${symbol} ${side} | OrderID: ${result.id}`);
                 if (this.bot.activePositions) this.bot.activePositions[symbol] = true; 
-                asset.positionOpenTime = Date.now(); // Track for potential Time Stop
             } else {
                 const errorStr = JSON.stringify(result || {});
                 if (errorStr.includes("bracket_order_position_exists")) {
@@ -217,4 +242,4 @@ class TickStrategy {
 }
 
 module.exports = TickStrategy;
-        
+    
