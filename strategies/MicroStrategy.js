@@ -1,11 +1,11 @@
 /**
  * MicroStrategy.js
- * v13.2 - ALIGNED NATIVE (Binance HFT + Hard SL/Trail TP)
+ * v13.3 - ALIGNED NATIVE (Binance HFT + Hard SL/Trail TP)
  * * ALIGNMENT:
  * 1. Consumes Rust/Trader.js flat 'DepthUpdate' structure.
  * 2. Implements AdvanceStrategy's "Hard SL + Trail TP" logic.
  * * LOGIC:
- * 1. Window maintained at 30ms.
+ * 1. Window maintained at 100ms (Fixed for feed latency).
  * 2. Volume-Weighted Microprice (VWM) with Imbalance checks.
  * 3. OPTIMIZATION: Removed redundant Liquidity Ratio gates (Math guarantees > 80%).
  */
@@ -28,7 +28,8 @@ class MicroStrategy {
 
         // --- VELOCITY CONFIG ---
         this.SPIKE_PERCENT = 0.0003;   
-        this.SPIKE_WINDOW_MS = 17; // KEPT AT 30ms PER REQUEST
+        // [FIX] Increased to 100ms. 17ms was too fast for feed, causing 0% velocity.
+        this.SPIKE_WINDOW_MS = 50; 
 
         this.assets = {};
 
@@ -54,11 +55,11 @@ class MicroStrategy {
             }
         });
         
-        this.logger.info(`[MicroStrategy] Loaded V13.2 | SL/Trail: ${this.TRAILING_PERCENT}% | Ratio Logic: IMPLIED (Math) | Rust-Aligned`);
+        this.logger.info(`[MicroStrategy] Loaded V13.3 | SL/Trail: ${this.TRAILING_PERCENT}% | Window: ${this.SPIKE_WINDOW_MS}ms`);
     }
 
     getName() {
-        return `MicroStrategy (VWM + 30ms Tick + HardSL)`;
+        return `MicroStrategy (VWM + ${this.SPIKE_WINDOW_MS}ms Tick + HardSL)`;
     }
 
     async start() {
@@ -105,29 +106,36 @@ class MicroStrategy {
         // 1. Notional Filter
         if ((Vb * Pb) + (Va * Pa) < this.MIN_NOTIONAL_VALUE) return;
 
-        // --- Velocity Calculation (Strict 30ms Window) ---
+        // --- Velocity Calculation ---
         asset.priceHistory.push({ price: midPrice, time: now });
         
-        // Cleanup old ticks (> 2x Window to be safe)
-        while (asset.priceHistory.length > 0 && now - asset.priceHistory[0].time > this.SPIKE_WINDOW_MS * 2) {
+        // [FIX] Cleanup old ticks (> 10x Window to ensure baseline exists)
+        // Previously cleared too fast, causing "0 velocity" if feed was slow.
+        while (asset.priceHistory.length > 0 && now - asset.priceHistory[0].time > this.SPIKE_WINDOW_MS * 10) {
             asset.priceHistory.shift();
         }
 
-        // Find baseline tick (approx 30ms ago)
+        // Find baseline tick (approx 100ms ago)
         let baselineTick = null;
         for (let i = 0; i < asset.priceHistory.length; i++) {
+             // We look for the oldest tick that is WITHIN the window
              if (now - asset.priceHistory[i].time <= this.SPIKE_WINDOW_MS) {
                  baselineTick = asset.priceHistory[i];
                  break;
              }
         }
         
+        // Fallback: If no tick inside window (gap > 100ms), use the most recent previous tick
+        if (!baselineTick && asset.priceHistory.length > 0) {
+            baselineTick = asset.priceHistory[0]; 
+        }
+
         if (!baselineTick) return;
 
         const signedChange = (midPrice - baselineTick.price) / baselineTick.price;
         const absChange = Math.abs(signedChange);
 
-        // --- GLASS BOX HEARTBEAT (Added per request) ---
+        // --- GLASS BOX HEARTBEAT ---
         // Logs status every 5s regardless of velocity to show "what it's seeing/thinking"
         if (now - asset.lastLogTime > 5000) {
             const hbMicro = ((Vb * Pa) + (Va * Pb)) / (Vb + Va);
@@ -175,8 +183,6 @@ class MicroStrategy {
         let side = null;
 
         // [CORRECTION 2] Liquidity Logic (Imbalance vs Raw Volume)
-        // Calculated purely for logging and verification now.
-        // Math Guarantee: If signalStrength > 0.60, bidRatio is ALREADY > 0.80.
         const totalL1Vol = Vb + Va;
         const bidRatio = Vb / totalL1Vol;
 
@@ -189,7 +195,6 @@ class MicroStrategy {
         }
 
         // Logging (Active Signal)
-        // This might be skipped if Heartbeat just fired, which is fine (avoids duplicates)
         if (now - asset.lastLogTime > 5000) {
             this.logger.info(
                 `[CONT] ${symbol} | Vel:${(signedChange * 100).toFixed(4)}% | Sig:${signalStrength.toFixed(2)} | Ratio:${bidRatio.toFixed(2)}`
@@ -213,11 +218,7 @@ class MicroStrategy {
             // Quote price is the price we expect to fill at (Ask for Buy, Bid for Sell)
             const quotePrice = side === 'buy' ? bestAsk : bestBid;
 
-            // --- HARD SL + TRAIL TP LOGIC (Aligned with AdvanceStrategy) ---
-            // Logic: A tight trailing stop (0.02%) serves both purposes.
-            // 1. At T=0, it sets a stop at Entry +/- 0.02% (Hard SL).
-            // 2. At T>0, if price moves in favor, the stop moves with it (Trail TP).
-            
+            // --- HARD SL + TRAIL TP LOGIC ---
             let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
             
             // Ensure trail value is positive absolute number for the API and meets tick size
@@ -246,11 +247,9 @@ class MicroStrategy {
                 order_type: 'market_order',
                 
                 // --- SAFETY + PROFIT MECHANISM ---
-                // This matches AdvanceStrategy's logic exactly
                 bracket_trail_amount: trailAmountSigned,
                 
                 // CRITICAL: Using 'last_traded_price' acts as the Hard SL anchor immediately.
-                // 'mark_price' can be too slow/smooth for HFT stops.
                 bracket_stop_trigger_method: 'last_traded_price', 
                 
                 client_order_id: clientOid
@@ -270,3 +269,4 @@ class MicroStrategy {
 }
 
 module.exports = MicroStrategy;
+                        
