@@ -1,12 +1,12 @@
 /**
  * TickStrategy.js
- * v13.1 - QUANTUM HARMONY (Time-Decay, OBI, Vol-Adjusted Risk)
+ * v13.2 - QUANTUM HARMONY (Omnipresent Heartbeat)
  * * * FEATURES ADDED:
- * 1. TIME-SPACE STATIONARITY: EMAs use exact Δt (Delta time), immune to tick-rate fluctuations.
- * 2. CORRECTED Z-SCORE: Threshold mathematically anchored to slow volatility (No double-scaling).
- * 3. MICROSTRUCTURE GATES: Order Book Imbalance (OBI) > 30% + Spread Filters.
- * 4. VOLATILITY RISK: Trailing stops are dynamically sized to 1.5 * σ_slow.
- * 5. ADVANCED GLASS LOGGING: 5s heartbeat exposes the complete quantitative state.
+ * 1. OMNIPRESENT GLASS LOG: Heartbeat runs every 5s regardless of bot state (Warmup, Active, Cooldown).
+ * 2. TIME-SPACE STATIONARITY: EMAs use exact Δt (Delta time), immune to tick-rate fluctuations.
+ * 3. CORRECTED Z-SCORE: Threshold mathematically anchored to slow volatility (No double-scaling).
+ * 4. MICROSTRUCTURE GATES: Order Book Imbalance (OBI) > 30% + Spread Filters.
+ * 5. VOLATILITY RISK: Trailing stops are dynamically sized to 1.5 * σ_slow.
  */
 
 class TickStrategy {
@@ -97,18 +97,30 @@ class TickStrategy {
         const zScore = slowVol > 1e-9 ? (midPrice - asset.muSlow) / slowVol : 0;
         const regimeRatio = slowVol > 1e-9 ? fastVol / slowVol : 1.0;
 
-        // 6. Warmup & Cooldown Gates
+        // 6. State Determinations (Warmup, Cooldown, Positions)
         const elapsedWarmup = now - asset.startTimeMs;
         const isWarm = elapsedWarmup >= this.WARMUP_MS;
         const isOnCooldown = asset.cooldownUntil && now < asset.cooldownUntil;
+        const hasOpenPosition = this.bot.activePositions && this.bot.activePositions[symbol];
 
-        // 7. EXTENSIVE GLASS LOG (Heartbeat every 5 seconds)
+        // 7. OMNIPRESENT GLASS LOG (Fires strictly every 5 seconds)
         if (now - asset.lastLogMs > 5000) {
             asset.lastLogMs = now;
-            const warmupPct = Math.min(100, (elapsedWarmup / this.WARMUP_MS) * 100).toFixed(0);
             
+            // Determine the exact string state for the UI
+            let stateString = '[🟢 ACTIVE]';
+            if (!isWarm) {
+                const warmupPct = Math.min(100, (elapsedWarmup / this.WARMUP_MS) * 100).toFixed(0);
+                stateString = `[🟡 WARMING UP: ${warmupPct}%]`;
+            } else if (hasOpenPosition) {
+                stateString = '[🔴 IN POSITION]';
+            } else if (isOnCooldown) {
+                const cdRemaining = Math.max(0, (asset.cooldownUntil - now) / 1000).toFixed(0);
+                stateString = `[🔵 COOLDOWN: ${cdRemaining}s]`;
+            }
+
             this.logger.info(
-                `[GLASS LOG] 🔍 ${symbol} | 🟢 Warmup: ${warmupPct}% | ` +
+                `[GLASS LOG] 🔍 ${symbol} ${stateString} | ` +
                 `📊 Mid: ${midPrice.toFixed(4)} | ` +
                 `🎯 Z-Score: ${zScore > 0 ? '+' : ''}${zScore.toFixed(2)} (Req: ±${this.Z_BASE_ENTRY}) | ` +
                 `🌪️ Vol Regime: ${regimeRatio.toFixed(2)}x (Req: >${this.VOL_REGIME_MIN}) | ` +
@@ -116,8 +128,8 @@ class TickStrategy {
                 `📏 Spread: ${spread.toFixed(4)} (Max allowed: ${(slowVol * 0.5).toFixed(4)})`
             );
 
-            // Optional: Log Bot's internal "thinking" if close to a trade
-            if (isWarm && !isOnCooldown && regimeRatio > 1.0) {
+            // Print inner thoughts only if we are active and searching for a trade
+            if (isWarm && !isOnCooldown && !hasOpenPosition && regimeRatio > 1.0) {
                 let thoughts = `[THINKING] ${symbol} -> Volatility is waking up... `;
                 if (Math.abs(zScore) > 1.5) thoughts += `Z-Score building (${zScore.toFixed(2)}). `;
                 if (Math.abs(obi) > 0.2) thoughts += `Book is tilting (${(obi*100).toFixed(0)}%). `;
@@ -126,11 +138,10 @@ class TickStrategy {
             }
         }
 
-        // --- GATEKEEPING: Block logic if warming up or cooling down ---
-        if (!isWarm || isOnCooldown) return;
-        if (this.bot.activePositions && this.bot.activePositions[symbol]) return;
+        // --- 8. STRICT GATEKEEPING: Block logic if warming up, cooling down, or in position ---
+        if (!isWarm || isOnCooldown || hasOpenPosition) return;
 
-        // 8. LOGICAL HYPOTHESIS EXECUTION (The Harmony)
+        // 9. LOGICAL HYPOTHESIS EXECUTION (The Harmony)
         const isVolExpanding = regimeRatio >= this.VOL_REGIME_MIN;
         const isSpreadTight = spread <= (slowVol * 0.5); // Spread must be less than 50% of typical vol
 
