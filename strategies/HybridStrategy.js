@@ -8,7 +8,7 @@
  * - Micro/Advance: Hard SL + Trail TP with correct sign and tick floors
  */
 
-class HybridMicroLeadTickStrategy {
+class HybridStrategy {
   constructor(bot) {
     this.bot = bot;
     this.logger = bot.logger;
@@ -401,5 +401,5 @@ class HybridMicroLeadTickStrategy {
   }
 }
 
-module.exports = HybridMicroLeadTickStrategy;
+module.exports = HybridStrategy;
         
