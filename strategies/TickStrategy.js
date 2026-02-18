@@ -22,7 +22,7 @@ class TickStrategy {
         this.WARMUP_MS = 180000;    // 3 minutes warmup
 
         // --- 2. BASE THRESHOLDS & RISK GATES ---
-        this.Z_BASE_ENTRY = 2.5;    // Base StdDev required for breakout (scales down with vol)
+        this.Z_BASE_ENTRY = 1.5;    // Base StdDev required for breakout (scales down with vol)
         this.VOL_REGIME_MIN = 1.2;  // Fast Vol must be 20% higher than Slow Vol
         this.MIN_OBI = 0.30;        // Base 30% order book imbalance (scales down with vol)
         this.SL_MULTIPLIER = 1.5;   // Hard Stop Loss distance (1.5 * slow volatility)
