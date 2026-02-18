@@ -29,7 +29,7 @@ class MicroStrategy {
         // --- VELOCITY CONFIG ---
         this.SPIKE_PERCENT = 0.0002;   
         // 
-        this.SPIKE_WINDOW_MS = 70; 
+        this.SPIKE_WINDOW_MS = 10; 
 
         this.assets = {};
 
