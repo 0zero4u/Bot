@@ -28,7 +28,7 @@ class MicroStrategy {
 
         // --- VELOCITY CONFIG ---
         this.SPIKE_PERCENT = 0.0003;   
-        this.SPIKE_WINDOW_MS = 25; // KEPT AT 30ms PER REQUEST
+        this.SPIKE_WINDOW_MS = 17; // KEPT AT 30ms PER REQUEST
 
         this.assets = {};
 
@@ -127,6 +127,20 @@ class MicroStrategy {
         const signedChange = (midPrice - baselineTick.price) / baselineTick.price;
         const absChange = Math.abs(signedChange);
 
+        // --- GLASS BOX HEARTBEAT (Added per request) ---
+        // Logs status every 5s regardless of velocity to show "what it's seeing/thinking"
+        if (now - asset.lastLogTime > 5000) {
+            const hbMicro = ((Vb * Pa) + (Va * Pb)) / (Vb + Va);
+            const hbSpread = (Pa - Pb) / 2;
+            const hbSig = (hbSpread > 1e-9) ? (hbMicro - midPrice) / hbSpread : 0;
+            const hbRatio = Vb / (Vb + Va);
+            
+            this.logger.info(
+                `[HEARTBEAT] ${symbol} | P:${midPrice} | Vel:${(signedChange * 100).toFixed(4)}% | Sig:${hbSig.toFixed(2)} | Ratio:${hbRatio.toFixed(2)}`
+            );
+            asset.lastLogTime = now;
+        }
+
         // 2. Minimum Velocity Threshold
         if (absChange < this.SPIKE_PERCENT) return;
 
@@ -174,7 +188,8 @@ class MicroStrategy {
             side = 'sell';
         }
 
-        // Logging (Throttled)
+        // Logging (Active Signal)
+        // This might be skipped if Heartbeat just fired, which is fine (avoids duplicates)
         if (now - asset.lastLogTime > 5000) {
             this.logger.info(
                 `[CONT] ${symbol} | Vel:${(signedChange * 100).toFixed(4)}% | Sig:${signalStrength.toFixed(2)} | Ratio:${bidRatio.toFixed(2)}`
@@ -205,7 +220,7 @@ class MicroStrategy {
             
             let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
             
-            // Ensure trail value is valid against tick size (calculate absolutely first)
+            // Ensure trail value is positive absolute number for the API and meets tick size
             const tickSize = 1 / Math.pow(10, spec.precision);
             if (Math.abs(trailValue) < tickSize) trailValue = tickSize;
             
@@ -255,4 +270,3 @@ class MicroStrategy {
 }
 
 module.exports = MicroStrategy;
-                
