@@ -205,11 +205,18 @@ class MicroStrategy {
             
             let trailValue = quotePrice * (this.TRAILING_PERCENT / 100);
             
-            // Ensure trail value is positive absolute number for the API and meets tick size
+            // Ensure trail value is valid against tick size (calculate absolutely first)
             const tickSize = 1 / Math.pow(10, spec.precision);
-            if (trailValue < tickSize) trailValue = tickSize;
+            if (Math.abs(trailValue) < tickSize) trailValue = tickSize;
             
-            const trailAmountAbs = Math.abs(trailValue).toFixed(spec.precision);
+            // [FIX] Delta requires negative trail for BUY (stop below), positive for SELL (stop above)
+            let finalTrailValue = Math.abs(trailValue);
+            if (side === 'buy') {
+                finalTrailValue = -finalTrailValue;
+            }
+            
+            // Convert to string with correct precision
+            const trailAmountSigned = finalTrailValue.toFixed(spec.precision);
 
             const clientOid = `micro_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
             this.bot.recordOrderPunch(clientOid);
@@ -225,7 +232,7 @@ class MicroStrategy {
                 
                 // --- SAFETY + PROFIT MECHANISM ---
                 // This matches AdvanceStrategy's logic exactly
-                bracket_trail_amount: trailAmountAbs,
+                bracket_trail_amount: trailAmountSigned,
                 
                 // CRITICAL: Using 'last_traded_price' acts as the Hard SL anchor immediately.
                 // 'mark_price' can be too slow/smooth for HFT stops.
@@ -237,7 +244,7 @@ class MicroStrategy {
             await this.bot.placeOrder(payload);
 
             this.logger.info(
-                `[EXEC_MICRO] ⚡ ${symbol} ${side} @ ${quotePrice} | Trail:${trailAmountAbs} | OID:${clientOid}`
+                `[EXEC_MICRO] ⚡ ${symbol} ${side} @ ${quotePrice} | Trail:${trailAmountSigned} | OID:${clientOid}`
             );
         } catch (e) {
             this.logger.error(`[EXEC_FAIL] ${e.message}`);
@@ -248,4 +255,4 @@ class MicroStrategy {
 }
 
 module.exports = MicroStrategy;
-        
+                
