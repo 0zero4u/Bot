@@ -6,7 +6,7 @@ class ArbBaselineStrategy {
         this.logger = bot.logger;
 
         this.BASELINE_WINDOW = 180000;
-        this.THRESHOLD = 0.0005;
+        this.THRESHOLD = 0.0007;
         this.FEE = 0.0005;
 
         this.assets = {};
