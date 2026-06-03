@@ -1,10 +1,8 @@
 /**
  * trader.js
- * v73.3 - NATIVE ARCHITECTURE (Aligned with AdvanceStrategy V83.0)
- * Updates:
- * 1. FIXED: Subscribes exclusively to L1 Orderbook (100ms interval) for Exchange 1 Liquidity.
- * 2. FIXED: STRICTLY uses USD pairs (no USDT) for Delta Exchange perps/options.
- * 3. FIXED: Normalizes 'all_trades' side/taker_side so AdvanceStrategy doesn't miss volume.
+ * v74.0 - Migrated to new Delta public WebSocket
+ * - Endpoint: wss://public-socket.india.delta.exchange
+ * - Channels: trades (was all_trades), ob_l1 (was l1_orderbook)
  */
 
 const WebSocket = require('ws');
@@ -30,7 +28,7 @@ try {
 const config = {
     strategy: process.env.STRATEGY || 'Advance', 
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
-    wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
+    wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://public-socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
     apiSecret: process.env.DELTA_API_SECRET,
     logLevel: process.env.LOG_LEVEL || 'info',
@@ -249,7 +247,7 @@ class TradingBot {
         const tradeSymbols = this.targetAssets.map(asset => `${asset}USD`);
         
         this.logger.info(`Subscribing to: Orders, Positions, User Trades`);
-        this.logger.info(`Subscribing to L1 Orderbook & All Trades for: ${tradeSymbols.join(', ')}`);
+        this.logger.info(`Subscribing to ob_l1 & trades for: ${tradeSymbols.join(', ')}`);
         
         this.ws.send(JSON.stringify({ 
             type: 'subscribe', 
@@ -258,8 +256,8 @@ class TradingBot {
                     { name: 'orders', symbols: ['all'] },
                     { name: 'positions', symbols: ['all'] },
                     { name: 'user_trades', symbols: ['all'] },
-                    { name: 'all_trades', symbols: tradeSymbols },
-                    { name: 'l1_orderbook', symbols: tradeSymbols } 
+                    { name: 'trades', symbols: tradeSymbols },
+                    { name: 'ob_l1', symbols: tradeSymbols } 
                 ]
             }
         }));
@@ -285,11 +283,11 @@ class TradingBot {
         }
 
         switch (message.type) {
-            case 'l1_orderbook':
+            case 'ob_l1':
                 this.forwardQuoteToStrategy(message);
                 break;
 
-            case 'all_trades':
+            case 'trades':
                 const tradesData = Array.isArray(message.data) ? message.data : [message.data || message];
                 tradesData.forEach(t => {
                     if (t) {
