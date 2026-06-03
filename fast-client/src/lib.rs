@@ -274,9 +274,12 @@ pub struct TradeUpdate {
 }
 
 #[derive(Deserialize, Debug)]
-struct BinanceTradeMsg {
-    #[serde(rename = "e")]
-    event: Option<String>,
+struct BinanceTradeWrapper {
+    data: Option<BinanceTradeData>,
+}
+
+#[derive(Deserialize, Debug)]
+struct BinanceTradeData {
     #[serde(rename = "s")]
     symbol: Option<String>,
     #[serde(rename = "p")]
@@ -333,20 +336,22 @@ impl BinanceTradeListener {
                                             scratch_buffer.clear();
                                             scratch_buffer.extend_from_slice(&frame.payload);
 
-                                            if let Ok(parsed) = simd_json::from_slice::<BinanceTradeMsg>(&mut scratch_buffer) {
-                                                if let (Some(symbol), Some(price)) = (parsed.symbol, parsed.price) {
-                                                    let asset_name = symbol.replace("USDT", "");
-                                                    
-                                                    let update = TradeUpdate {
-                                                        s: asset_name,
-                                                        p: price.parse::<f64>().unwrap_or(0.0),
-                                                        q: parsed.quantity.unwrap_or_default().parse::<f64>().unwrap_or(0.0),
-                                                        t: parsed.trade_id.unwrap_or(0),
-                                                        ts: parsed.trade_time.unwrap_or(0),
-                                                        m: parsed.buyer_maker.unwrap_or(false),
-                                                    };
+                                            if let Ok(wrapper) = simd_json::from_slice::<BinanceTradeWrapper>(&mut scratch_buffer) {
+                                                if let Some(data) = wrapper.data {
+                                                    if let (Some(symbol), Some(price)) = (data.symbol, data.price) {
+                                                        let asset_name = symbol.replace("USDT", "");
+                                                        
+                                                        let update = TradeUpdate {
+                                                            s: asset_name,
+                                                            p: price.parse::<f64>().unwrap_or(0.0),
+                                                            q: data.quantity.unwrap_or_default().parse::<f64>().unwrap_or(0.0),
+                                                            t: data.trade_id.unwrap_or(0),
+                                                            ts: data.trade_time.unwrap_or(0),
+                                                            m: data.buyer_maker.unwrap_or(false),
+                                                        };
 
-                                                    callback.call(Ok(update), ThreadsafeFunctionCallMode::NonBlocking);
+                                                        callback.call(Ok(update), ThreadsafeFunctionCallMode::NonBlocking);
+                                                    }
                                                 }
                                             }
                                         }
