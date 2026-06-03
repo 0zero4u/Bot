@@ -106,10 +106,10 @@ class ArbBaselineStrategy {
 
     async executeTrade(symbol, side) {
         const specs = {
-            'BTC': { deltaId: 27, lot: 0.002 },
-            'ETH': { deltaId: 299, lot: 0.02 },
-            'XRP': { deltaId: 14969, lot: 20 },
-            'SOL': { deltaId: 417, lot: 0.2 }
+            'BTC': { deltaId: 27, precision: 1 },
+            'ETH': { deltaId: 299, precision: 2 },
+            'XRP': { deltaId: 14969, precision: 4 },
+            'SOL': { deltaId: 417, precision: 3 }
         };
 
         const spec = specs[symbol];
@@ -120,20 +120,27 @@ class ArbBaselineStrategy {
             return;
         }
 
+        const data = this.assets[symbol];
+        const entryPrice = side === 'buy' ? data.deltaPrice : data.deltaPrice;
+        const trailAmount = (entryPrice * 0.0002).toFixed(spec.precision);
+
         const payload = {
             product_id: spec.deltaId.toString(),
-            size: spec.lot.toString(),
+            size: "1",
             side: side,
             order_type: 'market_order',
+            bracket_trail_amount: trailAmount,
+            bracket_stop_trigger_method: "last_traded_price",
             client_order_id: `arb_${Date.now()}`
         };
 
         try {
-            this.logger.info(`[ArbBaseline] Placing order: ${side} ${spec.lot} ${symbol} @ market`);
+            this.logger.info(`[ArbBaseline] Placing order: ${side} 1 ${symbol} @ market`);
+            this.logger.info(`[ArbBaseline] Trail: ${trailAmount} (0.02% of ${entryPrice})`);
             const result = await this.bot.placeOrder(payload);
 
             if (result && result.success) {
-                this.logger.info(`[ArbBaseline] ✅ ORDER FILLED: ${symbol} ${side}`);
+                this.logger.info(`[ArbBaseline] ✅ ORDER FILLED: ${symbol} ${side} | Trail: ${trailAmount}`);
             } else {
                 this.logger.error(`[ArbBaseline] ❌ ORDER FAILED: ${JSON.stringify(result)}`);
             }
