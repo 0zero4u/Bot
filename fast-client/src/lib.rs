@@ -6,7 +6,7 @@ use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use serde_json::Value;
 
-// --- NEW IMPORTS FOR BINANCE LISTENER ---
+// --- BINANCE LISTENER IMPORTS ---
 use fast_websocket_client::{connect, OpCode};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use serde::Deserialize;
@@ -37,8 +37,8 @@ impl DeltaNativeClient {
         .tcp_nodelay(true) 
         .pool_idle_timeout(None) 
         .pool_max_idle_per_host(10)
-        .connect_timeout(Duration::from_millis(2500)) // Fail fast configuration
-        .timeout(Duration::from_millis(2500))         // Fail fast configuration
+        .connect_timeout(Duration::from_millis(2500))
+        .timeout(Duration::from_millis(2500))
         .user_agent("Mozilla/5.0 (compatible; DeltaBot/Native)")
         .build()
         .map_err(|e| Error::new(Status::GenericFailure, format!("Client build failed: {}", e)))?;
@@ -153,7 +153,7 @@ impl DeltaNativeClient {
 }
 
 // ==========================================
-// 2. BINANCE HFT WEBSOCKET LISTENER
+// 2. BINANCE DEPTH (bookTicker) LISTENER
 // ==========================================
 
 #[napi(object)]
@@ -166,13 +166,13 @@ pub struct DepthUpdate {
 }
 
 #[derive(Deserialize, Debug)]
-struct BinanceMsg {
-    data: Option<BinanceData>,
+struct BinanceDepthMsg {
+    data: Option<BinanceDepthData>,
 }
 
 #[derive(Deserialize, Debug)]
 #[allow(non_snake_case)]
-struct BinanceData {
+struct BinanceDepthData {
     s: String, 
     b: String, 
     B: String, 
@@ -200,10 +200,7 @@ impl BinanceListener {
 
         let url = format!("wss://fstream.binance.com/stream?streams={}", streams);
 
-        // Isolate the HFT listener into its own OS Thread.
         std::thread::spawn(move || {
-            
-            // Build a dedicated async engine exclusively for this thread
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -211,58 +208,46 @@ impl BinanceListener {
 
             rt.block_on(async move {
                 loop {
-                    println!("[Rust-Listener] ⚡ Connecting to Binance on dedicated CPU core...");
+                    println!("[Rust-Depth] ⚡ Connecting to Binance bookTicker...");
 
                     match connect(&url).await {
                         Ok(mut client) => {
-                            println!("[Rust-Listener] ✅ Connected & Streaming at SIMD speed.");
-
-                            // --- THE HFT FIX: REUSABLE SCRATCH BUFFER ---
-                            // Allocate memory exactly ONCE to prevent GC spikes and borrow checker errors
+                            println!("[Rust-Depth] ✅ Connected & Streaming.");
                             let mut scratch_buffer: Vec<u8> = Vec::with_capacity(1024);
 
                             loop {
                                 match client.receive_frame().await {
                                     Ok(frame) => {
                                         if frame.opcode == OpCode::Text {
-                                            
-                                            // 1. Clear old data without deallocating memory
                                             scratch_buffer.clear();
-                                            
-                                            // 2. Fast-copy the read-only network bytes into the mutable scratchpad
                                             scratch_buffer.extend_from_slice(&frame.payload);
 
-                                            // 3. simd-json safely mutates our scratch buffer using AVX2 registers
-                                            if let Ok(parsed) = simd_json::from_slice::<BinanceMsg>(&mut scratch_buffer) {
+                                            if let Ok(parsed) = simd_json::from_slice::<BinanceDepthMsg>(&mut scratch_buffer) {
                                                 if let Some(data) = parsed.data {
-                                                    
                                                     let asset_name = data.s.replace("USDT", "");
                                                     
-                                                    let bb = data.b.parse::<f64>().unwrap_or(0.0);
-                                                    let bq = data.B.parse::<f64>().unwrap_or(0.0);
-                                                    let ba = data.a.parse::<f64>().unwrap_or(0.0);
-                                                    let aq = data.A.parse::<f64>().unwrap_or(0.0);
-
                                                     let update = DepthUpdate {
                                                         s: asset_name,
-                                                        bb, bq, ba, aq,
+                                                        bb: data.b.parse::<f64>().unwrap_or(0.0),
+                                                        bq: data.B.parse::<f64>().unwrap_or(0.0),
+                                                        ba: data.a.parse::<f64>().unwrap_or(0.0),
+                                                        aq: data.A.parse::<f64>().unwrap_or(0.0),
                                                     };
 
-                                                    // Fire directly into the Node.js event loop asynchronously
                                                     callback.call(Ok(update), ThreadsafeFunctionCallMode::NonBlocking);
                                                 }
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        println!("[Rust-Listener] ⚠️ Stream Frame Error: {:?}", e);
+                                        println!("[Rust-Depth] ⚠️ Error: {:?}", e);
                                         break; 
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            println!("[Rust-Listener] ❌ Connection Failed: {}. Retrying in 5s...", e);
+                            println!("[Rust-Depth] ❌ Failed: {}. Retrying in 5s...", e);
                         }
                     }
                     sleep(Duration::from_secs(5)).await;
@@ -272,5 +257,116 @@ impl BinanceListener {
 
         Ok(())
     }
-  }
-                                
+}
+
+// ==========================================
+// 3. BINANCE TRADES LISTENER (NEW)
+// ==========================================
+
+#[napi(object)]
+pub struct TradeUpdate {
+    pub s: String,   // Symbol (e.g., "XRP")
+    pub p: f64,      // Trade price
+    pub q: f64,      // Trade quantity
+    pub t: i64,      // Trade ID
+    pub ts: i64,     // Trade time (ms)
+    pub m: bool,     // Is buyer maker
+}
+
+#[derive(Deserialize, Debug)]
+struct BinanceTradeMsg {
+    #[serde(rename = "e")]
+    event: Option<String>,
+    #[serde(rename = "s")]
+    symbol: Option<String>,
+    #[serde(rename = "p")]
+    price: Option<String>,
+    #[serde(rename = "q")]
+    quantity: Option<String>,
+    #[serde(rename = "t")]
+    trade_id: Option<i64>,
+    #[serde(rename = "T")]
+    trade_time: Option<i64>,
+    #[serde(rename = "m")]
+    buyer_maker: Option<bool>,
+}
+
+#[napi]
+pub struct BinanceTradeListener {}
+
+#[napi]
+impl BinanceTradeListener {
+    #[napi(constructor)]
+    pub fn new() -> Self {
+        BinanceTradeListener {}
+    }
+
+    #[napi]
+    pub fn start(&self, assets: Vec<String>, callback: ThreadsafeFunction<TradeUpdate>) -> Result<()> {
+        let streams = assets
+            .iter()
+            .map(|a| format!("{}usdt@trade", a.to_lowercase()))
+            .collect::<Vec<_>>()
+            .join("/");
+
+        let url = format!("wss://fstream.binance.com/stream?streams={}", streams);
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async move {
+                loop {
+                    println!("[Rust-Trades] ⚡ Connecting to Binance @trade...");
+
+                    match connect(&url).await {
+                        Ok(mut client) => {
+                            println!("[Rust-Trades] ✅ Connected & Streaming.");
+                            let mut scratch_buffer: Vec<u8> = Vec::with_capacity(1024);
+
+                            loop {
+                                match client.receive_frame().await {
+                                    Ok(frame) => {
+                                        if frame.opcode == OpCode::Text {
+                                            scratch_buffer.clear();
+                                            scratch_buffer.extend_from_slice(&frame.payload);
+
+                                            if let Ok(parsed) = simd_json::from_slice::<BinanceTradeMsg>(&mut scratch_buffer) {
+                                                if let (Some(symbol), Some(price)) = (parsed.symbol, parsed.price) {
+                                                    let asset_name = symbol.replace("USDT", "");
+                                                    
+                                                    let update = TradeUpdate {
+                                                        s: asset_name,
+                                                        p: price.parse::<f64>().unwrap_or(0.0),
+                                                        q: parsed.quantity.unwrap_or_default().parse::<f64>().unwrap_or(0.0),
+                                                        t: parsed.trade_id.unwrap_or(0),
+                                                        ts: parsed.trade_time.unwrap_or(0),
+                                                        m: parsed.buyer_maker.unwrap_or(false),
+                                                    };
+
+                                                    callback.call(Ok(update), ThreadsafeFunctionCallMode::NonBlocking);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("[Rust-Trades] ⚠️ Error: {:?}", e);
+                                        break; 
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("[Rust-Trades] ❌ Failed: {}. Retrying in 5s...", e);
+                        }
+                    }
+                    sleep(Duration::from_secs(5)).await;
+                }
+            });
+        });
+
+        Ok(())
+    }
+}

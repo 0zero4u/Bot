@@ -14,11 +14,13 @@ require('dotenv').config();
 
 // --- Rust Native Client Integration ---
 let DeltaClient;
-let BinanceListener; 
+let BinanceListener;
+let BinanceTradeListener;
 try {
     const fastClient = require('fast-client');
     DeltaClient = fastClient.DeltaNativeClient;
-    BinanceListener = fastClient.BinanceListener; 
+    BinanceListener = fastClient.BinanceListener;
+    BinanceTradeListener = fastClient.BinanceTradeListener;
 } catch (e) {
     console.warn("Native client not found, please ensure 'fast-client' is installed and built.");
     process.exit(1);
@@ -128,12 +130,13 @@ class TradingBot {
         await this.initWebSocket();
         this.startRestKeepAlive();
 
-        this.logger.info("⚡ Booting Native Rust Binance Listener...");
-        const binanceFeed = new BinanceListener();
+        this.logger.info("⚡ Booting Native Rust Binance Listeners...");
         
+        // Binance Depth (bookTicker) - for strategies that need L1 orderbook
+        const binanceFeed = new BinanceListener();
         binanceFeed.start(this.targetAssets, (err, update) => {
             if (err) {
-                this.logger.error(`[Binance Thread Error] ${err}`);
+                this.logger.error(`[Binance Depth Error] ${err}`);
                 return;
             }
             if (!update) return;
@@ -141,7 +144,7 @@ class TradingBot {
             if (!this.authenticated) {
                 const now = Date.now();
                 if (now - this.lastAuthWarning > 5000) { 
-                    this.logger.warn(`[Data Drop] ⚠️ Receiving Binance Data but Delta NOT Authenticated yet. Ignoring.`);
+                    this.logger.warn(`[Data Drop] ⚠️ Receiving Binance Depth but Delta NOT Authenticated yet.`);
                     this.lastAuthWarning = now;
                 }
                 return;
@@ -149,6 +152,21 @@ class TradingBot {
 
             if (this.strategy && typeof this.strategy.onDepthUpdate === 'function') {
                 this.strategy.onDepthUpdate(update);
+            }
+        });
+
+        // Binance Trades - for ArbBaselineStrategy
+        const binanceTrades = new BinanceTradeListener();
+        binanceTrades.start(this.targetAssets, (err, update) => {
+            if (err) {
+                this.logger.error(`[Binance Trade Error] ${err}`);
+                return;
+            }
+            if (!update) return;
+
+            // Trades don't need Delta auth - they're just price data
+            if (this.strategy && typeof this.strategy.onBinanceTrade === 'function') {
+                this.strategy.onBinanceTrade(update);
             }
         });
 
