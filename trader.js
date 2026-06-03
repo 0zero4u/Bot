@@ -128,45 +128,42 @@ class TradingBot {
         await this.initWebSocket();
         this.startRestKeepAlive();
 
-        this.logger.info("⚡ Booting Native Rust Binance Listeners...");
-        
-        // Binance Depth (bookTicker) - for strategies that need L1 orderbook
-        const binanceFeed = new BinanceListener();
-        binanceFeed.start(this.targetAssets, (err, update) => {
-            if (err) {
-                this.logger.error(`[Binance Depth Error] ${err}`);
-                return;
-            }
-            if (!update) return;
+        this.logger.info("⚡ Checking strategy requirements for Binance feeds...");
 
-            if (!this.authenticated) {
-                const now = Date.now();
-                if (now - this.lastAuthWarning > 5000) { 
-                    this.logger.warn(`[Data Drop] ⚠️ Receiving Binance Depth but Delta NOT Authenticated yet.`);
-                    this.lastAuthWarning = now;
+        const needsDepth = this.strategy && typeof this.strategy.onDepthUpdate === 'function' && this.strategy.onDepthUpdate.toString().length > 50;
+        const needsTrades = this.strategy && typeof this.strategy.onBinanceTrade === 'function' && this.strategy.onBinanceTrade.toString().length > 50;
+
+        if (needsDepth) {
+            this.logger.info("📊 Starting Binance bookTicker (strategy uses onDepthUpdate)...");
+            const binanceFeed = new BinanceListener();
+            binanceFeed.start(this.targetAssets, (err, update) => {
+                if (err) { this.logger.error(`[Binance Depth Error] ${err}`); return; }
+                if (!update) return;
+                if (!this.authenticated) {
+                    const now = Date.now();
+                    if (now - this.lastAuthWarning > 5000) {
+                        this.logger.warn(`[Data Drop] ⚠️ Binance Depth received but Delta NOT authenticated.`);
+                        this.lastAuthWarning = now;
+                    }
+                    return;
                 }
-                return;
-            }
-
-            if (this.strategy && typeof this.strategy.onDepthUpdate === 'function') {
                 this.strategy.onDepthUpdate(update);
-            }
-        });
+            });
+        } else {
+            this.logger.info("⏭️ Skipping Binance bookTicker (strategy doesn't use onDepthUpdate)");
+        }
 
-        // Binance Trades - for ArbBaselineStrategy
-        const binanceTrades = new BinanceTradeListener();
-        binanceTrades.start(this.targetAssets, (err, update) => {
-            if (err) {
-                this.logger.error(`[Binance Trade Error] ${err}`);
-                return;
-            }
-            if (!update) return;
-
-            // Trades don't need Delta auth - they're just price data
-            if (this.strategy && typeof this.strategy.onBinanceTrade === 'function') {
+        if (needsTrades) {
+            this.logger.info("📊 Starting Binance @trade (strategy uses onBinanceTrade)...");
+            const binanceTrades = new BinanceTradeListener();
+            binanceTrades.start(this.targetAssets, (err, update) => {
+                if (err) { this.logger.error(`[Binance Trade Error] ${err}`); return; }
+                if (!update) return;
                 this.strategy.onBinanceTrade(update);
-            }
-        });
+            });
+        } else {
+            this.logger.info("⏭️ Skipping Binance @trade (strategy doesn't use onBinanceTrade)");
+        }
 
         if (this.strategy && typeof this.strategy.start === 'function') {
             this.logger.info(`🚀 Starting Strategy Logic...`);
