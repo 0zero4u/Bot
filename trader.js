@@ -183,8 +183,8 @@ class TradingBot {
     startHeartbeat() {
         this.resetHeartbeatTimeout();
         this.pingInterval = setInterval(() => {
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                this.ws.send(JSON.stringify({ type: 'ping' }));
+            if (this.wsPrivate && this.wsPrivate.readyState === WebSocket.OPEN) {
+                this.wsPrivate.send(JSON.stringify({ type: 'ping' }));
             }
         }, this.config.pingIntervalMs);
     }
@@ -193,7 +193,7 @@ class TradingBot {
         clearTimeout(this.heartbeatTimeout);
         this.heartbeatTimeout = setTimeout(() => {
             this.logger.warn('Heartbeat timeout! No pong received. Terminating.');
-            if (this.ws) this.ws.terminate();
+            if (this.wsPrivate) this.wsPrivate.terminate();
         }, this.config.heartbeatTimeoutMs);
     }
 
@@ -203,74 +203,81 @@ class TradingBot {
     }
 
     async initWebSocket() {
-        this.logger.info(`Connecting to: ${this.config.wsURL}`);
-        this.ws = new WebSocket(this.config.wsURL);
+        this.logger.info(`Connecting to PUBLIC endpoint for trades...`);
+        this.ws = new WebSocket('wss://public-socket.india.delta.exchange');
 
-        this.ws.on('open', () => this.authenticateWebSocket());
+        this.ws.on('open', () => {
+            const tradeSymbols = this.targetAssets.map(asset => `${asset}USD`);
+            this.ws.send(JSON.stringify({
+                type: 'subscribe',
+                payload: { channels: [{ name: 'trades', symbols: tradeSymbols }] }
+            }));
+            this.logger.info(`✅ Public WS: Subscribed to trades`);
+        });
+
         this.ws.on('message', (data) => this.handleWebSocketMessage(JSON.parse(data.toString())));
-        this.ws.on('error', (error) => this.logger.error('WebSocket error:', error.message));
+        this.ws.on('error', (error) => this.logger.error('Public WS error:', error.message));
         this.ws.on('close', (code, reason) => {
-            this.logger.warn(`WebSocket disconnected: ${code} - ${reason}. Reconnecting...`);
-            this.stopHeartbeat();
-            this.authenticated = false;
+            this.logger.warn(`Public WS disconnected: ${code}. Reconnecting...`);
             setTimeout(() => this.initWebSocket(), this.config.reconnectInterval);
+        });
+
+        this.initPrivateWebSocket();
+    }
+
+    initPrivateWebSocket() {
+        this.logger.info(`Connecting to PRIVATE endpoint for orders...`);
+        this.wsPrivate = new WebSocket('wss://socket.india.delta.exchange');
+
+        this.wsPrivate.on('open', () => {
+            this.logger.info(`✅ Private WS connected, authenticating...`);
+            this.authenticatePrivate();
+        });
+
+        this.wsPrivate.on('message', (data) => this.handlePrivateMessage(JSON.parse(data.toString())));
+        this.wsPrivate.on('error', (error) => this.logger.error('Private WS error:', error.message));
+        this.wsPrivate.on('close', (code, reason) => {
+            this.logger.warn(`Private WS disconnected: ${code}. Reconnecting...`);
+            this.authenticated = false;
+            setTimeout(() => this.initPrivateWebSocket(), this.config.reconnectInterval);
         });
     }
 
-    authenticateWebSocket() {
-        const timestampNum = Math.floor(Date.now() / 1000);
-        const timestampStr = timestampNum.toString();
-
-        const signatureData = 'GET' + timestampStr + '/live';
+    authenticatePrivate() {
+        const timestamp = Math.floor(Date.now() / 1000).toString();
         const signature = crypto
             .createHmac('sha256', this.config.apiSecret)
-            .update(signatureData)
+            .update('GET' + timestamp + '/live')
             .digest('hex');
 
-        const payload = {
+        this.wsPrivate.send(JSON.stringify({
             type: 'key-auth',
-            payload: {
-                'api-key': this.config.apiKey,
-                timestamp: timestampStr,
-                signature: signature
-            }
-        };
-
-        this.ws.send(JSON.stringify(payload));
-    }
-
-    subscribeToChannels() {
-        // STRICTLY USING USD SUFFIX AS REQUESTED
-        const tradeSymbols = this.targetAssets.map(asset => `${asset}USD`);
-        
-        this.logger.info(`Subscribing to: Orders, Positions, User Trades`);
-        this.logger.info(`Subscribing to ob_l1 & trades for: ${tradeSymbols.join(', ')}`);
-        
-        this.ws.send(JSON.stringify({ 
-            type: 'subscribe', 
-            payload: { 
-                channels: [
-                    { name: 'orders', symbols: ['all'] },
-                    { name: 'positions', symbols: ['all'] },
-                    { name: 'user_trades', symbols: ['all'] },
-                    { name: 'trades', symbols: tradeSymbols },
-                    { name: 'ob_l1', symbols: tradeSymbols } 
-                ]
-            }
+            payload: { 'api-key': this.config.apiKey, timestamp, signature }
         }));
     }
 
-    handleWebSocketMessage(message) {
-        if (
-            (message.type === 'success' && message.message === 'Authenticated') ||
-            (message.type === 'key-auth' && message.status === 'authenticated') ||
-            (message.success === true && message.status === 'authenticated')
-        ) {
-            this.logger.info('✅ WebSocket AUTHENTICATED Successfully.');
-            this.authenticated = true;
-            this.subscribeToChannels();
-            this.startHeartbeat();
-            this.syncPositionState();
+    subscribePrivateChannels() {
+        this.wsPrivate.send(JSON.stringify({
+            type: 'subscribe',
+            payload: {
+                channels: [
+                    { name: 'orders', symbols: ['all'] },
+                    { name: 'positions', symbols: ['all'] },
+                    { name: 'user_trades', symbols: ['all'] }
+                ]
+            }
+        }));
+        this.logger.info(`✅ Private WS: Subscribed to orders, positions, user_trades`);
+    }
+
+    handlePrivateMessage(message) {
+        if (message.type === 'key-auth' && message.status === 'authenticated') {
+            if (!this.authenticated) {
+                this.logger.info(`✅ Private WS AUTHENTICATED`);
+                this.authenticated = true;
+                this.subscribePrivateChannels();
+                this.startHeartbeat();
+            }
             return;
         }
 
@@ -280,24 +287,21 @@ class TradingBot {
         }
 
         switch (message.type) {
-            case 'ob_l1':
-                this.forwardQuoteToStrategy(message);
-                break;
-
-            case 'trades':
-                const tradesData = Array.isArray(message.data) ? message.data : [message.data || message];
-                tradesData.forEach(t => {
-                    if (t) {
-                        this.forwardTradeToStrategy({
-                            ...t,
-                            symbol: message.symbol || t.symbol || message.product_symbol
-                        });
-                    }
-                });
-                break;
-
             case 'orders':
-                if (message.data) message.data.forEach(update => this.handleOrderUpdate(update));
+                if (message.action === 'snapshot') return;
+                if (message.data) {
+                    message.data.forEach(update => {
+                        this.handleOrderUpdate(update);
+                        if (this.strategy && typeof this.strategy.onOrderUpdate === 'function') {
+                            this.strategy.onOrderUpdate(update);
+                        }
+                    });
+                } else if (message.action) {
+                    this.handleOrderUpdate(message);
+                    if (this.strategy && typeof this.strategy.onOrderUpdate === 'function') {
+                        this.strategy.onOrderUpdate(message);
+                    }
+                }
                 break;
 
             case 'positions':
@@ -307,9 +311,34 @@ class TradingBot {
                     this.handlePositionUpdate(message);
                 }
                 break;
-            
+
             case 'user_trades':
                 this.measureLatency(message);
+                break;
+        }
+    }
+
+    handleWebSocketMessage(message) {
+        switch (message.type) {
+            case 'trades':
+                if (message.sy) {
+                    this.forwardTradeToStrategy({
+                        price: message.p,
+                        size: message.s,
+                        symbol: message.sy,
+                        timestamp: message.t
+                    });
+                } else {
+                    const tradesData = Array.isArray(message.data) ? message.data : [message.data || message];
+                    tradesData.forEach(t => {
+                        if (t) {
+                            this.forwardTradeToStrategy({
+                                ...t,
+                                symbol: message.symbol || t.symbol || message.product_symbol
+                            });
+                        }
+                    });
+                }
                 break;
         }
     }

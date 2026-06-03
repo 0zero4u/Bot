@@ -10,3 +10,6 @@ npm-debug.log
 # PM2 process files
 *.log
 *.pid
+fast-client/target/
+prices.csv
+node_modules/
