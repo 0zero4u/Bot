@@ -215,11 +215,18 @@ class TradingBot {
             this.logger.info(`✅ Public WS: Subscribed to trades`);
         });
 
-        this.ws.on('message', (data) => this.handleWebSocketMessage(JSON.parse(data.toString())));
+        this.ws.on('message', (data) => {
+            const msg = JSON.parse(data.toString());
+            this.logger.debug(`[WS RAW] type=${msg.type}`);
+            this.handleWebSocketMessage(msg);
+        });
         this.ws.on('error', (error) => this.logger.error('Public WS error:', error.message));
         this.ws.on('close', (code, reason) => {
             this.logger.warn(`Public WS disconnected: ${code}. Reconnecting...`);
             setTimeout(() => this.initWebSocket(), this.config.reconnectInterval);
+        });
+        this.ws.on('unexpected-response', (req, res) => {
+            this.logger.error(`[WS] Unexpected response: ${res.statusCode}`);
         });
 
         this.initPrivateWebSocket();
@@ -314,6 +321,9 @@ class TradingBot {
 
             case 'user_trades':
                 this.measureLatency(message);
+                if (this.strategy && typeof this.strategy.onUserTrade === 'function') {
+                    this.strategy.onUserTrade(message);
+                }
                 break;
         }
     }
@@ -327,16 +337,6 @@ class TradingBot {
                         size: message.s,
                         symbol: message.sy,
                         timestamp: message.t
-                    });
-                } else {
-                    const tradesData = Array.isArray(message.data) ? message.data : [message.data || message];
-                    tradesData.forEach(t => {
-                        if (t) {
-                            this.forwardTradeToStrategy({
-                                ...t,
-                                symbol: message.symbol || t.symbol || message.product_symbol
-                            });
-                        }
                     });
                 }
                 break;
@@ -360,7 +360,6 @@ class TradingBot {
 
     forwardTradeToStrategy(tradeData) {
         if (this.strategy && typeof this.strategy.onLaggerTrade === 'function') {
-            // Normalize side for AdvanceStrategy.js (handles delta's taker_side format)
             tradeData.side = tradeData.side || tradeData.taker_side || (tradeData.buyer_role === 'taker' ? 'buy' : 'sell');
             this.strategy.onLaggerTrade(tradeData);
         }
@@ -417,11 +416,19 @@ class TradingBot {
     }
     
     async placeOrder(orderData) {
+        const totalStart = process.hrtime.bigint();
+        
         if (orderData.client_order_id) {
             this.recordOrderPunch(orderData.client_order_id);
         }
+        
         try {
+            const t0 = process.hrtime.bigint();
             const result = await this.client.placeOrder(orderData);
+            const t1 = process.hrtime.bigint();
+            const nativeMs = Number(t1 - t0) / 1e6;
+            const overheadMs = Number(t0 - totalStart) / 1e6;
+            this.logger.info(`[TIMING] overhead: ${overheadMs.toFixed(2)}ms | native: ${nativeMs.toFixed(2)}ms`);
             
             if (result && !result.success) {
                  this.logger.error(`[ORDER REJECT] Native Client returned failure: ${JSON.stringify(result)}`);

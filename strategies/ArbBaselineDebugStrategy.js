@@ -18,15 +18,13 @@ class ArbBaselineStrategy {
                 deltaPrice: null,
                 divergenceHistory: [],
                 signalActive: false,
-                lastSignalTime: 0,
-                thresholdCrossedAt: null
+                lastSignalTime: 0
             };
         });
 
         this.COOLDOWN_MS = 30000;
         this.stats = { signals: 0, binanceTrades: 0, deltaTrades: 0 };
         this.openOrders = {};
-        this.pendingStopLoss = null;
 
         this.csvStream = fs.createWriteStream('/home/arshhtripathi/Bot/prices.csv', { flags: 'a' });
         this.csvStream.write('timestamp,binance,delta,divergence,baseline,above_baseline,signal\n');
@@ -102,6 +100,9 @@ class ArbBaselineStrategy {
         const data = this.assets[symbol];
         data.deltaPrice = parseFloat(trade.price);
         this.stats.deltaTrades++;
+        if (this.stats.deltaTrades % 10 === 0) {
+            this.logger.info(`[ArbBaseline] Delta trades: ${this.stats.deltaTrades} | Price: ${data.deltaPrice}`);
+        }
         this.checkSignal(symbol);
     }
 
@@ -134,50 +135,6 @@ class ArbBaselineStrategy {
         }
     }
 
-    onUserTrade(trade) {
-        if (trade.reason !== 'normal') return;
-        if (!trade.client_order_id || !trade.client_order_id.startsWith('arb_')) return;
-
-        const symbol = Object.keys(this.assets).find(s => trade.symbol?.includes(s));
-        if (!symbol) return;
-
-        const spec = { 'BTC': { deltaId: 27, precision: 1 }, 'ETH': { deltaId: 299, precision: 2 }, 'XRP': { deltaId: 14969, precision: 4 }, 'SOL': { deltaId: 417, precision: 3 } }[symbol];
-        if (!spec) return;
-
-        if (this.pendingStopLoss && this.pendingStopLoss.symbol === symbol) {
-            const fillPrice = parseFloat(trade.price);
-            const entryPrice = this.pendingStopLoss.entryPrice;
-            const trailPercent = 0.0003;
-            const trailAbs = (fillPrice * trailPercent).toFixed(spec.precision);
-            const trailAmount = this.pendingStopLoss.side === 'buy' ? `-${trailAbs}` : trailAbs;
-            const stopSide = this.pendingStopLoss.side === 'buy' ? 'sell' : 'buy';
-
-            this.logger.info(`[ArbBaseline] 🎯 FILL DETECTED: ${symbol} @ ${fillPrice}`);
-            this.logger.info(`  [DEBUG] entrySide=${this.pendingStopLoss.side} | stopSide=${stopSide}`);
-            this.logger.info(`  [DEBUG] entryPrice=${entryPrice} | fillPrice=${fillPrice} | diff=${(fillPrice - entryPrice).toFixed(4)}`);
-            this.logger.info(`[ArbBaseline] Placing stop: side=${stopSide} trail=${trailAmount}`);
-
-            this.bot.placeOrder({
-                product_id: spec.deltaId.toString(),
-                size: "1",
-                side: stopSide,
-                order_type: "market_order",
-                stop_order_type: "stop_loss_order",
-                trail_amount: trailAmount,
-                stop_trigger_method: "last_traded_price",
-                client_order_id: `arb_stop_${Date.now()}`
-            }).then(result => {
-                if (result && result.success) {
-                    this.logger.info(`[ArbBaseline] ✅ STOP PLACED: ${symbol}`);
-                } else {
-                    this.logger.error(`[ArbBaseline] ❌ STOP FAILED: ${JSON.stringify(result)}`);
-                }
-            });
-
-            this.pendingStopLoss = null;
-        }
-    }
-
     getBaseline(symbol) {
         const data = this.assets[symbol];
         const now = Date.now();
@@ -194,55 +151,45 @@ class ArbBaselineStrategy {
     checkSignal(symbol) {
         const data = this.assets[symbol];
 
-        if (!data.binancePrice || !data.deltaPrice || data.binancePrice === 0) return;
+        if (!data.binancePrice || !data.deltaPrice || data.binancePrice === 0) {
+            this.logger.info(`[DEBUG] Missing prices: binance=${data.binancePrice} delta=${data.deltaPrice}`);
+            return;
+        }
 
         const divergence = Math.abs(data.binancePrice - data.deltaPrice) / data.binancePrice;
         data.divergenceHistory.push({ ts: Date.now(), divergence });
 
         const baseline = this.getBaseline(symbol);
-        if (baseline === null) return;
+        const historyLen = data.divergenceHistory.length;
+
+        if (baseline === null) {
+            this.logger.info(`[DEBUG] No baseline yet: history=${historyLen}/10`);
+            return;
+        }
 
         const aboveBaseline = divergence - baseline;
         const aboveThreshold = aboveBaseline >= this.THRESHOLD;
         const cooldownActive = Date.now() - data.lastSignalTime < this.COOLDOWN_MS;
-        const now = Date.now();
 
-        // Urgency check: signal must spike within 50ms
-        if (aboveThreshold) {
-            if (!data.thresholdCrossedAt) {
-                data.thresholdCrossedAt = now;
-            }
-            const timeAboveThreshold = now - data.thresholdCrossedAt;
-            const isUrgent = timeAboveThreshold <= 10;
+        this.logger.info(`[DEBUG] ${symbol}: div=${(divergence*100).toFixed(4)}% base=${(baseline*100).toFixed(4)}% above=${(aboveBaseline*100).toFixed(4)}% thresh=${this.THRESHOLD*100}% | signal=${data.signalActive} cooldown=${cooldownActive} hist=${historyLen}`);
 
-            if (!isUrgent) {
-                // Grid move, not a spike - don't trade
-                return;
-            }
+        if (aboveThreshold && !data.signalActive && !cooldownActive) {
+            const side = data.deltaPrice > data.binancePrice ? 'buy' : 'sell';
+            const profit = (divergence - this.FEE) * 100;
 
-            if (!data.signalActive && !cooldownActive) {
-                const deltaHigher = data.deltaPrice > data.binancePrice;
-                const side = deltaHigher ? 'sell' : 'buy';
-                const profit = (divergence - this.FEE) * 100;
+            this.logger.info(`[ArbBaseline] 🎯 SIGNAL: ${symbol} ${side.toUpperCase()}`);
+            this.logger.info(`  Binance: ${data.binancePrice} | Delta: ${data.deltaPrice}`);
+            this.logger.info(`  Divergence: ${(divergence * 100).toFixed(4)}% | Baseline: ${(baseline * 100).toFixed(4)}%`);
+            this.logger.info(`  Above baseline: ${(aboveBaseline * 100).toFixed(4)}% | Profit: ${profit.toFixed(4)}%`);
 
-                this.logger.info(`[ArbBaseline] 🎯 SIGNAL: ${symbol} ${side.toUpperCase()}`);
-                this.logger.info(`  Binance: ${data.binancePrice} | Delta: ${data.deltaPrice}`);
-                this.logger.info(`  Divergence: ${(divergence * 100).toFixed(4)}% | Baseline: ${(baseline * 100).toFixed(4)}%`);
-                this.logger.info(`  Above baseline: ${(aboveBaseline * 100).toFixed(4)}% | Profit: ${profit.toFixed(4)}%`);
-                this.logger.info(`  [DEBUG] deltaHigher=${deltaHigher} | side=${side} | Delta-Binance=${(data.deltaPrice - data.binancePrice).toFixed(4)}`);
-                this.logger.info(`  [URGENCY] timeAboveThreshold=${timeAboveThreshold}ms ✅ URGENT`);
+            this.executeTrade(symbol, side);
+            data.signalActive = true;
+            data.lastSignalTime = Date.now();
+            this.stats.signals++;
 
-                this.executeTrade(symbol, side);
-                data.signalActive = true;
-                data.lastSignalTime = now;
-                this.stats.signals++;
-            }
-        } else {
-            // Reset threshold crossing time when below threshold
-            data.thresholdCrossedAt = null;
-            if (data.signalActive) {
-                data.signalActive = false;
-            }
+        } else if (!aboveThreshold && data.signalActive) {
+            data.signalActive = false;
+            this.logger.info(`[ArbBaseline] Signal deactivated: divergence dropped below threshold`);
         }
     }
 
@@ -265,6 +212,13 @@ class ArbBaselineStrategy {
         const data = this.assets[symbol];
         const entryPrice = data.deltaPrice;
         const OFFSET = 0.0003;
+        const trailPercent = 0.0003;
+        const trailAbs = (entryPrice * trailPercent).toFixed(spec.precision);
+        const trailAmount = side === 'buy' ? trailAbs : `-${trailAbs}`;
+
+        const limitPrice = side === 'buy'
+            ? (entryPrice * (1 + OFFSET)).toFixed(spec.precision)
+            : (entryPrice * (1 - OFFSET)).toFixed(spec.precision);
 
         this.logger.info(`[ArbBaseline] POSITION LOCK: ${symbol} = true`);
         this.bot.activePositions[symbol] = true;
@@ -273,25 +227,26 @@ class ArbBaselineStrategy {
             product_id: spec.deltaId.toString(),
             size: "1",
             side: side,
-            order_type: 'market_order',
+            order_type: 'limit_order',
+            limit_price: limitPrice,
+            time_in_force: 'ioc',
+            bracket_trail_amount: trailAmount,
+            bracket_stop_trigger_method: "last_traded_price",
             client_order_id: `arb_${Date.now()}`
         };
 
         try {
-            this.logger.info(`[ArbBaseline] ENTRY: ${side} 1 ${symbol} MARKET`);
-            this.logger.info(`  [DEBUG] Binance=${data.binancePrice} | Delta=${data.deltaPrice} | Delta-Binance=${(data.deltaPrice - data.binancePrice).toFixed(4)}`);
-            
-            const t0 = process.hrtime.bigint();
+            const stopPrice = side === 'sell' ? entryPrice + parseFloat(trailAbs) : entryPrice - parseFloat(trailAbs);
+            this.logger.info(`[ArbBaseline] ENTRY: ${side} 1 ${symbol} @ ${entryPrice}`);
+            this.logger.info(`[ArbBaseline] LIMIT: ${limitPrice} (offset: ${(OFFSET * 100).toFixed(2)}%)`);
+            this.logger.info(`[ArbBaseline] TRAIL: ${trailAmount} (${(trailPercent * 100).toFixed(1)}%)`);
+            this.logger.info(`[ArbBaseline] STOP: ${stopPrice.toFixed(spec.precision)}`);
             const result = await this.bot.placeOrder(payload);
-            const t1 = process.hrtime.bigint();
-            const totalMs = Number(t1 - t0) / 1e6;
-            this.logger.info(`[TIMING] placeOrder total: ${totalMs.toFixed(2)}ms`);
 
             if (result && result.success) {
-                this.logger.info(`[ArbBaseline] ✅ ORDER PLACED: ${symbol} ${side}`);
+                this.logger.info(`[ArbBaseline] ✅ ORDER PLACED: ${symbol} ${side} | Trail: ${trailAmount}`);
                 if (result.result?.id) {
                     this.openOrders[result.result.id] = { symbol, side, entryPrice };
-                    this.pendingStopLoss = { symbol, side, entryPrice, orderId: result.result.id };
                 }
             } else {
                 this.logger.error(`[ArbBaseline] ❌ ORDER FAILED: ${JSON.stringify(result)}`);
