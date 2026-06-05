@@ -263,18 +263,21 @@ class ArbBaselineStrategy {
             this.logger.info(`[ArbBaseline-CCXT] ENTRY: ${side} 1 ${ccxtSymbol} MARKET | Trail: ${trailAmount.toFixed(4)}`);
             this.logger.info(`  [DEBUG] Binance=${data.binancePrice} | Delta=${data.deltaPrice} | Delta-Binance=${(data.deltaPrice - data.binancePrice).toFixed(4)}`);
             
+            const stopLossPrice = side === 'buy' 
+                ? (entryPrice - trailAmount).toFixed(4)
+                : (entryPrice + trailAmount).toFixed(4);
+
             const t0 = Date.now();
             const order = await this.exchange.createOrder(ccxtSymbol, 'market', side, 1, undefined, {
-                'stopLossPrice': side === 'buy' 
-                    ? (entryPrice - trailAmount).toFixed(4)
-                    : (entryPrice + trailAmount).toFixed(4),
-                'stopLossTriggerPrice': entryPrice,
+                'bracket_stop_loss_price': stopLossPrice,
+                'bracket_trail_amount': trailAmount.toFixed(4),
+                'bracket_stop_trigger_method': 'last_traded_price',
             });
             const t1 = Date.now();
             const totalMs = t1 - t0;
             this.logger.info(`[TIMING] CCXT createOrder total: ${totalMs}ms`);
 
-            this.logger.info(`[ArbBaseline-CCXT] ✅ ORDER PLACED: ${symbol} ${side} | ID: ${order.id} | Latency: ${totalMs}ms`);
+            this.logger.info(`[ArbBaseline-CCXT] ✅ ORDER PLACED: ${symbol} ${side} | ID: ${order.id} | Latency: ${totalMs}ms | SL: ${stopLossPrice} | Trail: ${trailAmount.toFixed(4)}`);
             this.openOrders[order.id] = { symbol, side, entryPrice };
 
         } catch (error) {
