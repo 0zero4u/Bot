@@ -1,9 +1,0 @@
-/tmp/verify-rust/fast-client/target/debug/deps/fast_websocket_client-716d147e7c810eff.d: /home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/lib.rs /home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/base_client.rs /home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/client.rs /home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/proxy.rs /home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/tls_connector.rs
-
-/tmp/verify-rust/fast-client/target/debug/deps/libfast_websocket_client-716d147e7c810eff.rmeta: /home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/lib.rs /home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/base_client.rs /home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/client.rs /home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/proxy.rs /home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/tls_connector.rs
-
-/home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/lib.rs:
-/home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/base_client.rs:
-/home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/client.rs:
-/home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/proxy.rs:
-/home/arshhtripathi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fast_websocket_client-0.4.1/src/tls_connector.rs:
