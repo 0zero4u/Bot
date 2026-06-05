@@ -9,7 +9,7 @@ class ArbBaselineStrategy {
         this.BASELINE_WINDOW = 180000;
         this.THRESHOLD = 0.0007;
         this.FEE = 0.0005;
-        this.Z_THRESHOLD = 3.0;
+        this.Z_THRESHOLD = 1.5;
 
         this.exchange = new ccxt.delta({
             apiKey: process.env.DELTA_API_KEY,
@@ -207,15 +207,8 @@ class ArbBaselineStrategy {
             if (!data.signalActive && !cooldownActive) {
                 const deltaHigher = data.deltaPrice > data.binancePrice;
                 const side = deltaHigher ? 'sell' : 'buy';
-                const profit = (divergence - this.FEE) * 100;
 
-                this.logger.info(`[ArbBaseline-CCXT] 🎯 SIGNAL: ${symbol} ${side.toUpperCase()}`);
-                this.logger.info(`  Binance: ${data.binancePrice} | Delta: ${data.deltaPrice}`);
-                this.logger.info(`  Divergence: ${(divergence * 100).toFixed(4)}% | Baseline: ${(mean * 100).toFixed(4)}%`);
-                this.logger.info(`  Above baseline: ${(aboveBaseline * 100).toFixed(4)}% | Profit: ${profit.toFixed(4)}%`);
-                this.logger.info(`  [Z-SCORE] z=${zScore.toFixed(2)} | std=${(std * 100).toFixed(4)}% | threshold=${this.Z_THRESHOLD}`);
-                this.logger.info(`  [DEBUG] deltaHigher=${deltaHigher} | side=${side} | Delta-Binance=${(data.deltaPrice - data.binancePrice).toFixed(4)}`);
-                this.logger.info(`  [URGENCY] timeAboveThreshold=${timeAboveThreshold}ms ✅ URGENT`);
+                this.logger.info(`[ARB] ${symbol} ${side} | z=${zScore.toFixed(1)} | div=${(divergence * 100).toFixed(3)}%`);
 
                 this.executeTrade(symbol, side);
                 data.signalActive = true;
@@ -260,29 +253,18 @@ class ArbBaselineStrategy {
         this.bot.activePositions[symbol] = true;
 
         try {
-            this.logger.info(`[ArbBaseline-CCXT] ENTRY: ${side} 1 ${ccxtSymbol} MARKET | Trail: ${trailAmount.toFixed(4)}`);
-            this.logger.info(`  [DEBUG] Binance=${data.binancePrice} | Delta=${data.deltaPrice} | Delta-Binance=${(data.deltaPrice - data.binancePrice).toFixed(4)}`);
-            
-            const stopLossPrice = side === 'buy' 
-                ? (entryPrice - trailAmount).toFixed(4)
-                : (entryPrice + trailAmount).toFixed(4);
-
             const t0 = Date.now();
+            const trailValue = side === 'buy' ? -trailAmount : trailAmount;
             const order = await this.exchange.createOrder(ccxtSymbol, 'market', side, 1, undefined, {
-                'bracket_stop_loss_price': stopLossPrice,
-                'bracket_trail_amount': trailAmount.toFixed(4),
+                'bracket_trail_amount': trailValue.toFixed(4),
                 'bracket_stop_trigger_method': 'last_traded_price',
             });
-            const t1 = Date.now();
-            const totalMs = t1 - t0;
-            this.logger.info(`[TIMING] CCXT createOrder total: ${totalMs}ms`);
-
-            this.logger.info(`[ArbBaseline-CCXT] ✅ ORDER PLACED: ${symbol} ${side} | ID: ${order.id} | Latency: ${totalMs}ms | SL: ${stopLossPrice} | Trail: ${trailAmount.toFixed(4)}`);
+            const latency = Date.now() - t0;
+            this.logger.info(`[ORDER] ${side} ${symbol} | ${latency}ms | ID: ${order.id}`);
             this.openOrders[order.id] = { symbol, side, entryPrice };
 
         } catch (error) {
-            this.logger.error(`[ArbBaseline-CCXT] ❌ ORDER ERROR: ${error.message}`);
-            this.logger.info(`[ArbBaseline-CCXT] POSITION LOCK: ${symbol} = false (order error)`);
+            this.logger.error(`[ORDER] FAIL: ${error.message}`);
             this.bot.activePositions[symbol] = false;
         }
     }
