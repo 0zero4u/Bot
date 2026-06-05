@@ -1,0 +1,327 @@
+const fs = require('fs');
+const http = require('http');
+
+class ArbBaselineGoStrategy {
+    constructor(bot) {
+        this.bot = bot;
+        this.logger = bot.logger;
+
+        this.BASELINE_WINDOW = 180000;
+        this.THRESHOLD = 0.0007;
+        this.FEE = 0.0005;
+        this.Z_THRESHOLD = 1.5;
+
+        this.GO_EXECUTOR_URL = 'http://127.0.0.1:8083/order';
+
+        this.productIds = {
+            'XRP': '14969',
+            'BTC': '27',
+            'ETH': '299',
+            'SOL': '417'
+        };
+
+        this.assets = {};
+        const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
+
+        targets.forEach(symbol => {
+            this.assets[symbol] = {
+                binancePrice: null,
+                deltaPrice: null,
+                divergenceHistory: [],
+                signalActive: false,
+                lastSignalTime: 0,
+                thresholdCrossedAt: null
+            };
+        });
+
+        this.COOLDOWN_MS = 30000;
+        this.TRAILING_PERCENT = 0.03;
+        this.stats = { signals: 0, binanceTrades: 0, deltaTrades: 0, orders: 0 };
+        this.openOrders = {};
+
+        this.csvStream = fs.createWriteStream('/home/arshhtripathi/Bot/prices.csv', { flags: 'a' });
+        this.csvStream.write('timestamp,binance,delta,divergence,baseline,above_baseline,z_score,signal\n');
+
+        this.logger.info(`[ArbBaseline-Go] Loaded | Threshold: ${this.THRESHOLD * 100}% | Z-Score: ${this.Z_THRESHOLD} | Baseline: ${this.BASELINE_WINDOW / 1000}s | Cooldown: ${this.COOLDOWN_MS / 1000}s`);
+    }
+
+    getName() { return "ArbBaselineStrategy-Go"; }
+
+    async start() {
+        try {
+            const res = await this.httpGet('http://127.0.0.1:8083/health');
+            this.logger.info(`[ArbBaseline-Go] 🟢 Go executor connected`);
+        } catch (e) {
+            this.logger.error(`[ArbBaseline-Go] ❌ Go executor not running on :8083`);
+        }
+        this.startCsvLogging();
+        this.startPositionCheck();
+    }
+
+    httpGet(url) {
+        return new Promise((resolve, reject) => {
+            http.get(url, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve(data));
+            }).on('error', reject);
+        });
+    }
+
+    httpPost(url, body) {
+        return new Promise((resolve, reject) => {
+            const postData = JSON.stringify(body);
+            const options = {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(postData)
+                }
+            };
+
+            const req = http.request(url, options, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    try {
+                        resolve(JSON.parse(data));
+                    } catch (e) {
+                        resolve(data);
+                    }
+                });
+            });
+
+            req.on('error', reject);
+            req.write(postData);
+            req.end();
+        });
+    }
+
+    startPositionCheck() {
+        setInterval(async () => {
+            try {
+                const positions = await this.bot.client.getPositions();
+                const openPositions = positions.result?.filter(p => parseFloat(p.size) !== 0) || [];
+                
+                if (openPositions.length === 0 && Object.values(this.bot.activePositions).some(v => v)) {
+                    this.logger.info(`[ArbBaseline-Go] 🔄 POSITION CLOSED - resetting locks`);
+                    Object.keys(this.bot.activePositions).forEach(symbol => {
+                        if (this.bot.activePositions[symbol]) {
+                            this.bot.activePositions[symbol] = false;
+                            this.assets[symbol].signalActive = false;
+                        }
+                    });
+                }
+            } catch (e) {
+                this.logger.error(`[ArbBaseline-Go] Position check error: ${e.message}`);
+            }
+        }, 3000);
+    }
+
+    startCsvLogging() {
+        setInterval(() => {
+            const symbol = Object.keys(this.assets)[0];
+            const data = this.assets[symbol];
+            if (!data.binancePrice || !data.deltaPrice) return;
+
+            const divergence = Math.abs(data.binancePrice - data.deltaPrice) / data.binancePrice;
+            const baseline = this.getBaseline(symbol);
+            const mean = baseline ? baseline.mean : 0;
+            const std = baseline ? baseline.std : 0;
+            const aboveBaseline = baseline ? divergence - mean : 0;
+            const zScore = std > 1e-10 ? (divergence - mean) / std : 0;
+            const signal = data.signalActive ? 1 : 0;
+
+            this.csvStream.write(`${Date.now()},${data.binancePrice},${data.deltaPrice},${divergence.toFixed(6)},${mean.toFixed(6)},${aboveBaseline.toFixed(6)},${zScore.toFixed(2)},${signal}\n`);
+        }, 1000);
+    }
+
+    onBinanceTrade(update) {
+        const symbol = update.s;
+        const data = this.assets[symbol];
+        if (!data) return;
+
+        data.binancePrice = update.p;
+        this.stats.binanceTrades++;
+        if (this.stats.binanceTrades % 100 === 0) {
+            this.logger.info(`[ArbBaseline-Go] Binance trades: ${this.stats.binanceTrades} | Price: ${update.p}`);
+        }
+        this.checkSignal(symbol);
+    }
+
+    onLaggerTrade(trade) {
+        if (!trade.symbol) return;
+
+        const symbol = Object.keys(this.assets).find(k => trade.symbol.includes(k));
+        if (!symbol) return;
+
+        const data = this.assets[symbol];
+        data.deltaPrice = parseFloat(trade.price);
+        this.stats.deltaTrades++;
+        this.checkSignal(symbol);
+    }
+
+    onOrderUpdate(order) {
+        this.logger.info(`[ArbBaseline-Go] ORDER: ${order.action} | state=${order.state} | reason=${order.reason} | side=${order.side} | filled=${order.average_fill_price}`);
+
+        if (order.state === 'closed' && order.reason === 'fill') {
+            const symbol = Object.keys(this.assets).find(s => order.symbol?.includes(s));
+            if (!symbol) return;
+
+            if (order.side === 'sell' && this.bot.activePositions[symbol]) {
+                this.logger.info(`[ArbBaseline-Go] ✅ POSITION CLOSED: ${symbol} | exit_price=${order.average_fill_price}`);
+                this.bot.activePositions[symbol] = false;
+                this.assets[symbol].signalActive = false;
+            }
+        }
+
+        if (order.reason === 'stop_trigger') {
+            const symbol = Object.keys(this.assets).find(s => order.symbol?.includes(s));
+            if (symbol) {
+                this.logger.info(`[ArbBaseline-Go] 🛑 STOP TRIGGERED: ${symbol}`);
+                this.bot.activePositions[symbol] = false;
+                this.assets[symbol].signalActive = false;
+            }
+        }
+    }
+
+    onUserTrade(trade) {}
+
+    getBaseline(symbol) {
+        const data = this.assets[symbol];
+        const now = Date.now();
+        const cutoff = now - this.BASELINE_WINDOW;
+
+        data.divergenceHistory = data.divergenceHistory.filter(d => d.ts > cutoff);
+
+        if (data.divergenceHistory.length < 10) return null;
+
+        const n = data.divergenceHistory.length;
+        const sum = data.divergenceHistory.reduce((acc, d) => acc + d.divergence, 0);
+        const mean = sum / n;
+
+        const sumSqDiff = data.divergenceHistory.reduce((acc, d) => acc + Math.pow(d.divergence - mean, 2), 0);
+        const std = Math.sqrt(sumSqDiff / n);
+
+        return { mean, std };
+    }
+
+    checkSignal(symbol) {
+        const data = this.assets[symbol];
+
+        if (!data.binancePrice || !data.deltaPrice || data.binancePrice === 0) return;
+
+        const divergence = Math.abs(data.binancePrice - data.deltaPrice) / data.binancePrice;
+        data.divergenceHistory.push({ ts: Date.now(), divergence });
+
+        const baseline = this.getBaseline(symbol);
+        if (baseline === null) return;
+
+        const { mean, std } = baseline;
+        const zScore = std > 1e-10 ? (divergence - mean) / std : 0;
+
+        const aboveBaseline = divergence - mean;
+        const aboveThreshold = aboveBaseline >= this.THRESHOLD;
+        const zThresholdMet = Math.abs(zScore) >= this.Z_THRESHOLD;
+        const cooldownActive = Date.now() - data.lastSignalTime < this.COOLDOWN_MS;
+        const now = Date.now();
+
+        if (aboveThreshold && zThresholdMet) {
+            if (!data.thresholdCrossedAt) {
+                data.thresholdCrossedAt = now;
+            }
+            const timeAboveThreshold = now - data.thresholdCrossedAt;
+            const isUrgent = timeAboveThreshold <= 10;
+
+            if (!isUrgent) return;
+
+            if (!data.signalActive && !cooldownActive) {
+                const deltaHigher = data.deltaPrice > data.binancePrice;
+                const side = deltaHigher ? 'sell' : 'buy';
+                const profit = (divergence - this.FEE) * 100;
+
+                this.logger.info(`[ArbBaseline-Go] 🎯 SIGNAL: ${symbol} ${side.toUpperCase()}`);
+                this.logger.info(`  Binance: ${data.binancePrice} | Delta: ${data.deltaPrice}`);
+                this.logger.info(`  Divergence: ${(divergence * 100).toFixed(4)}% | Baseline: ${(mean * 100).toFixed(4)}%`);
+                this.logger.info(`  Above baseline: ${(aboveBaseline * 100).toFixed(4)}% | Profit: ${profit.toFixed(4)}%`);
+                this.logger.info(`  [Z-SCORE] z=${zScore.toFixed(2)} | std=${(std * 100).toFixed(4)}% | threshold=${this.Z_THRESHOLD}`);
+                this.logger.info(`  [URGENCY] timeAboveThreshold=${timeAboveThreshold}ms ✅ URGENT`);
+
+                this.executeTrade(symbol, side);
+                data.signalActive = true;
+                data.lastSignalTime = now;
+                this.stats.signals++;
+            }
+        } else {
+            data.thresholdCrossedAt = null;
+            if (data.signalActive) {
+                data.signalActive = false;
+            }
+        }
+    }
+
+    async executeTrade(symbol, side) {
+        const productId = this.productIds[symbol];
+        if (!productId) {
+            this.logger.error(`[ArbBaseline-Go] No product ID for ${symbol}`);
+            return;
+        }
+
+        if (this.bot.hasOpenPosition(symbol)) {
+            this.logger.info(`[ArbBaseline-Go] Skip ${symbol} - already in position`);
+            return;
+        }
+
+        const data = this.assets[symbol];
+        const entryPrice = data.deltaPrice;
+        const trailAmount = (entryPrice * this.TRAILING_PERCENT / 100).toFixed(4);
+
+        this.logger.info(`[ArbBaseline-Go] POSITION LOCK: ${symbol} = true`);
+        this.bot.activePositions[symbol] = true;
+
+        const orderReq = {
+            product_id: productId,
+            size: "1",
+            side: side,
+            order_type: "market_order",
+            trail_amount: trailAmount,
+            stop_trigger_method: "last_traded_price",
+            client_order_id: `arb_go_${Date.now()}`
+        };
+
+        try {
+            this.logger.info(`[ArbBaseline-Go] ENTRY: ${side} 1 ${symbol} MARKET | Trail: ${trailAmount}`);
+            this.logger.info(`  [DEBUG] Binance=${data.binancePrice} | Delta=${data.deltaPrice} | Delta-Binance=${(data.deltaPrice - data.binancePrice).toFixed(4)}`);
+
+            const t0 = Date.now();
+            const result = await this.httpPost(this.GO_EXECUTOR_URL, orderReq);
+            const t1 = Date.now();
+            const latency = t1 - t0;
+
+            this.stats.orders++;
+
+            if (result.success) {
+                this.logger.info(`[ArbBaseline-Go] ✅ ORDER PLACED: ${symbol} ${side} | Latency: ${latency}ms`);
+            } else {
+                this.logger.error(`[ArbBaseline-Go] ❌ ORDER FAILED: ${JSON.stringify(result)}`);
+                this.logger.info(`[ArbBaseline-Go] POSITION LOCK: ${symbol} = false (order failed)`);
+                this.bot.activePositions[symbol] = false;
+            }
+        } catch (error) {
+            this.logger.error(`[ArbBaseline-Go] ❌ ORDER ERROR: ${error.message}`);
+            this.logger.info(`[ArbBaseline-Go] POSITION LOCK: ${symbol} = false (order error)`);
+            this.bot.activePositions[symbol] = false;
+        }
+    }
+
+    onPositionClose(asset) {
+        this.logger.info(`[ArbBaseline-Go] POSITION CLOSED: ${asset} - resetting lock`);
+        this.bot.activePositions[asset] = false;
+        this.assets[asset].signalActive = false;
+    }
+
+    onExchange1Quote(msg) {}
+    onDepthUpdate(update) {}
+}
+
+module.exports = ArbBaselineGoStrategy;
