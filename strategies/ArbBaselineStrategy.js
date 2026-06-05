@@ -8,6 +8,7 @@ class ArbBaselineStrategy {
         this.BASELINE_WINDOW = 180000;
         this.THRESHOLD = 0.0007;
         this.FEE = 0.0005;
+        this.Z_THRESHOLD = 3.0;  // Z-score must exceed this (99.7% confidence)
 
         this.assets = {};
         const targets = (process.env.TARGET_ASSETS || 'XRP').split(',');
@@ -29,9 +30,9 @@ class ArbBaselineStrategy {
         this.pendingStopLoss = null;
 
         this.csvStream = fs.createWriteStream('/home/arshhtripathi/Bot/prices.csv', { flags: 'a' });
-        this.csvStream.write('timestamp,binance,delta,divergence,baseline,above_baseline,signal\n');
+        this.csvStream.write('timestamp,binance,delta,divergence,baseline,above_baseline,z_score,signal\n');
 
-        this.logger.info(`[ArbBaseline] Loaded | Threshold: ${this.THRESHOLD * 100}% | Baseline: ${this.BASELINE_WINDOW / 1000}s | Cooldown: ${this.COOLDOWN_MS / 1000}s`);
+        this.logger.info(`[ArbBaseline] Loaded | Threshold: ${this.THRESHOLD * 100}% | Z-Score: ${this.Z_THRESHOLD} | Baseline: ${this.BASELINE_WINDOW / 1000}s | Cooldown: ${this.COOLDOWN_MS / 1000}s`);
     }
 
     getName() { return "ArbBaselineStrategy"; }
@@ -73,10 +74,13 @@ class ArbBaselineStrategy {
 
             const divergence = Math.abs(data.binancePrice - data.deltaPrice) / data.binancePrice;
             const baseline = this.getBaseline(symbol);
-            const aboveBaseline = baseline ? divergence - baseline : 0;
+            const mean = baseline ? baseline.mean : 0;
+            const std = baseline ? baseline.std : 0;
+            const aboveBaseline = baseline ? divergence - mean : 0;
+            const zScore = std > 1e-10 ? (divergence - mean) / std : 0;
             const signal = data.signalActive ? 1 : 0;
 
-            this.csvStream.write(`${Date.now()},${data.binancePrice},${data.deltaPrice},${divergence.toFixed(6)},${baseline ? baseline.toFixed(6) : ''},${aboveBaseline.toFixed(6)},${signal}\n`);
+            this.csvStream.write(`${Date.now()},${data.binancePrice},${data.deltaPrice},${divergence.toFixed(6)},${mean.toFixed(6)},${aboveBaseline.toFixed(6)},${zScore.toFixed(2)},${signal}\n`);
         }, 1000);
     }
 
@@ -187,8 +191,15 @@ class ArbBaselineStrategy {
 
         if (data.divergenceHistory.length < 10) return null;
 
+        const n = data.divergenceHistory.length;
         const sum = data.divergenceHistory.reduce((acc, d) => acc + d.divergence, 0);
-        return sum / data.divergenceHistory.length;
+        const mean = sum / n;
+
+        // Calculate standard deviation
+        const sumSqDiff = data.divergenceHistory.reduce((acc, d) => acc + Math.pow(d.divergence - mean, 2), 0);
+        const std = Math.sqrt(sumSqDiff / n);
+
+        return { mean, std };
     }
 
     checkSignal(symbol) {
@@ -202,13 +213,16 @@ class ArbBaselineStrategy {
         const baseline = this.getBaseline(symbol);
         if (baseline === null) return;
 
-        const aboveBaseline = divergence - baseline;
+        const { mean, std } = baseline;
+        const zScore = std > 1e-10 ? (divergence - mean) / std : 0;
+
+        const aboveBaseline = divergence - mean;
         const aboveThreshold = aboveBaseline >= this.THRESHOLD;
+        const zThresholdMet = Math.abs(zScore) >= this.Z_THRESHOLD;
         const cooldownActive = Date.now() - data.lastSignalTime < this.COOLDOWN_MS;
         const now = Date.now();
 
-        // Urgency check: signal must spike within 50ms
-        if (aboveThreshold) {
+        if (aboveThreshold && zThresholdMet) {
             if (!data.thresholdCrossedAt) {
                 data.thresholdCrossedAt = now;
             }
@@ -216,7 +230,6 @@ class ArbBaselineStrategy {
             const isUrgent = timeAboveThreshold <= 10;
 
             if (!isUrgent) {
-                // Grid move, not a spike - don't trade
                 return;
             }
 
@@ -227,8 +240,9 @@ class ArbBaselineStrategy {
 
                 this.logger.info(`[ArbBaseline] 🎯 SIGNAL: ${symbol} ${side.toUpperCase()}`);
                 this.logger.info(`  Binance: ${data.binancePrice} | Delta: ${data.deltaPrice}`);
-                this.logger.info(`  Divergence: ${(divergence * 100).toFixed(4)}% | Baseline: ${(baseline * 100).toFixed(4)}%`);
+                this.logger.info(`  Divergence: ${(divergence * 100).toFixed(4)}% | Baseline: ${(mean * 100).toFixed(4)}%`);
                 this.logger.info(`  Above baseline: ${(aboveBaseline * 100).toFixed(4)}% | Profit: ${profit.toFixed(4)}%`);
+                this.logger.info(`  [Z-SCORE] z=${zScore.toFixed(2)} | std=${(std * 100).toFixed(4)}% | threshold=${this.Z_THRESHOLD}`);
                 this.logger.info(`  [DEBUG] deltaHigher=${deltaHigher} | side=${side} | Delta-Binance=${(data.deltaPrice - data.binancePrice).toFixed(4)}`);
                 this.logger.info(`  [URGENCY] timeAboveThreshold=${timeAboveThreshold}ms ✅ URGENT`);
 
@@ -238,7 +252,6 @@ class ArbBaselineStrategy {
                 this.stats.signals++;
             }
         } else {
-            // Reset threshold crossing time when below threshold
             data.thresholdCrossedAt = null;
             if (data.signalActive) {
                 data.signalActive = false;
