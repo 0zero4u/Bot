@@ -35,6 +35,7 @@ class ArbBaselineStrategy {
             this.symbolIndex.set(k + 'USD', k);
             this.symbolIndex.set(k + 'USDT', k);
             this.symbolIndex.set(k + '-USD', k);
+            this.symbolIndex.set(k + '-PERP', k);
         });
 
         this.csvStream = fs.createWriteStream('/home/arshhtripathi/Bot/prices.csv', { flags: 'a' });
@@ -188,6 +189,8 @@ class ArbBaselineStrategy {
                 } else {
                     this.logger.error(`[ArbBaseline] ❌ STOP FAILED: ${JSON.stringify(result)}`);
                 }
+            }).catch(err => {
+                this.logger.error(`[ArbBaseline] ❌ STOP ERROR: ${err.message}`);
             });
 
             this.pendingStopLoss = null;

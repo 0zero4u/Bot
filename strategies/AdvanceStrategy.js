@@ -98,6 +98,7 @@ class AdvanceStrategy {
             this.symbolIndex.set(k + 'USD', k);
             this.symbolIndex.set(k + 'USDT', k);
             this.symbolIndex.set(k + '-USD', k);
+            this.symbolIndex.set(k + '-PERP', k);
         });
 
         this.logger.info(`[Strategy] Loaded V83.3 (Hard SL + Trail TP) | SL/Trail: ${this.TRAILING_PERCENT}%`);

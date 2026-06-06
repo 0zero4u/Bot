@@ -215,9 +215,12 @@ class TradingBot {
         // Use native WebSocket ping/pong control frames (opcode 0x9/0xA)
         // instead of JSON text frames — avoids JSON serialization, GC pressure,
         // and is handled at the TCP level for lower latency.
-        this.wsPrivate.on('pong', () => {
+        this._pongHandler = () => {
             this.resetHeartbeatTimeout();
-        });
+        };
+        if (this.wsPrivate) {
+            this.wsPrivate.on('pong', this._pongHandler);
+        }
         this.pingInterval = setInterval(() => {
             if (this.wsPrivate && this.wsPrivate.readyState === WebSocket.OPEN) {
                 this.wsPrivate.ping();
@@ -236,6 +239,10 @@ class TradingBot {
     stopHeartbeat() {
         clearTimeout(this.heartbeatTimeout);
         clearInterval(this.pingInterval);
+        if (this.wsPrivate && this._pongHandler) {
+            this.wsPrivate.off('pong', this._pongHandler);
+        }
+        this._pongHandler = null;
     }
 
     async initWebSocket() {
@@ -276,6 +283,7 @@ class TradingBot {
         this.wsPrivate.on('message', (data) => this.handlePrivateMessage(JSON.parse(data)));
         this.wsPrivate.on('error', (error) => this.logger.error('Private WS error:', error.message));
         this.wsPrivate.on('close', (code, reason) => {
+            this.stopHeartbeat();
             this.logger.warn(`Private WS disconnected: ${code}. Reconnecting...`);
             this.authenticated = false;
             setTimeout(() => this.initPrivateWebSocket(), this.config.reconnectInterval);
@@ -370,7 +378,9 @@ class TradingBot {
                         price: message.p,
                         size: message.s,
                         symbol: message.sy,
-                        timestamp: message.t
+                        timestamp: message.t,
+                        buyer_role: message.buyer_role,
+                        taker_side: message.taker_side
                     });
                 }
                 break;
@@ -479,6 +489,10 @@ class TradingBot {
 
         const winner = await Promise.race([restCall, wsCall]);
 
+        // Always swallow restCall rejection — if REST hasn't resolved yet when we exit
+        // (e.g., WS timeout at 2s), the orphaned promise must not crash the process.
+        restCall.catch(() => {});
+
         if (winner && winner.source === 'ws') {
             // WS won — discard REST result (order already confirmed by exchange)
             this.orderAckWaiters.delete(cid);
@@ -519,8 +533,11 @@ class TradingBot {
     try {
         const bot = new TradingBot(config);
         await bot.start();
-        process.on('uncaughtException', async (err) => {
+        process.on('uncaughtException', (err) => {
             logger.error('Uncaught Exception:', err);
+        });
+        process.on('unhandledRejection', (reason) => {
+            logger.error('Unhandled Rejection:', reason);
         });
     } catch (error) {
         logger.error("Failed to start bot:", error);
