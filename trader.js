@@ -28,7 +28,7 @@ try {
 const config = {
     strategy: process.env.STRATEGY || 'Advance', 
     baseURL: process.env.DELTA_BASE_URL || 'https://api.india.delta.exchange',
-    wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://public-socket.india.delta.exchange',
+    wsURL: process.env.DELTA_WEBSOCKET_URL || 'wss://socket.india.delta.exchange',
     apiKey: process.env.DELTA_API_KEY,
     apiSecret: process.env.DELTA_API_SECRET,
     logLevel: process.env.LOG_LEVEL || 'info',
@@ -247,7 +247,7 @@ class TradingBot {
 
     async initWebSocket() {
         this.logger.info(`Connecting to PUBLIC endpoint for trades...`);
-        this.ws = new WebSocket('wss://public-socket.india.delta.exchange');
+        this.ws = new WebSocket(this.config.wsURL);
 
         this.ws.on('open', () => {
             this.ws.send(this.publicSubscribeMsg);
@@ -379,8 +379,7 @@ class TradingBot {
                         size: message.s,
                         symbol: message.sy,
                         timestamp: message.t,
-                        buyer_role: message.buyer_role,
-                        taker_side: message.taker_side
+                        buyer_role: message.buyer_role
                     });
                 }
                 break;
