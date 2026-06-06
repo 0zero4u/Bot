@@ -29,6 +29,14 @@ class ArbBaselineStrategy {
         this.openOrders = {};
         this.pendingStopLoss = null;
 
+        this.symbolIndex = new Map();
+        Object.keys(this.assets).forEach(k => {
+            this.symbolIndex.set(k, k);
+            this.symbolIndex.set(k + 'USD', k);
+            this.symbolIndex.set(k + 'USDT', k);
+            this.symbolIndex.set(k + '-USD', k);
+        });
+
         this.csvStream = fs.createWriteStream('/home/arshhtripathi/Bot/prices.csv', { flags: 'a' });
         this.csvStream.write('timestamp,binance,delta,divergence,baseline,above_baseline,z_score,signal\n');
 
@@ -100,7 +108,8 @@ class ArbBaselineStrategy {
     onLaggerTrade(trade) {
         if (!trade.symbol) return;
 
-        const symbol = Object.keys(this.assets).find(k => trade.symbol.includes(k));
+        const symbol = this.symbolIndex.get(trade.symbol) ||
+            Object.keys(this.assets).find(k => trade.symbol.includes(k));
         if (!symbol) return;
 
         const data = this.assets[symbol];
@@ -117,7 +126,8 @@ class ArbBaselineStrategy {
         }
 
         if (order.state === 'closed' && order.reason === 'fill') {
-            const symbol = Object.keys(this.assets).find(s => order.symbol?.includes(s));
+            const symbol = this.symbolIndex.get(order.symbol) ||
+                Object.keys(this.assets).find(s => order.symbol?.includes(s));
             if (!symbol) return;
 
             if (order.side === 'sell' && this.bot.activePositions[symbol]) {
@@ -129,7 +139,8 @@ class ArbBaselineStrategy {
         }
 
         if (order.reason === 'stop_trigger') {
-            const symbol = Object.keys(this.assets).find(s => order.symbol?.includes(s));
+            const symbol = this.symbolIndex.get(order.symbol) ||
+                Object.keys(this.assets).find(s => order.symbol?.includes(s));
             if (symbol) {
                 this.logger.info(`[ArbBaseline] 🛑 STOP TRIGGERED: ${symbol}`);
                 this.bot.activePositions[symbol] = false;
@@ -142,7 +153,8 @@ class ArbBaselineStrategy {
         if (trade.reason !== 'normal') return;
         if (!trade.client_order_id || !trade.client_order_id.startsWith('arb_')) return;
 
-        const symbol = Object.keys(this.assets).find(s => trade.symbol?.includes(s));
+        const symbol = this.symbolIndex.get(trade.symbol) ||
+            Object.keys(this.assets).find(s => trade.symbol?.includes(s));
         if (!symbol) return;
 
         const spec = { 'BTC': { deltaId: 27, precision: 1 }, 'ETH': { deltaId: 299, precision: 2 }, 'XRP': { deltaId: 14969, precision: 4 }, 'SOL': { deltaId: 417, precision: 3 } }[symbol];

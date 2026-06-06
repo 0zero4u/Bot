@@ -32,14 +32,19 @@ impl DeltaNativeClient {
   #[napi(constructor)]
   pub fn new(api_key: String, api_secret: String, base_url: Option<String>) -> Result<Self> {
     let url = base_url.unwrap_or_else(|| "https://api.india.delta.exchange".to_string());
+
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    default_headers.insert("api-key", api_key.as_str().parse().unwrap());
+    default_headers.insert("Content-Type", "application/json".parse().unwrap());
     
     let client = Client::builder()
+        .default_headers(default_headers)
         .tcp_nodelay(true) 
         .pool_idle_timeout(None) 
         .pool_max_idle_per_host(10)
-        .connect_timeout(Duration::from_millis(2500))
-        .timeout(Duration::from_millis(2500))
-        .user_agent("Mozilla/5.0 (compatible; DeltaBot/Native)")
+        .connect_timeout(Duration::from_millis(2000))
+        .timeout(Duration::from_millis(4000))
+        .user_agent("DeltaBot")
         .build()
         .map_err(|e| Error::new(Status::GenericFailure, format!("Client build failed: {}", e)))?;
 
@@ -52,7 +57,13 @@ impl DeltaNativeClient {
   }
 
   fn sign(&self, method: &str, path: &str, query: &str, body: &str, timestamp: &str) -> Result<String> {
-    let signature_data = format!("{}{}{}{}{}", method, timestamp, path, query, body);
+    let cap = method.len() + timestamp.len() + path.len() + query.len() + body.len();
+    let mut signature_data = String::with_capacity(cap);
+    signature_data.push_str(method);
+    signature_data.push_str(timestamp);
+    signature_data.push_str(path);
+    signature_data.push_str(query);
+    signature_data.push_str(body);
     
     let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes())
         .map_err(|_| Error::new(Status::GenericFailure, "Invalid API Secret"))?;
@@ -62,27 +73,49 @@ impl DeltaNativeClient {
     Ok(hex::encode(result.into_bytes()))
   }
 
+  fn get_timestamp_str(&self) -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string()
+  }
+
   #[napi]
   pub async fn place_order(&self, body: Value) -> Result<Value> {
     let path = "/v2/orders";
     let method = "POST";
     let body_str = body.to_string();
-    
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        .to_string();
-
-    let signature = self.sign(method, path, "", &body_str, &timestamp)?;
+    let ts = self.get_timestamp_str();
+    let signature = self.sign(method, path, "", &body_str, &ts)?;
 
     let res = self.client
         .post(format!("{}{}", self.base_url, path))
-        .header("api-key", &self.api_key)
-        .header("timestamp", &timestamp)
+        .header("timestamp", &ts)
         .header("signature", &signature)
-        .header("Content-Type", "application/json")
         .body(body_str)
+        .send()
+        .await
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Request failed: {}", e)))?;
+
+    let json: Value = res.json().await
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Parse failed: {}", e)))?;
+        
+    Ok(json)
+  }
+
+  #[napi]
+  pub async fn place_order_raw(&self, body_json: String) -> Result<Value> {
+    let path = "/v2/orders";
+    let method = "POST";
+    let ts = self.get_timestamp_str();
+    let signature = self.sign(method, path, "", &body_json, &ts)?;
+
+    let res = self.client
+        .post(format!("{}{}", self.base_url, path))
+        .header("timestamp", &ts)
+        .header("signature", &signature)
+        .body(body_json)
         .send()
         .await
         .map_err(|e| Error::new(Status::GenericFailure, format!("Request failed: {}", e)))?;
@@ -97,21 +130,13 @@ impl DeltaNativeClient {
   pub async fn get_wallet_balance(&self) -> Result<Value> {
     let path = "/v2/wallet/balances";
     let method = "GET";
-    
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        .to_string();
-
-    let signature = self.sign(method, path, "", "", &timestamp)?;
+    let ts = self.get_timestamp_str();
+    let signature = self.sign(method, path, "", "", &ts)?;
 
     let res = self.client
         .get(format!("{}{}", self.base_url, path))
-        .header("api-key", &self.api_key)
-        .header("timestamp", &timestamp)
+        .header("timestamp", &ts)
         .header("signature", &signature)
-        .header("Content-Type", "application/json")
         .send()
         .await
         .map_err(|e| Error::new(Status::GenericFailure, format!("Request failed: {}", e)))?;
@@ -126,21 +151,13 @@ impl DeltaNativeClient {
   pub async fn get_positions(&self) -> Result<Value> {
     let path = "/v2/positions/margined";
     let method = "GET";
-    
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        .to_string();
-
-    let signature = self.sign(method, path, "", "", &timestamp)?;
+    let ts = self.get_timestamp_str();
+    let signature = self.sign(method, path, "", "", &ts)?;
 
     let res = self.client
         .get(format!("{}{}", self.base_url, path))
-        .header("api-key", &self.api_key)
-        .header("timestamp", &timestamp)
+        .header("timestamp", &ts)
         .header("signature", &signature)
-        .header("Content-Type", "application/json")
         .send()
         .await
         .map_err(|e| Error::new(Status::GenericFailure, format!("Request failed: {}", e)))?;

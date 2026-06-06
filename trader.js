@@ -86,6 +86,35 @@ class TradingBot {
             this.activePositions[asset] = false;
         });
 
+        // Build O(1) symbol lookup Map for position/trade asset matching
+        // Pre-maps all common symbol formats (e.g. "XRP"→"XRP", "XRPUSD"→"XRP")
+        // to avoid O(n) linear scans on every incoming message.
+        this.symbolLookup = new Map();
+        this.targetAssets.forEach(a => {
+            this.symbolLookup.set(a, a);
+            this.symbolLookup.set(`${a}USD`, a);
+            this.symbolLookup.set(`${a}USDT`, a);
+            this.symbolLookup.set(`${a}-USD`, a);
+            this.symbolLookup.set(`${a}-PERP`, a);
+        });
+
+        // Pre-compute static WebSocket subscribe messages to avoid JSON
+        // serialization + allocation on every (re)connection.
+        this.publicSubscribeMsg = JSON.stringify({
+            type: 'subscribe',
+            payload: { channels: [{ name: 'trades', symbols: this.targetAssets.map(a => `${a}USD`) }] }
+        });
+        this.privateSubscribeMsg = JSON.stringify({
+            type: 'subscribe',
+            payload: {
+                channels: [
+                    { name: 'orders', symbols: ['all'] },
+                    { name: 'positions', symbols: ['all'] },
+                    { name: 'user_trades', symbols: ['all'] }
+                ]
+            }
+        });
+
         this.pingInterval = null; 
         this.heartbeatTimeout = null;
         this.restKeepAliveInterval = null;
@@ -182,9 +211,15 @@ class TradingBot {
 
     startHeartbeat() {
         this.resetHeartbeatTimeout();
+        // Use native WebSocket ping/pong control frames (opcode 0x9/0xA)
+        // instead of JSON text frames — avoids JSON serialization, GC pressure,
+        // and is handled at the TCP level for lower latency.
+        this.wsPrivate.on('pong', () => {
+            this.resetHeartbeatTimeout();
+        });
         this.pingInterval = setInterval(() => {
             if (this.wsPrivate && this.wsPrivate.readyState === WebSocket.OPEN) {
-                this.wsPrivate.send(JSON.stringify({ type: 'ping' }));
+                this.wsPrivate.ping();
             }
         }, this.config.pingIntervalMs);
     }
@@ -207,16 +242,12 @@ class TradingBot {
         this.ws = new WebSocket('wss://public-socket.india.delta.exchange');
 
         this.ws.on('open', () => {
-            const tradeSymbols = this.targetAssets.map(asset => `${asset}USD`);
-            this.ws.send(JSON.stringify({
-                type: 'subscribe',
-                payload: { channels: [{ name: 'trades', symbols: tradeSymbols }] }
-            }));
+            this.ws.send(this.publicSubscribeMsg);
             this.logger.info(`✅ Public WS: Subscribed to trades`);
         });
 
         this.ws.on('message', (data) => {
-            const msg = JSON.parse(data.toString());
+            const msg = JSON.parse(data); // Buffer accepted directly by JSON.parse in Node 20+
             this.logger.debug(`[WS RAW] type=${msg.type}`);
             this.handleWebSocketMessage(msg);
         });
@@ -241,7 +272,7 @@ class TradingBot {
             this.authenticatePrivate();
         });
 
-        this.wsPrivate.on('message', (data) => this.handlePrivateMessage(JSON.parse(data.toString())));
+        this.wsPrivate.on('message', (data) => this.handlePrivateMessage(JSON.parse(data)));
         this.wsPrivate.on('error', (error) => this.logger.error('Private WS error:', error.message));
         this.wsPrivate.on('close', (code, reason) => {
             this.logger.warn(`Private WS disconnected: ${code}. Reconnecting...`);
@@ -264,16 +295,7 @@ class TradingBot {
     }
 
     subscribePrivateChannels() {
-        this.wsPrivate.send(JSON.stringify({
-            type: 'subscribe',
-            payload: {
-                channels: [
-                    { name: 'orders', symbols: ['all'] },
-                    { name: 'positions', symbols: ['all'] },
-                    { name: 'user_trades', symbols: ['all'] }
-                ]
-            }
-        }));
+        this.wsPrivate.send(this.privateSubscribeMsg);
         this.logger.info(`✅ Private WS: Subscribed to orders, positions, user_trades`);
     }
 
@@ -285,11 +307,6 @@ class TradingBot {
                 this.subscribePrivateChannels();
                 this.startHeartbeat();
             }
-            return;
-        }
-
-        if (message.type === 'pong') {
-            this.resetHeartbeatTimeout();
             return;
         }
 
@@ -378,7 +395,8 @@ class TradingBot {
 
     handlePositionUpdate(pos) {
         if (!pos.product_symbol) return;
-        const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
+        const asset = this.symbolLookup.get(pos.product_symbol) ||
+            this.targetAssets.find(a => pos.product_symbol.startsWith(a));
         
         if (asset) {
             const size = parseFloat(pos.size);
@@ -403,7 +421,8 @@ class TradingBot {
             positions.forEach(pos => {
                 const size = parseFloat(pos.size);
                 if (size !== 0) {
-                    const asset = this.targetAssets.find(a => pos.product_symbol.startsWith(a));
+                    const asset = this.symbolLookup.get(pos.product_symbol) ||
+                        this.targetAssets.find(a => pos.product_symbol.startsWith(a));
                     if (asset) {
                         this.activePositions[asset] = true;
                     }

@@ -91,6 +91,15 @@ class AdvanceStrategy {
         });
 
         this.stats = { signals: 0, fills: 0, misses: 0 };
+
+        this.symbolIndex = new Map();
+        Object.keys(this.assets).forEach(k => {
+            this.symbolIndex.set(k, k);
+            this.symbolIndex.set(k + 'USD', k);
+            this.symbolIndex.set(k + 'USDT', k);
+            this.symbolIndex.set(k + '-USD', k);
+        });
+
         this.logger.info(`[Strategy] Loaded V83.3 (Hard SL + Trail TP) | SL/Trail: ${this.TRAILING_PERCENT}%`);
     }
 
@@ -102,7 +111,8 @@ class AdvanceStrategy {
 
     onExchange1Quote(msg) {
         if (!msg.symbol) return;
-        const asset = Object.keys(this.assets).find(k => msg.symbol.includes(k));
+        const asset = this.symbolIndex.get(msg.symbol) ||
+            Object.keys(this.assets).find(k => msg.symbol.includes(k));
         if (!asset) return;
 
         const data = this.assets[asset];
@@ -124,7 +134,8 @@ class AdvanceStrategy {
         const price = parseFloat(trade.price);
         const size = parseFloat(trade.size || trade.qty || 0);
         const side = trade.side; 
-        const asset = Object.keys(this.assets).find(k => trade.symbol && trade.symbol.includes(k));
+        const asset = this.symbolIndex.get(trade.symbol) ||
+            Object.keys(this.assets).find(k => trade.symbol && trade.symbol.includes(k));
         if (!asset) return;
 
         const data = this.assets[asset];

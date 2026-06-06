@@ -20,7 +20,7 @@ simd-json = "0.13"
 tokio = { version = "1", features = ["full"] }
 
 # High-Performance HTTP Client
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls", "http2"] }
 
 # Cryptography (HMAC SHA256)
 hmac = "0.12.1"
