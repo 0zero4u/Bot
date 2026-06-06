@@ -1,4 +1,4 @@
-# Delta Exchange Arbitrage Bot
+# Arbitrage Bot
 
 High-frequency cryptocurrency arbitrage trading bot for Delta Exchange (India) using Binance price signals.
 
