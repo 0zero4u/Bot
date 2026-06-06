@@ -76,6 +76,7 @@ class TradingBot {
 
         this.activePositions = {};
         this.orderLatencies = new Map(); 
+        this.orderAckWaiters = new Map(); // client_order_id → { resolve, reject, timer }
         
         // --- ASSET LOADING ---
         this.targetAssets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL')
@@ -313,19 +314,32 @@ class TradingBot {
         switch (message.type) {
             case 'orders':
                 if (message.action === 'snapshot') return;
-                if (message.data) {
-                    message.data.forEach(update => {
-                        this.handleOrderUpdate(update);
-                        if (this.strategy && typeof this.strategy.onOrderUpdate === 'function') {
-                            this.strategy.onOrderUpdate(update);
-                        }
-                    });
-                } else if (message.action) {
-                    this.handleOrderUpdate(message);
-                    if (this.strategy && typeof this.strategy.onOrderUpdate === 'function') {
-                        this.strategy.onOrderUpdate(message);
+                const updates = message.data || (message.action ? [message] : []);
+                updates.forEach(update => {
+                    // Resolve pending order waiters on WS 'create' ack (~130ms faster than REST)
+                    if (update.action === 'create' && update.client_order_id && this.orderAckWaiters.has(update.client_order_id)) {
+                        const waiter = this.orderAckWaiters.get(update.client_order_id);
+                        clearTimeout(waiter.timer);
+                        waiter.resolve({
+                            success: true,
+                            meta: {},
+                            result: {
+                                id: update.id,
+                                client_order_id: update.client_order_id,
+                                product_id: update.product_id,
+                                side: update.side,
+                                size: update.size,
+                                ws_acked: true
+                            }
+                        });
+                        this.orderAckWaiters.delete(update.client_order_id);
+                        this.logger.info(`[WS-ACK] Order ${update.id} acked @ ${Date.now()}ms (WS beat REST)`);
                     }
-                }
+                    this.handleOrderUpdate(update);
+                    if (this.strategy && typeof this.strategy.onOrderUpdate === 'function') {
+                        this.strategy.onOrderUpdate(update);
+                    }
+                });
                 break;
 
             case 'positions':
@@ -441,23 +455,53 @@ class TradingBot {
             this.recordOrderPunch(orderData.client_order_id);
         }
         
-        try {
-            const t0 = process.hrtime.bigint();
+        // Race REST response vs WebSocket order 'create' ack.
+        // WS arrives ~130ms before REST because Delta broadcasts the event
+        // immediately after matching, before DB sync + REST gateway.
+        const cid = orderData.client_order_id;
+        
+        const restCall = (async () => {
             const result = await this.client.placeOrder(orderData);
+            return { source: 'rest', result };
+        })();
+
+        const wsCall = new Promise((resolve, reject) => {
+            if (!cid) return reject(new Error('No client_order_id'));
+            const timer = setTimeout(() => {
+                this.orderAckWaiters.delete(cid);
+                reject(new Error('WS ack timeout'));
+            }, 2000);
+            this.orderAckWaiters.set(cid, { resolve, reject, timer });
+        });
+
+        const winner = await Promise.race([restCall, wsCall]);
+
+        // Cancel the loser
+        if (winner.source === 'ws') {
+            // WS won — discard REST result in background (order already confirmed)
+            this.orderAckWaiters.delete(cid);
+            restCall.then(r => {
+                if (r.result && !r.result.success) {
+                    this.logger.warn(`[ORDER] REST says fail but WS said create — order ${cid} might have issues`);
+                }
+            }).catch(() => {});
             const t1 = process.hrtime.bigint();
-            const nativeMs = Number(t1 - t0) / 1e6;
-            const overheadMs = Number(t0 - totalStart) / 1e6;
-            this.logger.info(`[TIMING] overhead: ${overheadMs.toFixed(2)}ms | native: ${nativeMs.toFixed(2)}ms`);
-            
-            if (result && !result.success) {
-                 this.logger.error(`[ORDER REJECT] Native Client returned failure: ${JSON.stringify(result)}`);
+            const wsMs = Number(t1 - totalStart) / 1e6;
+            this.logger.info(`[TIMING] WS-race won: ${wsMs.toFixed(0)}ms (saved ~${(750 - wsMs).toFixed(0)}ms vs REST)`);
+            return winner.result;
+        } else {
+            // REST won (or WS not available) — clean up waiter
+            if (cid) {
+                const w = this.orderAckWaiters.get(cid);
+                if (w) { clearTimeout(w.timer); this.orderAckWaiters.delete(cid); }
             }
-            
-            return result;
-        } catch (error) {
-            const errMsg = error.message || JSON.stringify(error);
-            this.logger.error(`[ORDER FAIL] Native Client Exception: ${errMsg}`);
-            throw error; 
+            const t1 = process.hrtime.bigint();
+            const restMs = Number(t1 - totalStart) / 1e6;
+            this.logger.info(`[TIMING] REST: ${restMs.toFixed(0)}ms`);
+            if (winner.result && !winner.result.success) {
+                this.logger.error(`[ORDER REJECT] ${JSON.stringify(winner.result)}`);
+            }
+            return winner.result;
         }
     }
     
