@@ -321,15 +321,18 @@ class TradingBot {
                         const waiter = this.orderAckWaiters.get(update.client_order_id);
                         clearTimeout(waiter.timer);
                         waiter.resolve({
-                            success: true,
-                            meta: {},
+                            source: 'ws',
                             result: {
-                                id: update.id,
-                                client_order_id: update.client_order_id,
-                                product_id: update.product_id,
-                                side: update.side,
-                                size: update.size,
-                                ws_acked: true
+                                success: true,
+                                meta: {},
+                                result: {
+                                    id: update.id,
+                                    client_order_id: update.client_order_id,
+                                    product_id: update.product_id,
+                                    side: update.side,
+                                    size: update.size,
+                                    ws_acked: true
+                                }
                             }
                         });
                         this.orderAckWaiters.delete(update.client_order_id);
@@ -465,20 +468,19 @@ class TradingBot {
             return { source: 'rest', result };
         })();
 
-        const wsCall = new Promise((resolve, reject) => {
-            if (!cid) return reject(new Error('No client_order_id'));
+        const wsCall = new Promise((resolve) => {
+            if (!cid) { resolve(null); return; }
             const timer = setTimeout(() => {
                 this.orderAckWaiters.delete(cid);
-                reject(new Error('WS ack timeout'));
+                resolve(null); // WS timed out, resolve null so REST wins
             }, 2000);
-            this.orderAckWaiters.set(cid, { resolve, reject, timer });
+            this.orderAckWaiters.set(cid, { resolve, reject: resolve, timer });
         });
 
         const winner = await Promise.race([restCall, wsCall]);
 
-        // Cancel the loser
-        if (winner.source === 'ws') {
-            // WS won — discard REST result in background (order already confirmed)
+        if (winner && winner.source === 'ws') {
+            // WS won — discard REST result (order already confirmed by exchange)
             this.orderAckWaiters.delete(cid);
             restCall.then(r => {
                 if (r.result && !r.result.success) {
@@ -490,7 +492,7 @@ class TradingBot {
             this.logger.info(`[TIMING] WS-race won: ${wsMs.toFixed(0)}ms (saved ~${(750 - wsMs).toFixed(0)}ms vs REST)`);
             return winner.result;
         } else {
-            // REST won (or WS not available) — clean up waiter
+            // REST won (or WS unavailable/timeout)
             if (cid) {
                 const w = this.orderAckWaiters.get(cid);
                 if (w) { clearTimeout(w.timer); this.orderAckWaiters.delete(cid); }
@@ -498,10 +500,10 @@ class TradingBot {
             const t1 = process.hrtime.bigint();
             const restMs = Number(t1 - totalStart) / 1e6;
             this.logger.info(`[TIMING] REST: ${restMs.toFixed(0)}ms`);
-            if (winner.result && !winner.result.success) {
+            if (winner && winner.result && !winner.result.success) {
                 this.logger.error(`[ORDER REJECT] ${JSON.stringify(winner.result)}`);
             }
-            return winner.result;
+            return winner ? winner.result : null;
         }
     }
     
