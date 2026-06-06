@@ -21,7 +21,7 @@ Binance WS ──► Rust BinanceListener ──► JS Strategy ──► Rust D
 | **Binance Listener** | Rust (`fast_websocket_client` + `simd-json`) | WebSocket trade/depth feeds, parsed with scratch-buffer reuse |
 | **Strategy Engine** | Node.js | Divergence detection, Z-score baseline, signal generation |
 | **Delta Client** | Rust (reqwest HTTP/2, napi-rs) | Authenticated REST orders, HMAC-SHA256 signing |
-| **Delta WS** | Node.js (`ws`) | Private order/position updates, heartbeat, trade acks |
+| **Delta WS** | Node.js (`ws`) | Public trades + private orders/positions on single endpoint `wss://socket.india.delta.exchange` |
 
 ---
 
@@ -150,7 +150,7 @@ Set via `STRATEGY=Advance` in `.env` or environment.
 
 ### 🚨 Critical
 
-1. **Order side defaults to `sell` if WS trade message has no `buyer_role`/`taker_side`** — `handleWebSocketMessage` now forwards these fields, but if Delta's `trades` channel drops them, all trades are classified as sells and `AdvanceStrategy`'s volume tracking breaks. Monitor `volSinceUpdateBuy` never incrementing.
+1. **Order side defaults to `sell` if WS trade message has no `buyer_role`** — `handleWebSocketMessage` forwards `message.buyer_role` (values: `"taker"` or `"maker"`). Side is determined by `buyer_role === 'taker'` (buy) vs `seller_role === 'taker'` (sell). There is **no** `taker_side` field in Delta's protocol (verified against CCXT, cryptofeed, OpenAlgo, official SDK). Monitor `volSinceUpdateBuy` never incrementing as a symptom.
 
 2. **WS heartbeat timeout can fire during reconnect** — If the private WS disconnects and `stopHeartbeat()` doesn't clear the old timeout before `initPrivateWebSocket()` creates a new socket, the old timeout can `.terminate()` the new connection. The fix is in place (F3), but ensure no other code path skips `stopHeartbeat()`.
 
@@ -166,12 +166,14 @@ Set via `STRATEGY=Advance` in `.env` or environment.
 
 | Issue | Status |
 |-------|--------|
+| `taker_side` field referenced (doesn't exist in Delta protocol) | ✅ Fixed — removed, uses `buyer_role` only |
+| `wss://public-socket.india.delta.exchange` used (not a real endpoint) | ✅ Fixed — now uses `wss://socket.india.delta.exchange` (single endpoint for all channels) |
 | `restCall` unhandled promise rejection | ✅ Fixed — `.catch()` attached unconditionally |
 | Heartbeat interval/pong listener leak on reconnect | ✅ Fixed — `stopHeartbeat()` on close, stored handler ref |
 | Missing `unhandledRejection` process handler | ✅ Fixed |
 | Stop-loss `.then()` without `.catch()` | ✅ Fixed |
 | Missing `-PERP` key in strategy `symbolIndex` Maps | ✅ Fixed |
-| WS legacy trade direction (`buyer_role`) not forwarded | ✅ Fixed |
+| WS trade `buyer_role` not forwarded | ✅ Fixed |
 
 ---
 
