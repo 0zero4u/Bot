@@ -19,11 +19,13 @@ class MonumentStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.FEE = 0.0006;                    // Delta round-trip fee: 0.06%
+        this.FEE = 0.0001;                    // Delta round-trip fee: 0.01% (testing)
         this.EMA_ALPHA = 0.02;                // EMA smoothing factor
         this.LAG_RATIO_THRESHOLD = 0.50;      // Formula 3: Min remaining opportunity
         this.COOLDOWN_MS = 30000;             // 30s cooldown between trades
         this.TRAILING_STOP_PCT = 0.0003;      // 0.03% trailing stop
+        this.REQUIRE_FLOW_CONFIRMATION = false; // F2: disabled for testing
+        this.REQUIRE_MOVE_TRACKING = true;     // F3: keep enabled to debug
 
         // --- ASSET SPECS ---
         this.specs = {
@@ -36,6 +38,9 @@ class MonumentStrategy {
         // --- STATE ---
         this.assets = {};
         const targets = (process.env.TARGET_ASSETS || 'BTC,ETH,XRP,SOL').split(',');
+        this.peakEdge = 0;
+        this.peakEdgeTime = null;
+        this.lastPeakLogThreshold = 0;
 
         targets.forEach(symbol => {
             this.assets[symbol] = {
@@ -53,7 +58,7 @@ class MonumentStrategy {
                 spreadHistory: [],
 
                 // Formula 3: Move tracking
-                moveStartPrice: null,
+                moveStartSpread: null,
                 edgeTriggeredAt: null,
 
                 // Trade state
@@ -79,6 +84,17 @@ class MonumentStrategy {
     }
 
     getName() { return "MonumentStrategy"; }
+
+    _logMissing(symbol, data) {
+        this._missingCount = (this._missingCount || 0) + 1;
+        if (this._missingCount % 1000 === 0) {
+            const missing = [];
+            if (!data.bidPrice) missing.push('Binance bid');
+            if (!data.askPrice) missing.push('Binance ask');
+            if (!data.deltaPrice) missing.push('Delta price');
+            this.logger.warn(`[Monument] ${symbol} waiting for: ${missing.join(', ')}`);
+        }
+    }
 
     async start() {
         this.logger.info(`[Monument] 🟢 Ready — Watching ${Object.keys(this.assets).join(', ')}`);
@@ -153,7 +169,6 @@ class MonumentStrategy {
         const data = this.assets[symbol];
         data.deltaPrice = parseFloat(trade.price);
         this.stats.deltaTrades++;
-
         this.checkSignal(symbol);
     }
 
@@ -256,20 +271,26 @@ class MonumentStrategy {
     calculateFormula3(symbol, pBinance, adjustedEdge) {
         const data = this.assets[symbol];
 
-        // Store move start price on first trigger
-        if (data.moveStartPrice === null) {
-            data.moveStartPrice = pBinance;
+        // Track SPREAD movement, not Binance price
+        // spread = pBinance - pDelta (but we use adjustedEdge which is already normalized)
+        if (data.moveStartSpread === null) {
+            data.moveStartSpread = adjustedEdge;
             data.edgeTriggeredAt = Date.now();
+            this.logger.debug(`[F3] ${symbol} | Set moveStartSpread=${(adjustedEdge * 100).toFixed(4)}%`);
         }
 
-        const moveSize = Math.abs(pBinance - data.moveStartPrice);
+        // How much has the spread changed since we first detected edge?
+        const spreadMove = Math.abs(adjustedEdge - data.moveStartSpread);
 
-        // Avoid division by zero
-        if (moveSize < 0.0001) return null;
+        // Debug: show spread movement
+        this.logger.debug(`[F3] ${symbol} | adjEdge=${(adjustedEdge * 100).toFixed(4)}% moveStart=${(data.moveStartSpread * 100).toFixed(4)}% spreadMove=${(spreadMove * 100).toFixed(6)}% (need > 0.0001)`);
 
-        const lagRatio = Math.abs(adjustedEdge) / moveSize;
+        // If spread hasn't moved enough, skip
+        if (spreadMove < 0.000001) return null;
 
-        return { moveSize, lagRatio, moveStartPrice: data.moveStartPrice };
+        const lagRatio = Math.abs(adjustedEdge) / spreadMove;
+
+        return { moveSize: spreadMove, lagRatio, moveStartPrice: data.moveStartSpread };
     }
 
     // =========================================================================
@@ -278,6 +299,12 @@ class MonumentStrategy {
 
     checkSignal(symbol) {
         const data = this.assets[symbol];
+
+        // Need both Binance and Delta prices
+        if (!data.bidPrice || !data.askPrice || !data.deltaPrice) {
+            this._logMissing(symbol, data);
+            return;
+        }
 
         // Formula 0: Calculate baseline spread
         const f0 = this.calculateFormula0(symbol);
@@ -289,15 +316,39 @@ class MonumentStrategy {
         const f1 = this.calculateFormula1(adjustedEdge, pBinance);
         const { edgePct, side } = f1;
 
+        // Track peak edge - only log at 0.02%, 0.04%, 0.06%, 0.08%
+        if (Math.abs(edgePct) > Math.abs(this.peakEdge)) {
+            this.peakEdge = edgePct;
+            this.peakEdgeTime = Date.now();
+            
+            const absEdge = Math.abs(edgePct);
+            const threshold = absEdge >= 0.08 ? 0.08 : absEdge >= 0.06 ? 0.06 : absEdge >= 0.04 ? 0.04 : 0.02;
+            if (threshold > this.lastPeakLogThreshold) {
+                this.lastPeakLogThreshold = threshold;
+                this.logger.info(`[Monument] 🔺 PEAK EDGE: ${edgePct.toFixed(4)}% (spread=${(spread*100).toFixed(4)}%)`);
+            }
+        }
+
+        // Periodic status logging (every 10s) - shows why no signal
+        this._statusCount = (this._statusCount || 0) + 1;
+        if (this._statusCount % 500 === 0) {
+            const blocker = !side ? `edge ${edgePct.toFixed(4)}% < ${this.FEE * 100}% fee` : 'checking...';
+            const peakAge = this.peakEdgeTime ? `${Math.round((Date.now() - this.peakEdgeTime) / 1000)}s ago` : 'none';
+            this.logger.info(`[Monument] ${symbol} | Binance=${pBinance.toFixed(4)} Delta=${pDelta.toFixed(4)} | Edge=${edgePct.toFixed(4)}% | Peak=${this.peakEdge.toFixed(4)}% (${peakAge}) | Blocker: ${blocker}`);
+        }
+
         // Check cooldown
         const cooldownActive = Date.now() - data.lastSignalTime < this.COOLDOWN_MS;
 
         // If no edge, reset move tracking
         if (!side) {
-            data.moveStartPrice = null;
+            data.moveStartSpread = null;
             data.edgeTriggeredAt = null;
             return;
         }
+
+        // F1 PASSED - log it
+        this.logger.info(`[Monument] ✅ F1 PASSED: ${symbol} ${side.toUpperCase()} edge=${edgePct.toFixed(4)}% (fee=${this.FEE * 100}%)`);
 
         // Formula 2: Chase safety filter
         const f2 = this.calculateFormula2(symbol);
@@ -306,29 +357,37 @@ class MonumentStrategy {
         const { midprice, microprice } = f2;
 
         // Check microprice confirms direction
-        let flowConfirmed = false;
-        if (side === 'buy') {
-            flowConfirmed = microprice > midprice; // Buy pressure
-        } else {
-            flowConfirmed = microprice < midprice; // Sell pressure
+        let flowConfirmed = true;
+        if (this.REQUIRE_FLOW_CONFIRMATION) {
+            if (side === 'buy') {
+                flowConfirmed = microprice > midprice;
+            } else {
+                flowConfirmed = microprice < midprice;
+            }
         }
 
         if (!flowConfirmed) {
-            // Reset move tracking if flow doesn't confirm
-            data.moveStartPrice = null;
+            this.logger.info(`[Monument] ${symbol} | Edge=${edgePct.toFixed(4)}% OK but F2 blocked: micro=${microprice.toFixed(4)} vs mid=${midprice.toFixed(4)}`);
+            data.moveStartSpread = null;
             data.edgeTriggeredAt = null;
             return;
         }
 
+        // F2 passed - log
+        this.logger.debug(`[Monument] F2 passed: micro=${microprice.toFixed(4)} mid=${midprice.toFixed(4)}`);
+
         // Formula 3: Remaining opportunity
         const f3 = this.calculateFormula3(symbol, pBinance, adjustedEdge);
-        if (!f3) return;
+        if (!f3) {
+            this.logger.info(`[Monument] ${symbol} | F1+F2 OK but F3 null (moveSize too small)`);
+            return;
+        }
 
         const { moveSize, lagRatio } = f3;
 
         if (lagRatio <= this.LAG_RATIO_THRESHOLD) {
-            // Delta has absorbed too much of the move, skip
-            data.moveStartPrice = null;
+            this.logger.info(`[Monument] ${symbol} | Edge OK, F2 OK, but F3 blocked: LagRatio=${lagRatio.toFixed(2)} <= ${this.LAG_RATIO_THRESHOLD}`);
+            data.moveStartSpread = null;
             data.edgeTriggeredAt = null;
             return;
         }
@@ -337,10 +396,10 @@ class MonumentStrategy {
         if (!data.signalActive && !cooldownActive) {
             this.logger.info(`[Monument] 🎯 SIGNAL: ${symbol} ${side.toUpperCase()}`);
             this.logger.info(`  Formula 0: Spread=${(spread * 100).toFixed(4)}% | Baseline=${(baseline * 100).toFixed(4)}% | AdjEdge=${(adjustedEdge * 100).toFixed(4)}%`);
-            this.logger.info(`  Formula 1: Edge%=${(edgePct * 100).toFixed(4)}% > ${(this.FEE * 100).toFixed(2)}% ✅`);
-            this.logger.info(`  Formula 2: Microprice=${microprice.toFixed(2)} vs Midprice=${midprice.toFixed(2)} ${side === 'buy' ? '>' : '<'} ✅`);
+            this.logger.info(`  Formula 1: Edge=${edgePct.toFixed(4)}% > ${this.FEE * 100}% fee ✅`);
+            this.logger.info(`  Formula 2: Microprice=${microprice.toFixed(4)} vs Midprice=${midprice.toFixed(4)} ${side === 'buy' ? '>' : '<'} ✅`);
             this.logger.info(`  Formula 3: LagRatio=${lagRatio.toFixed(2)} > ${this.LAG_RATIO_THRESHOLD} ✅`);
-            this.logger.info(`  [EXEC] Binance=${pBinance.toFixed(2)} | Delta=${pDelta.toFixed(2)} | MoveSize=${moveSize.toFixed(2)}`);
+            this.logger.info(`  [EXEC] Binance=${pBinance.toFixed(4)} | Delta=${pDelta.toFixed(4)} | MoveSize=${moveSize.toFixed(4)}`);
 
             this.executeTrade(symbol, side, pDelta);
             data.signalActive = true;
