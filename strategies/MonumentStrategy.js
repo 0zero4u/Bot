@@ -19,7 +19,7 @@ class MonumentStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.FEE = 0.0003;                    // Delta round-trip fee: 0.03% (testing)
+        this.FEE = 0.0008;                    // Delta round-trip fee: 0.08% (break-even threshold)
         this.EMA_ALPHA = 0.02;                // EMA smoothing factor
         this.LAG_RATIO_THRESHOLD = 0.50;      // Formula 3: Min remaining opportunity
         this.COOLDOWN_MS = 30000;             // 30s cooldown between trades
@@ -427,9 +427,6 @@ class MonumentStrategy {
         this.bot.activePositions[symbol] = true;
 
         // Calculate bracket SL/TP prices
-        const slPrice = side === 'buy' 
-            ? price * (1 - this.TRAILING_STOP_PCT)
-            : price * (1 + this.TRAILING_STOP_PCT);
         const trailAmount = (price * this.TRAILING_STOP_PCT).toFixed(spec.precision);
         
         const payload = {
@@ -438,14 +435,13 @@ class MonumentStrategy {
             side: side,
             order_type: 'market_order',
             client_order_id: `mon_${Date.now()}`,
-            bracket_stop_loss_price: slPrice.toFixed(spec.precision),
             bracket_trail_amount: trailAmount,
             bracket_stop_trigger_method: 'last_traded_price'
         };
 
         try {
             this.logger.info(`[Monument] ENTRY: ${side} ${payload.size} ${symbol} MARKET`);
-            this.logger.info(`  [DEBUG] Binance=${data.bidPrice} | Delta=${price} | SL=${slPrice.toFixed(spec.precision)}`);
+            this.logger.info(`  [DEBUG] Binance=${data.bidPrice} | Delta=${price} | Trail=${trailAmount}`);
             
             const t0 = process.hrtime.bigint();
             const result = await this.bot.placeOrder(payload);
@@ -454,7 +450,7 @@ class MonumentStrategy {
             this.logger.info(`[TIMING] placeOrder total: ${totalMs.toFixed(2)}ms`);
 
             if (result && result.success) {
-                this.logger.info(`[Monument] ✅ ORDER PLACED: ${symbol} ${side} (bracket SL=${slPrice.toFixed(spec.precision)})`);
+                this.logger.info(`[Monument] ✅ ORDER PLACED: ${symbol} ${side} (trail=${trailAmount})`);
             } else {
                 this.logger.error(`[Monument] ❌ ORDER FAILED: ${JSON.stringify(result)}`);
                 this.logger.info(`[Monument] POSITION LOCK: ${symbol} = false (order failed)`);
