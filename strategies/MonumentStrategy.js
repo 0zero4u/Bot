@@ -19,7 +19,7 @@ class MonumentStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.FEE = 0.0008;                    // Delta round-trip fee: 0.08% (break-even threshold)
+        this.FEE = 0.0005;                    // Delta round-trip fee: 0.05% threshold
         this.EMA_ALPHA = 0.02;                // EMA smoothing factor
         this.LAG_RATIO_THRESHOLD = 0.50;      // Formula 3: Min remaining opportunity
         this.COOLDOWN_MS = 30000;             // 30s cooldown between trades
@@ -426,8 +426,11 @@ class MonumentStrategy {
         this.logger.info(`[Monument] POSITION LOCK: ${symbol} = true`);
         this.bot.activePositions[symbol] = true;
 
-        // Calculate bracket SL/TP prices
-        const trailAmount = (price * this.TRAILING_STOP_PCT).toFixed(spec.precision);
+        // Calculate bracket trail amount (negative for buy, positive for sell)
+        const trailAbs = price * this.TRAILING_STOP_PCT;
+        const trailAmount = side === 'buy' 
+            ? (-trailAbs).toFixed(spec.precision)
+            : trailAbs.toFixed(spec.precision);
         
         const payload = {
             product_id: spec.deltaId.toString(),
