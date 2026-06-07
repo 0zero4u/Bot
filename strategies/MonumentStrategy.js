@@ -430,6 +430,7 @@ class MonumentStrategy {
         const slPrice = side === 'buy' 
             ? price * (1 - this.TRAILING_STOP_PCT)
             : price * (1 + this.TRAILING_STOP_PCT);
+        const trailAmount = (price * this.TRAILING_STOP_PCT).toFixed(spec.precision);
         
         const payload = {
             product_id: spec.deltaId.toString(),
@@ -438,6 +439,7 @@ class MonumentStrategy {
             order_type: 'market_order',
             client_order_id: `mon_${Date.now()}`,
             bracket_stop_loss_price: slPrice.toFixed(spec.precision),
+            bracket_trail_amount: trailAmount,
             bracket_stop_trigger_method: 'last_traded_price'
         };
 
