@@ -19,11 +19,11 @@ class MonumentStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.FEE = 0.0001;                    // Delta round-trip fee: 0.01% (testing)
+        this.FEE = 0.0003;                    // Delta round-trip fee: 0.03% (testing)
         this.EMA_ALPHA = 0.02;                // EMA smoothing factor
         this.LAG_RATIO_THRESHOLD = 0.50;      // Formula 3: Min remaining opportunity
         this.COOLDOWN_MS = 30000;             // 30s cooldown between trades
-        this.TRAILING_STOP_PCT = 0.0003;      // 0.03% trailing stop
+        this.TRAILING_STOP_PCT = 0.0002;      // 0.02% trailing stop
         this.REQUIRE_FLOW_CONFIRMATION = false; // F2: disabled for testing
         this.REQUIRE_MOVE_TRACKING = true;     // F3: keep enabled to debug
 
@@ -423,22 +423,28 @@ class MonumentStrategy {
 
         const data = this.assets[symbol];
 
-        // Set position lock
         this.logger.info(`[Monument] POSITION LOCK: ${symbol} = true`);
         this.bot.activePositions[symbol] = true;
 
+        // Calculate bracket SL/TP prices
+        const slPrice = side === 'buy' 
+            ? price * (1 - this.TRAILING_STOP_PCT)
+            : price * (1 + this.TRAILING_STOP_PCT);
+        
         const payload = {
             product_id: spec.deltaId.toString(),
             size: process.env.ORDER_SIZE || "1",
             side: side,
             order_type: 'market_order',
-            client_order_id: `mon_${Date.now()}`
+            client_order_id: `mon_${Date.now()}`,
+            bracket_stop_loss_price: slPrice.toFixed(spec.precision),
+            bracket_stop_trigger_method: 'last_traded_price'
         };
 
         try {
             this.logger.info(`[Monument] ENTRY: ${side} ${payload.size} ${symbol} MARKET`);
-            this.logger.info(`  [DEBUG] Binance=${this.assets[symbol].bidPrice} | Delta=${price}`);
-
+            this.logger.info(`  [DEBUG] Binance=${data.bidPrice} | Delta=${price} | SL=${slPrice.toFixed(spec.precision)}`);
+            
             const t0 = process.hrtime.bigint();
             const result = await this.bot.placeOrder(payload);
             const t1 = process.hrtime.bigint();
@@ -446,10 +452,7 @@ class MonumentStrategy {
             this.logger.info(`[TIMING] placeOrder total: ${totalMs.toFixed(2)}ms`);
 
             if (result && result.success) {
-                this.logger.info(`[Monument] ✅ ORDER PLACED: ${symbol} ${side}`);
-                if (result.result?.id) {
-                    this.pendingStopLoss = { symbol, side, entryPrice: price, orderId: result.result.id };
-                }
+                this.logger.info(`[Monument] ✅ ORDER PLACED: ${symbol} ${side} (bracket SL=${slPrice.toFixed(spec.precision)})`);
             } else {
                 this.logger.error(`[Monument] ❌ ORDER FAILED: ${JSON.stringify(result)}`);
                 this.logger.info(`[Monument] POSITION LOCK: ${symbol} = false (order failed)`);
@@ -493,6 +496,7 @@ class MonumentStrategy {
     }
 
     onUserTrade(trade) {
+        // Bracket orders handle SL atomically - no separate stop placement needed
         if (trade.reason !== 'normal') return;
         if (!trade.client_order_id || !trade.client_order_id.startsWith('mon_')) return;
 
@@ -500,40 +504,7 @@ class MonumentStrategy {
             Object.keys(this.assets).find(s => trade.symbol?.includes(s));
         if (!symbol) return;
 
-        const spec = this.specs[symbol];
-        if (!spec) return;
-
-        if (this.pendingStopLoss && this.pendingStopLoss.symbol === symbol) {
-            const fillPrice = parseFloat(trade.price);
-            const side = this.pendingStopLoss.side;
-            const trailAbs = (fillPrice * this.TRAILING_STOP_PCT).toFixed(spec.precision);
-            const trailAmount = side === 'buy' ? `-${trailAbs}` : trailAbs;
-            const stopSide = side === 'buy' ? 'sell' : 'buy';
-
-            this.logger.info(`[Monument] 🎯 FILL: ${symbol} @ ${fillPrice}`);
-            this.logger.info(`[Monument] Placing stop: side=${stopSide} trail=${trailAmount}`);
-
-            this.bot.placeOrder({
-                product_id: spec.deltaId.toString(),
-                size: process.env.ORDER_SIZE || "1",
-                side: stopSide,
-                order_type: "market_order",
-                stop_order_type: "stop_loss_order",
-                trail_amount: trailAmount,
-                stop_trigger_method: "last_traded_price",
-                client_order_id: `mon_stop_${Date.now()}`
-            }).then(result => {
-                if (result && result.success) {
-                    this.logger.info(`[Monument] ✅ STOP PLACED: ${symbol}`);
-                } else {
-                    this.logger.error(`[Monument] ❌ STOP FAILED: ${JSON.stringify(result)}`);
-                }
-            }).catch(err => {
-                this.logger.error(`[Monument] ❌ STOP ERROR: ${err.message}`);
-            });
-
-            this.pendingStopLoss = null;
-        }
+        this.logger.info(`[Monument] 🎯 FILL: ${symbol} @ ${trade.price}`);
     }
 
     onPositionClose(asset) {
