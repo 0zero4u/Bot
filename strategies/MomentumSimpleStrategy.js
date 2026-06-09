@@ -25,7 +25,11 @@ class MomentumSimpleStrategy {
         this.FEE = parseFloat(process.env.MONUMENT_FEE || '0.0005');
         this.EMA_ALPHA = 0.02;
         this.COOLDOWN_MS = 30000;
-        this.TRAILING_STOP_PCT = 0.0002;
+        
+        // Delta Exchange bracket_trail_amount is ABSOLUTE price, NOT percentage
+        // XRPUSD tick_size = 0.0001 (verified via API)
+        // Sign convention: POSITIVE for buy, NEGATIVE for sell (per Delta docs)
+        this.TRAILING_STOP_AMOUNT = '0.0001';  // 1 tick = ~0.00857%
 
         // --- ASSET SPECS ---
         this.specs = {
@@ -253,10 +257,9 @@ class MomentumSimpleStrategy {
         this.bot.activePositions[symbol] = true;
         this.lastTradeSide = side;
 
-        const trailAbs = price * this.TRAILING_STOP_PCT;
         const trailAmount = side === 'buy' 
-            ? (-trailAbs).toFixed(spec.precision)
-            : trailAbs.toFixed(spec.precision);
+            ? this.TRAILING_STOP_AMOUNT
+            : `-${this.TRAILING_STOP_AMOUNT}`;
         
         const payload = {
             product_id: spec.deltaId.toString(),
