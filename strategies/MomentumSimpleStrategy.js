@@ -47,18 +47,18 @@ class MomentumSimpleStrategy {
         this.COOLDOWN_MS = 30000;
         
         // Delta Exchange bracket_trail_amount is ABSOLUTE price, NOT percentage
-        // XRPUSD tick_size = 0.0001 (verified via API)
         // Sign convention: NEGATIVE for buy, POSITIVE for sell (verified via live API)
         // Trail = 0.02% of entry price (dynamic, calculated per trade)
         this.TRAILING_STOP_PCT = 0.0002;  // 0.02% trailing stop
-        this.TICK_SIZE = 0.0001;           // XRPUSD tick size
+        // TICK_SIZE is now per-asset in specs
 
         // --- ASSET SPECS ---
         this.specs = {
-            'BTC': { deltaId: 27, precision: 1 },
-            'ETH': { deltaId: 299, precision: 2 },
-            'XRP': { deltaId: 14969, precision: 4 },
-            'SOL': { deltaId: 417, precision: 3 }
+            'BTC': { deltaId: 27, precision: 1, tickSize: 0.1 },
+            'ETH': { deltaId: 299, precision: 2, tickSize: 0.01 },
+            'XRP': { deltaId: 14969, precision: 4, tickSize: 0.0001 },
+            'SOL': { deltaId: 417, precision: 3, tickSize: 0.001 },
+            'DOGE': { deltaId: 14745, precision: 6, tickSize: 0.000001 }
         };
 
         // --- STATE ---
@@ -283,8 +283,9 @@ class MomentumSimpleStrategy {
 
         // Calculate trail amount dynamically: 0.02% of entry price, rounded to tick
         const trailAbs = price * this.TRAILING_STOP_PCT;
-        const trailTicks = Math.round(trailAbs / this.TICK_SIZE);
-        const trailAmount = (trailTicks * this.TICK_SIZE).toFixed(4);
+        const tickSize = spec.tickSize || 0.0001;
+        const trailTicks = Math.round(trailAbs / tickSize);
+        const trailAmount = (trailTicks * tickSize).toFixed(spec.precision || 4);
         
         // Sign convention: NEGATIVE for buy, POSITIVE for sell
         const signedTrail = side === 'buy' ? `-${trailAmount}` : trailAmount;
