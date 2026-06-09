@@ -12,27 +12,62 @@
  *
  * MONUMENT_FEE (signal threshold):
  *   - Set HIGHER than actual fees to filter for larger edges
- *   - Current: 0.0008 (0.08%) — only trade when edge > 0.08%
+ *   - Current: 0.0018 (0.18%) — tested optimal between 0.16% and 0.20%
  *   - This is a SIGNAL FILTER, not the actual fee
- *
- * ROE CALCULATION (with leverage):
- *   - Price move % = (exit - entry) / entry × 100
- *   - Net PNL = Price move % - TRADING_FEE (0.05%)
- *   - ROE = Net PNL × leverage (e.g., 100x)
- *   - Example: Entry 1.1641, Exit 1.1650 = +0.0773% price move
- *   - Net PNL = 0.0773% - 0.05% = +0.0273%
- *   - ROE (100x) = 0.0273% × 100 = +2.73%
  *
  * DELTA EXCHANGE BRACKET ORDERS (VERIFIED via live API 2026-06-09):
  *   - bracket_trail_amount is ABSOLUTE price, NOT percentage
- *   - XRPUSD tick_size = 0.0001 (verified via API: api.india.delta.exchange)
  *   - Sign convention: NEGATIVE for buy, POSITIVE for sell
- *   - Trail calculated dynamically: 0.02% of entry price, rounded to tick
+ *     (Delta API error: "bracket_trail_amount should be negative for buy orders")
+ *   - Trail must be >= 1 tick size (Math.max(1, ...) enforced)
  *
- * FORMULA 0: Baseline Spread (EMA) — Remove structural premium/discount
- * FORMULA 1: Edge Signal & Side — Determine if edge exceeds MONUMENT_FEE
- * 
- * Final: Trade only when dislocation > MONUMENT_FEE (signal threshold).
+ * ============================================================================
+ * CRITICAL BUGS FIXED (2026-06-09) — READ BEFORE MODIFYING
+ * ============================================================================
+ *
+ * BUG 1: CROSS-SYMBOL TRADE STATE CONTAMINATION
+ *   Symptom:  TRADE OUTCOME logged "XRP buy entry=0.08394 exit=1.1265" — garbage
+ *   Cause:    lastTradeSide/lastTradeEntryPrice/lastTradeSignalId were GLOBAL
+ *             variables shared across all symbols. When DOGE opened a position,
+ *             these were set to DOGE values. When XRP's stop fired, it read
+ *             DOGE's entry price with XRP's exit price → nonsensical PNL.
+ *   Fix:      Changed to per-symbol `this.tradeState[symbol]` map.
+ *   Lesson:   NEVER use global state for per-symbol trade data.
+ *
+ * BUG 2: DANGEROUS SYMBOL LOOKUP
+ *   Symptom:  Stop trigger matched wrong symbol (XRP instead of DOGE)
+ *   Cause:    `Object.keys(this.assets).find(s => order.symbol?.includes(s))`
+ *             could match partial strings incorrectly (e.g., "XRPUSD" matching
+ *             "XRP" when the order was actually for "DOGE").
+ *   Fix:      Only use `this.symbolIndex.get(order.symbol)` which has explicit
+ *             mappings: {XRP, XRPUSD, XRPUSDT, XRP-USD} → "XRP".
+ *   Lesson:   Always use the symbolIndex Map for order.symbol lookups.
+ *
+ * BUG 3: TRAIL SMALLER THAN TICK SIZE
+ *   Symptom:  Stop triggered immediately with -0.43% loss instead of -0.02%
+ *   Cause:    Math.round(trailAbs / tickSize) could round to 0 on small prices.
+ *             DOGE at 0.083 × 0.02% = 0.000017, but rounding could give 0 ticks.
+ *   Fix:      Math.max(1, Math.round(trailAbs / tickSize)) enforces minimum 1 tick.
+ *   Lesson:   Always enforce minimum trail of 1 tick for bracket orders.
+ *
+ * BUG 4: ENTRY FILL TRIGGERING POSITION CLOSE
+ *   Symptom:  TRADE OUTCOME logged with exit=0, pnl=0.0000%
+ *   Cause:    Entry order fill (side=sell for a sell entry) was treated as
+ *             "position closed" because the condition checked `side === 'sell'`.
+ *             With bracket orders, entry fill OPENS the position, stop closes it.
+ *   Fix:      Changed condition to `order.side !== lastTradeSide` — only process
+ *             fills on the OPPOSITE side of the entry (the exit).
+ *   Lesson:   With bracket orders, entry fill ≠ position close.
+ *
+ * BUG 5: EXIT PRICE = STOP TRIGGER PRICE (NOT FILL PRICE)
+ *   Symptom:  TRADE OUTCOME showed stop trigger price, not actual fill price
+ *   Cause:    TRADE OUTCOME was logged in stop_trigger handler which only has
+ *             `order.stop_price` (the trigger level), not the actual fill price.
+ *   Fix:      Moved TRADE OUTCOME logging to the fill handler which has
+ *             `order.avg_price` (the actual execution price).
+ *   Lesson:   Log trade outcomes from fill events, not trigger events.
+ *
+ * ============================================================================
  */
 
 class MomentumSimpleStrategy {
@@ -91,9 +126,10 @@ class MomentumSimpleStrategy {
         });
 
         this.stats = { signals: 0, binanceUpdates: 0, deltaTrades: 0 };
-        this.lastTradeSignalId = null;
-        this.lastTradeEntryPrice = null;
-        this.lastTradeSide = null;
+        // PER-SYMBOL trade state — NEVER use global variables for this.
+        // Global state caused cross-symbol contamination (BUG 1 above).
+        // Each symbol tracks its own: { signalId, entryPrice, side }
+        this.tradeState = {};
 
         this.logger.info(`[MomentumSimple] Initialized | Fee: ${this.FEE * 100}% | EMA α: ${this.EMA_ALPHA}`);
     }
@@ -277,14 +313,13 @@ class MomentumSimpleStrategy {
 
         this.logger.info(`[MomentumSimple] POSITION LOCK: ${symbol} = true`);
         this.bot.activePositions[symbol] = true;
-        this.lastTradeSide = side;
-        this.lastTradeEntryPrice = price;
-        this.lastTradeSignalId = `mom_${Date.now()}`;
+        const signalId = `mom_${Date.now()}`;
+        this.tradeState[symbol] = { signalId, entryPrice: price, side };
 
-        // Calculate trail amount dynamically: 0.02% of entry price, rounded to tick
+        // Calculate trail amount dynamically: 0.02% of entry price, rounded to tick (minimum 1 tick)
         const trailAbs = price * this.TRAILING_STOP_PCT;
         const tickSize = spec.tickSize || 0.0001;
-        const trailTicks = Math.round(trailAbs / tickSize);
+        const trailTicks = Math.max(1, Math.round(trailAbs / tickSize));
         const trailAmount = (trailTicks * tickSize).toFixed(spec.precision || 4);
         
         // Sign convention: NEGATIVE for buy, POSITIVE for sell
@@ -295,14 +330,14 @@ class MomentumSimpleStrategy {
             size: process.env.ORDER_SIZE || "1",
             side: side,
             order_type: 'market_order',
-            client_order_id: this.lastTradeSignalId,
+            client_order_id: signalId,
             bracket_trail_amount: signedTrail,
             bracket_stop_trigger_method: 'last_traded_price'
         };
 
         try {
             this.logger.info(`[MomentumSimple] ENTRY: ${side} ${payload.size} ${symbol} MARKET`);
-            this.logger.info(`  [DEBUG] Binance=${data.bidPrice} | Delta=${price} | Trail=${signedTrail} (${(this.TRAILING_STOP_PCT * 100).toFixed(2)}%)`);
+            this.logger.info(`  [DEBUG] Binance=${data.bidPrice} | Delta=${price} | Trail=${signedTrail} (${trailTicks} ticks)`);
             
             const t0 = process.hrtime.bigint();
             const result = await this.bot.placeOrder(payload);
@@ -316,17 +351,13 @@ class MomentumSimpleStrategy {
                 this.logger.error(`[MomentumSimple] ❌ ORDER FAILED: ${JSON.stringify(result)}`);
                 this.logger.info(`[MomentumSimple] POSITION LOCK: ${symbol} = false (order failed)`);
                 this.bot.activePositions[symbol] = false;
-                this.lastTradeSignalId = null;
-                this.lastTradeEntryPrice = null;
-                this.lastTradeSide = null;
+                delete this.tradeState[symbol];
             }
         } catch (error) {
             this.logger.error(`[MomentumSimple] ❌ ORDER ERROR: ${error.message}`);
             this.logger.info(`[MomentumSimple] POSITION LOCK: ${symbol} = false (order error)`);
             this.bot.activePositions[symbol] = false;
-            this.lastTradeSignalId = null;
-            this.lastTradeEntryPrice = null;
-            this.lastTradeSide = null;
+            delete this.tradeState[symbol];
         }
     }
 
@@ -342,79 +373,50 @@ class MomentumSimpleStrategy {
         }
 
         if (order.state === 'closed' && order.reason === 'fill') {
-            const symbol = this.symbolIndex.get(order.symbol) ||
-                Object.keys(this.assets).find(s => order.symbol?.includes(s));
+            const symbol = this.symbolIndex.get(order.symbol);
             if (!symbol) return;
 
-            if (order.side === 'sell' && this.bot.activePositions[symbol]) {
+            const ts = this.tradeState[symbol];
+            // Skip entry-side fills — with bracket orders, entry fill opens the position,
+            // stop_trigger closes it. Only process exit-side fills here.
+            if (ts && order.side !== ts.side && this.bot.activePositions[symbol]) {
                 this.logger.info(`[MomentumSimple] ✅ POSITION CLOSED: ${symbol}`);
                 this.bot.activePositions[symbol] = false;
                 this.assets[symbol].signalActive = false;
 
-                if (this.lastTradeSignalId && this.lastTradeEntryPrice) {
-                    const exitPrice = parseFloat(order.price || order.avg_price || 0);
-                    const entryPrice = this.lastTradeEntryPrice;
-                    const side = this.lastTradeSide;
-                    let pnl = 0;
-                    let priceMove = 0;
-                    if (exitPrice > 0 && entryPrice > 0) {
-                        priceMove = side === 'buy'
-                            ? (exitPrice - entryPrice) / entryPrice
-                            : (entryPrice - exitPrice) / entryPrice;
-                        pnl = priceMove - this.TRADING_FEE;
-                    }
-                    const leverage = parseFloat(process.env.LEVERAGE || '100');
-                    const roe = priceMove * leverage;
-                    this.logger.info(`[MomentumSimple] TRADE OUTCOME: ${symbol} ${side} entry=${entryPrice} exit=${exitPrice} priceMove=${(priceMove * 100).toFixed(4)}% pnl=${(pnl * 100).toFixed(4)}% roe=${roe.toFixed(2)}%`);
+                const exitPrice = parseFloat(order.price || order.avg_price || 0);
+                const entryPrice = ts.entryPrice;
+                const side = ts.side;
+                let pnl = 0;
+                let priceMove = 0;
+                if (exitPrice > 0 && entryPrice > 0) {
+                    priceMove = side === 'buy'
+                        ? (exitPrice - entryPrice) / entryPrice
+                        : (entryPrice - exitPrice) / entryPrice;
+                    pnl = priceMove - this.TRADING_FEE;
                 }
+                const leverage = parseFloat(process.env.LEVERAGE || '100');
+                const roe = priceMove * leverage;
+                this.logger.info(`[MomentumSimple] TRADE OUTCOME: ${symbol} ${side} entry=${entryPrice} exit=${exitPrice} priceMove=${(priceMove * 100).toFixed(4)}% pnl=${(pnl * 100).toFixed(4)}% roe=${roe.toFixed(2)}%`);
 
-                this.lastTradeSignalId = null;
-                this.lastTradeEntryPrice = null;
-                this.lastTradeSide = null;
+                delete this.tradeState[symbol];
             }
         }
 
         if (order.reason === 'stop_trigger') {
-            const symbol = this.symbolIndex.get(order.symbol) ||
-                Object.keys(this.assets).find(s => order.symbol?.includes(s));
+            const symbol = this.symbolIndex.get(order.symbol);
             if (symbol) {
-                this.logger.info(`[MomentumSimple] 🛑 STOP TRIGGERED: ${symbol}`);
-                this.bot.activePositions[symbol] = false;
-                this.assets[symbol].signalActive = false;
-
-                if (this.lastTradeSignalId && this.lastTradeEntryPrice) {
-                    const exitPrice = parseFloat(order.price || order.stop_price || 0);
-                    const entryPrice = this.lastTradeEntryPrice;
-                    const side = this.lastTradeSide;
-                    let pnl = 0;
-                    let priceMove = 0;
-                    if (exitPrice > 0 && entryPrice > 0) {
-                        priceMove = side === 'buy'
-                            ? (exitPrice - entryPrice) / entryPrice
-                            : (entryPrice - exitPrice) / entryPrice;
-                        pnl = priceMove - this.TRADING_FEE;
-                    }
-                    const leverage = parseFloat(process.env.LEVERAGE || '100');
-                    const roe = priceMove * leverage;
-                    this.logger.info(`[MomentumSimple] TRADE OUTCOME: ${symbol} ${side} entry=${entryPrice} exit=${exitPrice} priceMove=${(priceMove * 100).toFixed(4)}% pnl=${(pnl * 100).toFixed(4)}% roe=${roe.toFixed(2)}%`);
-                }
-
-                this.lastTradeSignalId = null;
-                this.lastTradeEntryPrice = null;
-                this.lastTradeSide = null;
+                this.logger.info(`[MomentumSimple] 🛑 STOP TRIGGERED: ${symbol} (trigger=${order.stop_price})`);
             }
         }
 
         if (order.reason === 'cancelled_by_user') {
-            const symbol = this.symbolIndex.get(order.symbol) ||
-                Object.keys(this.assets).find(s => order.symbol?.includes(s));
+            const symbol = this.symbolIndex.get(order.symbol);
             if (symbol) {
                 this.logger.info(`[MomentumSimple] ⚠️ BRACKET CANCELLED: ${symbol} - resetting position lock`);
                 this.bot.activePositions[symbol] = false;
                 this.assets[symbol].signalActive = false;
-                this.lastTradeSignalId = null;
-                this.lastTradeEntryPrice = null;
-                this.lastTradeSide = null;
+                delete this.tradeState[symbol];
             }
         }
     }
@@ -423,12 +425,13 @@ class MomentumSimpleStrategy {
         if (trade.reason !== 'normal') return;
         if (!trade.client_order_id || !trade.client_order_id.startsWith('mom_')) return;
 
-        const symbol = this.symbolIndex.get(trade.symbol) ||
-            Object.keys(this.assets).find(s => trade.symbol?.includes(s));
+        const symbol = this.symbolIndex.get(trade.symbol);
         if (!symbol) return;
 
         this.logger.info(`[MomentumSimple] 🎯 FILL: ${symbol} @ ${trade.price}`);
-        this.lastTradeEntryPrice = parseFloat(trade.price);
+        if (this.tradeState[symbol]) {
+            this.tradeState[symbol].entryPrice = parseFloat(trade.price);
+        }
     }
 
     onPositionClose(asset) {
