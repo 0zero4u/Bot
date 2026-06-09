@@ -4,25 +4,35 @@
  * Cross-exchange arbitrage: Binance (reference) → Delta Exchange (execution)
  * ============================================================================
  * 
- * FEE STRUCTURE (Delta Exchange - India):
- *   - Taker fee: 0.05% per side
+ * FEE STRUCTURE (Delta Exchange - India) — VERIFIED 2026-06-09:
+ *   - Standard taker fee: 0.05% per side
  *   - Scalper offer: 0% closing fee (opening fee only)
  *   - Round trip cost: 0.05% (opening) + 0% (closing) = 0.05%
- *   - MONUMENT_FEE should be set to 0.0005 (0.05% one-way)
+ *   - TRADING_FEE = 0.0005 (0.05%) — use for PNL calculation
+ *
+ * MONUMENT_FEE (signal threshold):
+ *   - Set HIGHER than actual fees to filter for larger edges
+ *   - Current: 0.0008 (0.08%) — only trade when edge > 0.08%
+ *   - This is a SIGNAL FILTER, not the actual fee
+ *
+ * ROE CALCULATION (with leverage):
+ *   - Price move % = (exit - entry) / entry × 100
+ *   - Net PNL = Price move % - TRADING_FEE (0.05%)
+ *   - ROE = Net PNL × leverage (e.g., 100x)
+ *   - Example: Entry 1.1641, Exit 1.1650 = +0.0773% price move
+ *   - Net PNL = 0.0773% - 0.05% = +0.0273%
+ *   - ROE (100x) = 0.0273% × 100 = +2.73%
  *
  * DELTA EXCHANGE BRACKET ORDERS (VERIFIED via live API 2026-06-09):
  *   - bracket_trail_amount is ABSOLUTE price, NOT percentage
  *   - XRPUSD tick_size = 0.0001 (verified via API: api.india.delta.exchange)
  *   - Sign convention: NEGATIVE for buy, POSITIVE for sell
- *     * Buy order rejection: "bracket_trail_amount should be negative for buy orders"
- *     * Sell order rejection: "bracket_trail_amount should be positive for sell orders"
- *   - trail_amount must be string format (Big Decimal)
  *   - Trail calculated dynamically: 0.02% of entry price, rounded to tick
  *
  * FORMULA 0: Baseline Spread (EMA) — Remove structural premium/discount
- * FORMULA 1: Edge Signal & Side — Determine if edge exceeds 0.05% fee
+ * FORMULA 1: Edge Signal & Side — Determine if edge exceeds MONUMENT_FEE
  * 
- * Final: Trade only when dislocation > 0.05% fee.
+ * Final: Trade only when dislocation > MONUMENT_FEE (signal threshold).
  */
 
 class MomentumSimpleStrategy {
@@ -31,7 +41,8 @@ class MomentumSimpleStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.FEE = parseFloat(process.env.MONUMENT_FEE || '0.0005');
+        this.FEE = parseFloat(process.env.MONUMENT_FEE || '0.0005');  // Signal threshold (edge must exceed this)
+        this.TRADING_FEE = 0.0005;  // Actual round-trip fee: 0.05% (scalper offer: 0% closing fee)
         this.EMA_ALPHA = 0.02;
         this.COOLDOWN_MS = 30000;
         
@@ -340,13 +351,16 @@ class MomentumSimpleStrategy {
                     const entryPrice = this.lastTradeEntryPrice;
                     const side = this.lastTradeSide;
                     let pnl = 0;
+                    let priceMove = 0;
                     if (exitPrice > 0 && entryPrice > 0) {
-                        pnl = side === 'buy'
+                        priceMove = side === 'buy'
                             ? (exitPrice - entryPrice) / entryPrice
                             : (entryPrice - exitPrice) / entryPrice;
-                        pnl -= this.FEE * 2;
+                        pnl = priceMove - this.TRADING_FEE;
                     }
-                    this.logger.info(`[MomentumSimple] TRADE OUTCOME: ${symbol} ${side} entry=${entryPrice} exit=${exitPrice} pnl=${(pnl * 100).toFixed(4)}%`);
+                    const leverage = parseFloat(process.env.LEVERAGE || '100');
+                    const roe = priceMove * leverage;
+                    this.logger.info(`[MomentumSimple] TRADE OUTCOME: ${symbol} ${side} entry=${entryPrice} exit=${exitPrice} priceMove=${(priceMove * 100).toFixed(4)}% pnl=${(pnl * 100).toFixed(4)}% roe=${roe.toFixed(2)}%`);
                 }
 
                 this.lastTradeSignalId = null;
@@ -368,13 +382,16 @@ class MomentumSimpleStrategy {
                     const entryPrice = this.lastTradeEntryPrice;
                     const side = this.lastTradeSide;
                     let pnl = 0;
+                    let priceMove = 0;
                     if (exitPrice > 0 && entryPrice > 0) {
-                        pnl = side === 'buy'
+                        priceMove = side === 'buy'
                             ? (exitPrice - entryPrice) / entryPrice
                             : (entryPrice - exitPrice) / entryPrice;
-                        pnl -= this.FEE * 2;
+                        pnl = priceMove - this.TRADING_FEE;
                     }
-                    this.logger.info(`[MomentumSimple] TRADE OUTCOME: ${symbol} ${side} entry=${entryPrice} exit=${exitPrice} pnl=${(pnl * 100).toFixed(4)}%`);
+                    const leverage = parseFloat(process.env.LEVERAGE || '100');
+                    const roe = priceMove * leverage;
+                    this.logger.info(`[MomentumSimple] TRADE OUTCOME: ${symbol} ${side} entry=${entryPrice} exit=${exitPrice} priceMove=${(priceMove * 100).toFixed(4)}% pnl=${(pnl * 100).toFixed(4)}% roe=${roe.toFixed(2)}%`);
                 }
 
                 this.lastTradeSignalId = null;
