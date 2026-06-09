@@ -337,6 +337,10 @@ class MomentumSimpleStrategy {
     onOrderUpdate(order) {
         this.logger.info(`[MomentumSimple] ORDER: ${order.action} | state=${order.state} | reason=${order.reason} | side=${order.side}`);
 
+        if (order.reason === 'stop_create') {
+            this.logger.info(`[MomentumSimple] 🛑 STOP CREATED: ${order.side} bracket order`);
+        }
+
         if (order.state === 'closed' && order.reason === 'fill') {
             const symbol = this.symbolIndex.get(order.symbol) ||
                 Object.keys(this.assets).find(s => order.symbol?.includes(s));
@@ -395,6 +399,19 @@ class MomentumSimpleStrategy {
                     this.logger.info(`[MomentumSimple] TRADE OUTCOME: ${symbol} ${side} entry=${entryPrice} exit=${exitPrice} priceMove=${(priceMove * 100).toFixed(4)}% pnl=${(pnl * 100).toFixed(4)}% roe=${roe.toFixed(2)}%`);
                 }
 
+                this.lastTradeSignalId = null;
+                this.lastTradeEntryPrice = null;
+                this.lastTradeSide = null;
+            }
+        }
+
+        if (order.reason === 'cancelled_by_user') {
+            const symbol = this.symbolIndex.get(order.symbol) ||
+                Object.keys(this.assets).find(s => order.symbol?.includes(s));
+            if (symbol) {
+                this.logger.info(`[MomentumSimple] ⚠️ BRACKET CANCELLED: ${symbol} - resetting position lock`);
+                this.bot.activePositions[symbol] = false;
+                this.assets[symbol].signalActive = false;
                 this.lastTradeSignalId = null;
                 this.lastTradeEntryPrice = null;
                 this.lastTradeSide = null;
