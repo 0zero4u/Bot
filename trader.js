@@ -381,6 +381,24 @@ class TradingBot {
                         timestamp: message.t,
                         buyer_role: message.buyer_role
                     });
+                } else if (message.data && Array.isArray(message.data)) {
+                    message.data.forEach(trade => {
+                        if (trade.symbol || trade.sy) {
+                            this.forwardTradeToStrategy({
+                                price: trade.price || trade.p,
+                                size: trade.size || trade.s,
+                                symbol: trade.symbol || trade.sy,
+                                timestamp: trade.timestamp || trade.t,
+                                buyer_role: trade.buyer_role
+                            });
+                        }
+                    });
+                } else {
+                    const keys = Object.keys(message);
+                    const hasData = message.data ? `data[${message.data.length}]` : 'no data';
+                    const firstTrade = message.data?.[0];
+                    const tradeKeys = firstTrade ? Object.keys(firstTrade).join(',') : 'none';
+                    this.logger.debug(`[WS] trades: keys=[${keys}] ${hasData} tradeKeys=[${tradeKeys}]`);
                 }
                 break;
         }
