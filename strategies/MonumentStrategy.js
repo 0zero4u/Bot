@@ -10,6 +10,13 @@
  *   - Round trip cost: 0.05% (opening) + 0% (closing) = 0.05%
  *   - MONUMENT_FEE should be set to 0.0005 (0.05% one-way)
  *
+ * DELTA EXCHANGE BRACKET ORDERS:
+ *   - bracket_trail_amount is ABSOLUTE price, NOT percentage
+ *   - XRPUSD tick_size = 0.0001 (verified via API: api.india.delta.exchange)
+ *   - 1 tick at $1.1672 = 0.00857% (approximately 3x smaller than 0.025% fee)
+ *   - Sign convention: NEGATIVE for buy, POSITIVE for sell (VERIFIED via live API 2026-06-09)
+ *   - trail_amount must be string format (Big Decimal)
+ *
  * FORMULA 0: Baseline Spread (EMA) — Remove structural premium/discount
  * FORMULA 1: Edge Signal & Side — Determine if edge exceeds 0.05% fee
  * FORMULA 2: Chase Safety Filter — Confirm Binance order flow supports direction
@@ -29,9 +36,16 @@ class MonumentStrategy {
         // MONUMENT_FEE should be 0.0005 (0.05% one-way opening fee)
         // F1 passes when edge > FEE (i.e., edge > 0.05%)
         this.FEE = parseFloat(process.env.MONUMENT_FEE || '0.0005');
-        this.EMA_ALPHA = 0.02;
+        this.EMA_ALPHA = 0.2;
         this.COOLDOWN_MS = 30000;
-        this.TRAILING_STOP_PCT = 0.0002;
+        
+        // --- TRAILING STOP ---
+        // Delta Exchange bracket_trail_amount is ABSOLUTE price, NOT percentage
+        // XRPUSD tick_size = 0.0001 (verified via API)
+        // 1 tick at $1.1672 = 0.00857% (approximately 3x smaller than 0.025% fee)
+        // Sign convention: NEGATIVE for buy, POSITIVE for sell (VERIFIED via live API 2026-06-09)
+        this.TRAILING_STOP_AMOUNT = '0.0001';  // 1 tick = ~0.00857%
+        
         this.REQUIRE_FLOW_CONFIRMATION = false;
 
         // --- F3 v2: ABSORPTION RATIO ---
@@ -42,7 +56,7 @@ class MonumentStrategy {
         //       TODO: Re-enable when subscribing to Delta ob_l1 (100ms updates)
         this.MAX_AGE_MS = parseInt(process.env.MONUMENT_MAX_AGE_MS || '500');
         this.MIN_REMAINING_RATIO = 0.50;
-        this.MIN_LEADER_MOVE_PCT = 0.00005;  // 0.005% - validates Binance moved
+        this.MIN_LEADER_MOVE_PCT = 0.000025;  // 0.0025% - validates Binance moved
         this.MIN_DELTA_MOVE_PCT = 0;          // DISABLED: Delta trades too sparse (7-20s)
         this.MAX_DATA_AGE_MS = parseInt(process.env.MONUMENT_MAX_DATA_AGE_MS || '10000');
 
@@ -78,6 +92,7 @@ class MonumentStrategy {
                 lastDeltaTradeTime: null,
                 lastLeaderUpdate: null,
                 lastDeltaUpdate: null,
+                priceHistory: [],
 
                 // Formula 0: EMA baseline
                 emaBaseline: null,
@@ -167,7 +182,11 @@ class MonumentStrategy {
         data.bidSize = update.bq;
         data.askSize = update.aq;
 
+        const midPrice = (update.bb + update.ba) / 2;
+        this.updatePriceHistory(asset, midPrice);
+
         this.stats.binanceUpdates++;
+        this.checkSignal(asset);
     }
 
     /**
@@ -183,6 +202,8 @@ class MonumentStrategy {
         data.binanceTradePrice = parseFloat(update.p);
         data.lastBinanceTradeTime = Date.now();
         data.lastLeaderUpdate = Date.now();
+
+        this.updatePriceHistory(asset, data.binanceTradePrice);
 
         if (!data.bidPrice || !data.askPrice) {
             data.bidPrice = parseFloat(update.p);
@@ -419,6 +440,43 @@ class MonumentStrategy {
         data._leaderSmallLogged = false;
     }
 
+    checkLookbackConfirmation(symbol, side) {
+        const data = this.assets[symbol];
+        if (!data.priceHistory || data.priceHistory.length < 2) return false;
+
+        const lookbackMs = 80;
+        const moveThreshold = 0.0005;
+        const now = Date.now();
+        const cutoff = now - lookbackMs;
+
+        const recentPrices = data.priceHistory.filter(p => p.time >= cutoff);
+        if (recentPrices.length < 2) return false;
+
+        const oldest = recentPrices[0].price;
+        const newest = recentPrices[recentPrices.length - 1].price;
+
+        let move;
+        if (side === 'buy') {
+            move = newest - oldest;
+        } else {
+            move = oldest - newest;
+        }
+
+        const movePct = Math.abs(move) / oldest;
+        return movePct >= moveThreshold / 100;
+    }
+
+    updatePriceHistory(symbol, price) {
+        const data = this.assets[symbol];
+        if (!data.priceHistory) data.priceHistory = [];
+
+        data.priceHistory.push({ price, time: Date.now() });
+
+        if (data.priceHistory.length > 100) {
+            data.priceHistory = data.priceHistory.slice(-50);
+        }
+    }
+
     logSignalState(symbol, signalId, ageMs, leaderMove, deltaMove, absorption, remaining) {
         const entry = {
             signal_id: signalId,
@@ -557,25 +615,39 @@ class MonumentStrategy {
         const leaderAge = data.lastBinanceTradeTime ? Date.now() - data.lastBinanceTradeTime : Infinity;
         const pLeaderForF3 = leaderAge < 1000 ? data.binanceTradePrice : pBinance;
         const f3 = this.calculateFormula3(symbol, pLeaderForF3, pDelta, side);
-        if (!f3) {
-            this.logger.info(`[Monument] ${symbol} | F1 OK but F3 null (guard blocked)`);
+
+        const lookbackConfirmed = this.checkLookbackConfirmation(symbol, side);
+
+        if (!f3 && !lookbackConfirmed) {
+            this.logger.info(`[Monument] ${symbol} | F1 OK but F3+Lookback null`);
             return;
         }
 
-        const { absorption, remaining, leaderMove, deltaMove, ageMs, signalId } = f3;
+        if (f3) {
+            const { absorption, remaining, leaderMove, deltaMove, ageMs, signalId } = f3;
 
-        if (remaining <= this.MIN_REMAINING_RATIO) {
-            this.logger.info(`[Monument] ${symbol} | Edge OK but F3 blocked: remaining=${(remaining * 100).toFixed(2)}% <= ${(this.MIN_REMAINING_RATIO * 100).toFixed(0)}%`);
-            return;
+            if (remaining <= this.MIN_REMAINING_RATIO) {
+                this.logger.info(`[Monument] ${symbol} | Edge OK but F3 blocked: remaining=${(remaining * 100).toFixed(2)}% <= ${(this.MIN_REMAINING_RATIO * 100).toFixed(0)}%`);
+                return;
+            }
+
+            this.logger.info(`[Monument] ${symbol} | F3 PASSED: absorption=${(absorption * 100).toFixed(2)}% remaining=${(remaining * 100).toFixed(2)}%`);
+        } else if (lookbackConfirmed) {
+            this.logger.info(`[Monument] ${symbol} | LOOKBACK CONFIRMED`);
         }
 
         // ALL FORMULAS PASSED — Execute trade
         if (!data.signalActive && !cooldownActive) {
+            const signalId = f3 ? f3.signalId : Date.now();
             this.logger.info(`[Monument] 🎯 SIGNAL: ${symbol} ${side.toUpperCase()}`);
             this.logger.info(`  Formula 0: Spread=${(spread * 100).toFixed(4)}% | Baseline=${(baseline * 100).toFixed(4)}% | AdjEdge=${(adjustedEdge * 100).toFixed(4)}%`);
             this.logger.info(`  Formula 1: Edge=${edgePct.toFixed(4)}% > ${this.FEE * 100}% fee ✅`);
-            this.logger.info(`  Formula 3: Absorption=${(absorption * 100).toFixed(2)}% | Remaining=${(remaining * 100).toFixed(2)}% > ${(this.MIN_REMAINING_RATIO * 100).toFixed(0)}% ✅`);
-            this.logger.info(`  [EXEC] Binance=${pBinance.toFixed(4)} | Delta=${pDelta.toFixed(4)} | leaderMove=${leaderMove.toFixed(6)} | deltaMove=${deltaMove.toFixed(6)} | age=${ageMs}ms`);
+            if (f3) {
+                this.logger.info(`  Formula 3: Absorption=${(f3.absorption * 100).toFixed(2)}% | Remaining=${(f3.remaining * 100).toFixed(2)}% > ${(this.MIN_REMAINING_RATIO * 100).toFixed(0)}% ✅`);
+            } else {
+                this.logger.info(`  Lookback: CONFIRMED ✅`);
+            }
+            this.logger.info(`  [EXEC] Binance=${pBinance.toFixed(4)} | Delta=${pDelta.toFixed(4)}`);
 
             this.executeTrade(symbol, side, pDelta, signalId);
             data.signalActive = true;
@@ -606,11 +678,13 @@ class MonumentStrategy {
         this.lastTradeAgeMs = ageMs;
         this.lastTradeSide = side;
 
-        // Calculate bracket trail amount (negative for buy, positive for sell)
-        const trailAbs = price * this.TRAILING_STOP_PCT;
+        // Calculate bracket trail amount
+        // Delta Exchange sign convention: POSITIVE for buy, NEGATIVE for sell
+        // trail_amount is ABSOLUTE price (not percentage)
+        // XRPUSD tick_size = 0.0001 (minimum viable trail)
         const trailAmount = side === 'buy' 
-            ? (-trailAbs).toFixed(spec.precision)
-            : trailAbs.toFixed(spec.precision);
+            ? `-${this.TRAILING_STOP_AMOUNT}`
+            : this.TRAILING_STOP_AMOUNT;
         
         const payload = {
             product_id: spec.deltaId.toString(),

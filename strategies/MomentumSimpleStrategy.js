@@ -10,6 +10,15 @@
  *   - Round trip cost: 0.05% (opening) + 0% (closing) = 0.05%
  *   - MONUMENT_FEE should be set to 0.0005 (0.05% one-way)
  *
+ * DELTA EXCHANGE BRACKET ORDERS (VERIFIED via live API 2026-06-09):
+ *   - bracket_trail_amount is ABSOLUTE price, NOT percentage
+ *   - XRPUSD tick_size = 0.0001 (verified via API: api.india.delta.exchange)
+ *   - 1 tick at $1.1672 = 0.00857% (approximately 3x smaller than 0.025% fee)
+ *   - Sign convention: NEGATIVE for buy, POSITIVE for sell
+ *     * Buy order rejection: "bracket_trail_amount should be negative for buy orders"
+ *     * Sell order rejection: "bracket_trail_amount should be positive for sell orders"
+ *   - trail_amount must be string format (Big Decimal)
+ *
  * FORMULA 0: Baseline Spread (EMA) — Remove structural premium/discount
  * FORMULA 1: Edge Signal & Side — Determine if edge exceeds 0.05% fee
  * 
@@ -28,7 +37,7 @@ class MomentumSimpleStrategy {
         
         // Delta Exchange bracket_trail_amount is ABSOLUTE price, NOT percentage
         // XRPUSD tick_size = 0.0001 (verified via API)
-        // Sign convention: POSITIVE for buy, NEGATIVE for sell (per Delta docs)
+        // Sign convention: NEGATIVE for buy, POSITIVE for sell (verified via live API)
         this.TRAILING_STOP_AMOUNT = '0.0001';  // 1 tick = ~0.00857%
 
         // --- ASSET SPECS ---
@@ -258,8 +267,8 @@ class MomentumSimpleStrategy {
         this.lastTradeSide = side;
 
         const trailAmount = side === 'buy' 
-            ? this.TRAILING_STOP_AMOUNT
-            : `-${this.TRAILING_STOP_AMOUNT}`;
+            ? `-${this.TRAILING_STOP_AMOUNT}`
+            : this.TRAILING_STOP_AMOUNT;
         
         const payload = {
             product_id: spec.deltaId.toString(),
