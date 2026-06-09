@@ -13,11 +13,11 @@
  * DELTA EXCHANGE BRACKET ORDERS (VERIFIED via live API 2026-06-09):
  *   - bracket_trail_amount is ABSOLUTE price, NOT percentage
  *   - XRPUSD tick_size = 0.0001 (verified via API: api.india.delta.exchange)
- *   - 1 tick at $1.1672 = 0.00857% (approximately 3x smaller than 0.025% fee)
  *   - Sign convention: NEGATIVE for buy, POSITIVE for sell
  *     * Buy order rejection: "bracket_trail_amount should be negative for buy orders"
  *     * Sell order rejection: "bracket_trail_amount should be positive for sell orders"
  *   - trail_amount must be string format (Big Decimal)
+ *   - Trail calculated dynamically: 0.02% of entry price, rounded to tick
  *
  * FORMULA 0: Baseline Spread (EMA) — Remove structural premium/discount
  * FORMULA 1: Edge Signal & Side — Determine if edge exceeds 0.05% fee
@@ -38,7 +38,9 @@ class MomentumSimpleStrategy {
         // Delta Exchange bracket_trail_amount is ABSOLUTE price, NOT percentage
         // XRPUSD tick_size = 0.0001 (verified via API)
         // Sign convention: NEGATIVE for buy, POSITIVE for sell (verified via live API)
-        this.TRAILING_STOP_AMOUNT = '0.0001';  // 1 tick = ~0.00857%
+        // Trail = 0.02% of entry price (dynamic, calculated per trade)
+        this.TRAILING_STOP_PCT = 0.0002;  // 0.02% trailing stop
+        this.TICK_SIZE = 0.0001;           // XRPUSD tick size
 
         // --- ASSET SPECS ---
         this.specs = {
@@ -265,24 +267,30 @@ class MomentumSimpleStrategy {
         this.logger.info(`[MomentumSimple] POSITION LOCK: ${symbol} = true`);
         this.bot.activePositions[symbol] = true;
         this.lastTradeSide = side;
+        this.lastTradeEntryPrice = price;
+        this.lastTradeSignalId = `mom_${Date.now()}`;
 
-        const trailAmount = side === 'buy' 
-            ? `-${this.TRAILING_STOP_AMOUNT}`
-            : this.TRAILING_STOP_AMOUNT;
+        // Calculate trail amount dynamically: 0.02% of entry price, rounded to tick
+        const trailAbs = price * this.TRAILING_STOP_PCT;
+        const trailTicks = Math.round(trailAbs / this.TICK_SIZE);
+        const trailAmount = (trailTicks * this.TICK_SIZE).toFixed(4);
+        
+        // Sign convention: NEGATIVE for buy, POSITIVE for sell
+        const signedTrail = side === 'buy' ? `-${trailAmount}` : trailAmount;
         
         const payload = {
             product_id: spec.deltaId.toString(),
             size: process.env.ORDER_SIZE || "1",
             side: side,
             order_type: 'market_order',
-            client_order_id: `mom_${Date.now()}`,
-            bracket_trail_amount: trailAmount,
+            client_order_id: this.lastTradeSignalId,
+            bracket_trail_amount: signedTrail,
             bracket_stop_trigger_method: 'last_traded_price'
         };
 
         try {
             this.logger.info(`[MomentumSimple] ENTRY: ${side} ${payload.size} ${symbol} MARKET`);
-            this.logger.info(`  [DEBUG] Binance=${data.bidPrice} | Delta=${price} | Trail=${trailAmount}`);
+            this.logger.info(`  [DEBUG] Binance=${data.bidPrice} | Delta=${price} | Trail=${signedTrail} (${(this.TRAILING_STOP_PCT * 100).toFixed(2)}%)`);
             
             const t0 = process.hrtime.bigint();
             const result = await this.bot.placeOrder(payload);
@@ -291,16 +299,22 @@ class MomentumSimpleStrategy {
             this.logger.info(`[TIMING] placeOrder total: ${totalMs.toFixed(2)}ms`);
 
             if (result && result.success) {
-                this.logger.info(`[MomentumSimple] ✅ ORDER PLACED: ${symbol} ${side} (trail=${trailAmount})`);
+                this.logger.info(`[MomentumSimple] ✅ ORDER PLACED: ${symbol} ${side} (trail=${signedTrail})`);
             } else {
                 this.logger.error(`[MomentumSimple] ❌ ORDER FAILED: ${JSON.stringify(result)}`);
                 this.logger.info(`[MomentumSimple] POSITION LOCK: ${symbol} = false (order failed)`);
                 this.bot.activePositions[symbol] = false;
+                this.lastTradeSignalId = null;
+                this.lastTradeEntryPrice = null;
+                this.lastTradeSide = null;
             }
         } catch (error) {
             this.logger.error(`[MomentumSimple] ❌ ORDER ERROR: ${error.message}`);
             this.logger.info(`[MomentumSimple] POSITION LOCK: ${symbol} = false (order error)`);
             this.bot.activePositions[symbol] = false;
+            this.lastTradeSignalId = null;
+            this.lastTradeEntryPrice = null;
+            this.lastTradeSide = null;
         }
     }
 
