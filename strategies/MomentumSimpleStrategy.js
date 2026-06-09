@@ -22,19 +22,10 @@ class MomentumSimpleStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        // FEE: Delta taker fee = 0.05% per side, scalper offer = 0% closing
-        // MONUMENT_FEE should be 0.0005 (0.05% one-way opening fee)
-        // F1 passes when edge > FEE (i.e., edge > 0.05%)
         this.FEE = parseFloat(process.env.MONUMENT_FEE || '0.0005');
-        this.EMA_ALPHA = 0.2;
+        this.EMA_ALPHA = 0.02;
         this.COOLDOWN_MS = 30000;
-        
-        // --- TRAILING STOP ---
-        // Delta Exchange bracket_trail_amount is ABSOLUTE price, NOT percentage
-        // XRPUSD tick_size = 0.0001 (verified via API)
-        // 1 tick at $1.1672 = 0.00857% (approximately 3x smaller than 0.025% fee)
-        // Sign convention: POSITIVE for buy, NEGATIVE for sell (per Delta docs)
-        this.TRAILING_STOP_AMOUNT = '0.0001';  // 1 tick = ~0.00857%
+        this.TRAILING_STOP_PCT = 0.0002;
 
         // --- ASSET SPECS ---
         this.specs = {
@@ -53,27 +44,18 @@ class MomentumSimpleStrategy {
 
         targets.forEach(symbol => {
             this.assets[symbol] = {
-                // Binance BookTicker data
                 bidPrice: null,
                 askPrice: null,
                 bidSize: null,
                 askSize: null,
-
-                // Delta trade data
                 deltaPrice: null,
                 lastDeltaTradeTime: null,
-                lastDeltaUpdate: null,
-
-                // Formula 0: EMA baseline
                 emaBaseline: null,
-
-                // Trade state
                 lastSignalTime: 0,
                 signalActive: false
             };
         });
 
-        // Symbol lookup for Delta WS messages
         this.symbolIndex = new Map();
         Object.keys(this.assets).forEach(k => {
             this.symbolIndex.set(k, k);
@@ -111,10 +93,6 @@ class MomentumSimpleStrategy {
     // DATA INGESTION
     // =========================================================================
 
-    /**
-     * Binance BookTicker feed (bidPrice, askPrice, bidSize, askSize)
-     * Called via onDepthUpdate from trader.js
-     */
     onDepthUpdate(update) {
         const symbol = update.s;
         if (!symbol) return;
@@ -123,19 +101,28 @@ class MomentumSimpleStrategy {
         if (!asset) return;
 
         const data = this.assets[asset];
-
         data.bidPrice = update.bb;
         data.askPrice = update.ba;
         data.bidSize = update.bq;
         data.askSize = update.aq;
-
         this.stats.binanceUpdates++;
+    }
+
+    onBinanceTrade(update) {
+        const symbol = update.s;
+        const asset = Object.keys(this.assets).find(k => symbol.toUpperCase().includes(k));
+        if (!asset) return;
+
+        const data = this.assets[asset];
+        if (!data.bidPrice || !data.askPrice) {
+            data.bidPrice = parseFloat(update.p);
+            data.askPrice = parseFloat(update.p);
+            data.bidSize = 1;
+            data.askSize = 1;
+        }
         this.checkSignal(asset);
     }
 
-    /**
-     * Delta Exchange trade feed
-     */
     onLaggerTrade(trade) {
         if (!trade.symbol) return;
 
@@ -146,7 +133,6 @@ class MomentumSimpleStrategy {
         const data = this.assets[symbol];
         data.deltaPrice = parseFloat(trade.price);
         data.lastDeltaTradeTime = Date.now();
-        data.lastDeltaUpdate = Date.now();
         this.stats.deltaTrades++;
         this.checkSignal(symbol);
     }
@@ -155,36 +141,21 @@ class MomentumSimpleStrategy {
     // FORMULA 0: BASELINE SPREAD (EMA)
     // =========================================================================
 
-    /**
-     * P_Binance = (BidPrice + AskPrice) / 2
-     * P_Delta = LastTradePrice
-     * Spread_t = P_Binance - P_Delta
-     * Baseline_t = α * Spread_t + (1-α) * Baseline_{t-1}
-     * AdjustedEdge = Spread_t - Baseline_t
-     */
     calculateFormula0(symbol) {
         const data = this.assets[symbol];
         if (!data.bidPrice || !data.askPrice || !data.deltaPrice) return null;
 
-        // Binance mid price
         const pBinance = (data.bidPrice + data.askPrice) / 2;
-
-        // Delta price (last trade)
         const pDelta = data.deltaPrice;
-
-        // Raw spread
         const spread = pBinance - pDelta;
 
-        // Update EMA baseline
         if (data.emaBaseline === null) {
             data.emaBaseline = spread;
         } else {
             data.emaBaseline = this.EMA_ALPHA * spread + (1 - this.EMA_ALPHA) * data.emaBaseline;
         }
 
-        // Adjusted edge (spread minus structural baseline)
         const adjustedEdge = spread - data.emaBaseline;
-
         return { pBinance, pDelta, spread, baseline: data.emaBaseline, adjustedEdge };
     }
 
@@ -192,20 +163,14 @@ class MomentumSimpleStrategy {
     // FORMULA 1: EDGE SIGNAL & SIDE
     // =========================================================================
 
-    /**
-     * Edge% = (AdjustedEdge / P_Binance) × 100
-     * 
-     * Long Signal: Edge% > 0.05% → BUY Delta
-     * Short Signal: Edge% < -0.05% → SELL Delta
-     */
     calculateFormula1(adjustedEdge, pBinance) {
         const edgePct = (adjustedEdge / pBinance) * 100;
 
         let side = null;
         if (edgePct > this.FEE * 100) {
-            side = 'buy';  // Delta is cheap, BUY on Delta
+            side = 'buy';
         } else if (edgePct < -(this.FEE * 100)) {
-            side = 'sell'; // Delta is expensive, SELL on Delta
+            side = 'sell';
         }
 
         return { edgePct, side };
@@ -218,23 +183,19 @@ class MomentumSimpleStrategy {
     checkSignal(symbol) {
         const data = this.assets[symbol];
 
-        // Need both Binance and Delta prices
         if (!data.bidPrice || !data.askPrice || !data.deltaPrice) {
             this._logMissing(symbol, data);
             return;
         }
 
-        // Formula 0: Calculate baseline spread
         const f0 = this.calculateFormula0(symbol);
         if (!f0) return;
 
         const { pBinance, pDelta, spread, baseline, adjustedEdge } = f0;
 
-        // Formula 1: Determine edge and side
         const f1 = this.calculateFormula1(adjustedEdge, pBinance);
         const { edgePct, side } = f1;
 
-        // Track peak edge - only log at 0.02%, 0.04%, 0.06%, 0.08%
         if (Math.abs(edgePct) > Math.abs(this.peakEdge)) {
             this.peakEdge = edgePct;
             this.peakEdgeTime = Date.now();
@@ -247,7 +208,6 @@ class MomentumSimpleStrategy {
             }
         }
 
-        // Periodic status logging (every 10s) - shows why no signal
         this._statusCount = (this._statusCount || 0) + 1;
         if (this._statusCount % 500 === 0) {
             const blocker = !side ? `edge ${edgePct.toFixed(4)}% < ${this.FEE * 100}% fee` : 'checking...';
@@ -255,26 +215,19 @@ class MomentumSimpleStrategy {
             this.logger.info(`[MomentumSimple] ${symbol} | Binance=${pBinance.toFixed(4)} Delta=${pDelta.toFixed(4)} | Edge=${edgePct.toFixed(4)}% | Peak=${this.peakEdge.toFixed(4)}% (${peakAge}) | Blocker: ${blocker}`);
         }
 
-        // Check cooldown
         const cooldownActive = Date.now() - data.lastSignalTime < this.COOLDOWN_MS;
 
-        // If no edge, return
-        if (!side) {
-            return;
-        }
+        if (!side) return;
 
-        // F1 PASSED - log it
         this.logger.info(`[MomentumSimple] ✅ F1 PASSED: ${symbol} ${side.toUpperCase()} edge=${edgePct.toFixed(4)}% (fee=${this.FEE * 100}%)`);
 
-        // Execute trade
         if (!data.signalActive && !cooldownActive) {
-            const signalId = Date.now();
             this.logger.info(`[MomentumSimple] 🎯 SIGNAL: ${symbol} ${side.toUpperCase()}`);
             this.logger.info(`  Formula 0: Spread=${(spread * 100).toFixed(4)}% | Baseline=${(baseline * 100).toFixed(4)}% | AdjEdge=${(adjustedEdge * 100).toFixed(4)}%`);
             this.logger.info(`  Formula 1: Edge=${edgePct.toFixed(4)}% > ${this.FEE * 100}% fee ✅`);
             this.logger.info(`  [EXEC] Binance=${pBinance.toFixed(4)} | Delta=${pDelta.toFixed(4)}`);
 
-            this.executeTrade(symbol, side, pDelta, signalId);
+            this.executeTrade(symbol, side, pDelta);
             data.signalActive = true;
             data.lastSignalTime = Date.now();
             this.stats.signals++;
@@ -285,7 +238,7 @@ class MomentumSimpleStrategy {
     // EXECUTION
     // =========================================================================
 
-    async executeTrade(symbol, side, price, signalId) {
+    async executeTrade(symbol, side, price) {
         const spec = this.specs[symbol];
         if (!spec) return;
 
@@ -298,16 +251,12 @@ class MomentumSimpleStrategy {
 
         this.logger.info(`[MomentumSimple] POSITION LOCK: ${symbol} = true`);
         this.bot.activePositions[symbol] = true;
-        this.lastTradeSignalId = signalId;
         this.lastTradeSide = side;
 
-        // Calculate bracket trail amount
-        // Delta Exchange sign convention: POSITIVE for buy, NEGATIVE for sell
-        // trail_amount is ABSOLUTE price (not percentage)
-        // XRPUSD tick_size = 0.0001 (minimum viable trail)
+        const trailAbs = price * this.TRAILING_STOP_PCT;
         const trailAmount = side === 'buy' 
-            ? this.TRAILING_STOP_AMOUNT
-            : `-${this.TRAILING_STOP_AMOUNT}`;
+            ? (-trailAbs).toFixed(spec.precision)
+            : trailAbs.toFixed(spec.precision);
         
         const payload = {
             product_id: spec.deltaId.toString(),
@@ -428,11 +377,30 @@ class MomentumSimpleStrategy {
     }
 
     // =========================================================================
-    // POSITION CHECK
+    // SAFETY: Position Check (every 3s)
     // =========================================================================
 
     startPositionCheck() {
-        // Periodic position sync (optional)
+        this.logger.info(`[MomentumSimple] Starting position check (every 3s)`);
+        setInterval(async () => {
+            try {
+                const positions = await this.bot.client.getPositions();
+                const openPositions = positions.result?.filter(p => parseFloat(p.size) !== 0) || [];
+
+                if (openPositions.length === 0 && Object.values(this.bot.activePositions).some(v => v)) {
+                    this.logger.info(`[MomentumSimple] 🔄 POSITION CLOSED detected via API - resetting locks`);
+                    Object.keys(this.bot.activePositions).forEach(symbol => {
+                        if (this.bot.activePositions[symbol]) {
+                            this.logger.info(`[MomentumSimple] Unlocking ${symbol}`);
+                            this.bot.activePositions[symbol] = false;
+                            this.assets[symbol].signalActive = false;
+                        }
+                    });
+                }
+            } catch (e) {
+                this.logger.error(`[MomentumSimple] Position check error: ${e.message}`);
+            }
+        }, 3000);
     }
 }
 
