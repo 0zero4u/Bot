@@ -19,13 +19,17 @@ class MonumentStrategy {
         this.logger = bot.logger;
 
         // --- CONFIGURATION ---
-        this.FEE = 0.0005;                    // Delta round-trip fee: 0.05% threshold
-        this.EMA_ALPHA = 0.02;                // EMA smoothing factor
-        this.LAG_RATIO_THRESHOLD = 0.50;      // Formula 3: Min remaining opportunity
-        this.COOLDOWN_MS = 30000;             // 30s cooldown between trades
-        this.TRAILING_STOP_PCT = 0.0002;      // 0.02% trailing stop
-        this.REQUIRE_FLOW_CONFIRMATION = false; // F2: disabled for testing
-        this.REQUIRE_MOVE_TRACKING = true;     // F3: keep enabled to debug
+        this.FEE = parseFloat(process.env.MONUMENT_FEE || '0.0005');
+        this.EMA_ALPHA = 0.02;
+        this.COOLDOWN_MS = 30000;
+        this.TRAILING_STOP_PCT = 0.0002;
+        this.REQUIRE_FLOW_CONFIRMATION = false;
+
+        // --- F3 v2: ABSORPTION RATIO ---
+        this.MAX_AGE_MS = parseInt(process.env.MONUMENT_MAX_AGE_MS || '500');
+        this.MIN_REMAINING_RATIO = 0.50;
+        this.MIN_LEADER_MOVE_PCT = 0.00005;
+        this.MAX_DATA_AGE_MS = parseInt(process.env.MONUMENT_MAX_DATA_AGE_MS || '10000');
 
         // --- ASSET SPECS ---
         this.specs = {
@@ -50,16 +54,26 @@ class MonumentStrategy {
                 bidSize: null,
                 askSize: null,
 
+                // Binance trade data (for F3 - more frequent updates)
+                binanceTradePrice: null,
+                lastBinanceTradeTime: null,
+
                 // Delta trade data
                 deltaPrice: null,
+                lastDeltaTradeTime: null,
+                lastLeaderUpdate: null,
+                lastDeltaUpdate: null,
 
                 // Formula 0: EMA baseline
                 emaBaseline: null,
                 spreadHistory: [],
 
-                // Formula 3: Move tracking
-                moveStartSpread: null,
-                edgeTriggeredAt: null,
+                // Formula 3: Absorption ratio (F3 v2)
+                leaderStart: null,
+                deltaStart: null,
+                signalSide: null,
+                signalId: null,
+                triggerTime: null,
 
                 // Trade state
                 lastSignalTime: 0,
@@ -79,8 +93,11 @@ class MonumentStrategy {
 
         this.stats = { signals: 0, binanceUpdates: 0, deltaTrades: 0 };
         this.pendingStopLoss = null;
+        this.lastTradeSignalId = null;
+        this.lastTradeAgeMs = null;
+        this.lastTradeEntryPrice = null;
 
-        this.logger.info(`[Monument] Initialized | Fee: ${this.FEE * 100}% | EMA α: ${this.EMA_ALPHA} | Lag Threshold: ${this.LAG_RATIO_THRESHOLD}`);
+        this.logger.info(`[Monument] Initialized | Fee: ${this.FEE * 100}% | EMA α: ${this.EMA_ALPHA} | MaxAge: ${this.MAX_AGE_MS}ms | MinRemaining: ${this.MIN_REMAINING_RATIO * 100}% | MinMove: ${this.MIN_LEADER_MOVE_PCT * 100}%`);
     }
 
     getName() { return "MonumentStrategy"; }
@@ -120,20 +137,17 @@ class MonumentStrategy {
         const symbol = update.s;
         if (!symbol) return;
 
-        // Map Binance symbol to our asset key
         const asset = Object.keys(this.assets).find(k => symbol.toUpperCase().includes(k));
         if (!asset) return;
 
         const data = this.assets[asset];
 
-        // Parse BookTicker fields (from Rust DepthUpdate struct)
         data.bidPrice = update.bb;
         data.askPrice = update.ba;
         data.bidSize = update.bq;
         data.askSize = update.aq;
 
         this.stats.binanceUpdates++;
-        this.checkSignal(asset);
     }
 
     /**
@@ -144,8 +158,12 @@ class MonumentStrategy {
         const asset = Object.keys(this.assets).find(k => symbol.toUpperCase().includes(k));
         if (!asset) return;
 
-        // If we don't have BookTicker, use trade price as both bid/ask
         const data = this.assets[asset];
+        
+        data.binanceTradePrice = parseFloat(update.p);
+        data.lastBinanceTradeTime = Date.now();
+        data.lastLeaderUpdate = Date.now();
+
         if (!data.bidPrice || !data.askPrice) {
             data.bidPrice = parseFloat(update.p);
             data.askPrice = parseFloat(update.p);
@@ -168,6 +186,8 @@ class MonumentStrategy {
 
         const data = this.assets[symbol];
         data.deltaPrice = parseFloat(trade.price);
+        data.lastDeltaTradeTime = Date.now();
+        data.lastDeltaUpdate = Date.now();
         this.stats.deltaTrades++;
         this.checkSignal(symbol);
     }
@@ -258,39 +278,123 @@ class MonumentStrategy {
     }
 
     // =========================================================================
-    // FORMULA 3: REMAINING OPPORTUNITY
+    // FORMULA 3: ABSORPTION RATIO (F3 v2)
     // =========================================================================
 
     /**
-     * When Formula 1 first triggers, store P_MoveStart = P_Binance
-     * MoveSize = |P_Binance - P_MoveStart|
-     * LagRatio = |AdjustedEdge| / MoveSize
+     * Measures how much Delta has absorbed of Binance's move.
+     * Directional version: rejects reversals.
      * 
-     * Trade if LagRatio > 0.50 (Delta hasn't absorbed > 50% of move)
+     * leaderMove = pLeader - leaderStart (BUY) or leaderStart - pLeader (SELL)
+     * deltaMove = pDelta - deltaStart (BUY) or deltaStart - pDelta (SELL)
+     * absorption = deltaMove / leaderMove
+     * remaining = 1 - absorption
+     * 
+     * Trade if remaining > MIN_REMAINING_RATIO AND age < MAX_AGE_MS
      */
-    calculateFormula3(symbol, pBinance, adjustedEdge) {
+    calculateFormula3(symbol, pLeader, pDelta, side) {
         const data = this.assets[symbol];
 
-        // Track SPREAD movement, not Binance price
-        // spread = pBinance - pDelta (but we use adjustedEdge which is already normalized)
-        if (data.moveStartSpread === null) {
-            data.moveStartSpread = adjustedEdge;
-            data.edgeTriggeredAt = Date.now();
-            this.logger.debug(`[F3] ${symbol} | Set moveStartSpread=${(adjustedEdge * 100).toFixed(4)}%`);
+        if (data.leaderStart === null) {
+            data.leaderStart = pLeader;
+            data.deltaStart = pDelta;
+            data.signalSide = side;
+            data.signalId = Date.now();
+            data.triggerTime = Date.now();
+            this.logger.info(`[F3] ${symbol} | 🎯 TRIGGER CAPTURED: leader=${pLeader.toFixed(6)} delta=${pDelta.toFixed(6)} side=${side}`);
+            return null;
         }
 
-        // How much has the spread changed since we first detected edge?
-        const spreadMove = Math.abs(adjustedEdge - data.moveStartSpread);
+        if (data.signalSide !== side) {
+            this.logger.info(`[F3] ${symbol} | ❌ DIRECTION FLIP: ${data.signalSide} → ${side} — resetting`);
+            this.resetF3State(symbol);
+            return null;
+        }
 
-        // Debug: show spread movement
-        this.logger.debug(`[F3] ${symbol} | adjEdge=${(adjustedEdge * 100).toFixed(4)}% moveStart=${(data.moveStartSpread * 100).toFixed(4)}% spreadMove=${(spreadMove * 100).toFixed(6)}% (need > 0.0001)`);
+        const ageMs = Date.now() - data.triggerTime;
+        if (ageMs > this.MAX_AGE_MS) {
+            this.logger.info(`[F3] ${symbol} | ⏰ STATE STALE: ${ageMs}ms > ${this.MAX_AGE_MS}ms — resetting`);
+            this.resetF3State(symbol);
+            return null;
+        }
 
-        // If spread hasn't moved enough, skip
-        if (spreadMove < 0.000001) return null;
+        if (ageMs < 10) {
+            return null;
+        }
 
-        const lagRatio = Math.abs(adjustedEdge) / spreadMove;
+        const now = Date.now();
+        const leaderDataAge = data.lastLeaderUpdate ? now - data.lastLeaderUpdate : Infinity;
+        const deltaDataAge = data.lastDeltaUpdate ? now - data.lastDeltaUpdate : Infinity;
 
-        return { moveSize: spreadMove, lagRatio, moveStartPrice: data.moveStartSpread };
+        if (leaderDataAge > this.MAX_DATA_AGE_MS) {
+            this.logger.info(`[F3] ${symbol} | ⏰ LEADER DATA STALE: ${leaderDataAge}ms > ${this.MAX_DATA_AGE_MS}ms`);
+            return null;
+        }
+
+        if (deltaDataAge > this.MAX_DATA_AGE_MS) {
+            this.logger.info(`[F3] ${symbol} | ⏰ DELTA DATA STALE: ${deltaDataAge}ms > ${this.MAX_DATA_AGE_MS}ms`);
+            return null;
+        }
+
+        let leaderMove, deltaMove;
+        if (side === 'buy') {
+            leaderMove = pLeader - data.leaderStart;
+            deltaMove = pDelta - data.deltaStart;
+        } else {
+            leaderMove = data.leaderStart - pLeader;
+            deltaMove = data.deltaStart - pDelta;
+        }
+
+        if (leaderMove !== 0 || deltaMove !== 0) {
+            this.logger.info(`[F3] ${symbol} | 📊 MOVEMENT: leaderNow=${pLeader.toFixed(6)} leaderStart=${data.leaderStart.toFixed(6)} leaderMove=${leaderMove.toFixed(6)} | deltaNow=${pDelta.toFixed(6)} deltaStart=${data.deltaStart.toFixed(6)} deltaMove=${deltaMove.toFixed(6)} | age=${ageMs}ms`);
+        }
+
+        if (leaderMove < 0 || deltaMove < 0) {
+            this.logger.info(`[F3] ${symbol} | ❌ REVERSAL: leaderMove=${leaderMove.toFixed(6)} deltaMove=${deltaMove.toFixed(6)}`);
+            return null;
+        }
+
+        const minLeaderMove = data.leaderStart * this.MIN_LEADER_MOVE_PCT;
+        if (leaderMove < minLeaderMove) {
+            if (!data._leaderSmallLogged) {
+                this.logger.info(`[F3] ${symbol} | ❌ LEADER TOO SMALL: ${leaderMove.toFixed(6)} < ${minLeaderMove.toFixed(6)} (${this.MIN_LEADER_MOVE_PCT * 100}% of ${data.leaderStart.toFixed(6)})`);
+                data._leaderSmallLogged = true;
+            }
+            return null;
+        }
+
+        const minDeltaMove = data.deltaStart * this.MIN_LEADER_MOVE_PCT;
+        if (deltaMove < minDeltaMove) {
+            this.logger.info(`[F3] ${symbol} | ❌ DELTA TOO SMALL: ${deltaMove.toFixed(6)} < ${minDeltaMove.toFixed(6)} (${this.MIN_LEADER_MOVE_PCT * 100}% of ${data.deltaStart.toFixed(6)})`);
+            return null;
+        }
+
+        const absorption = deltaMove / leaderMove;
+        const remaining = 1 - absorption;
+
+        if (!isFinite(absorption)) {
+            this.logger.warn(`[F3] ${symbol} | ❌ NON-FINITE: absorption=${absorption}`);
+            return null;
+        }
+
+        if (absorption > 1.0) {
+            this.logger.info(`[F3] ${symbol} | ❌ OVER-ABSORPTION: ${(absorption * 100).toFixed(2)}% > 100%`);
+            return null;
+        }
+
+        this.logger.info(`[F3] ${symbol} | ✅ PASSED: absorption=${(absorption * 100).toFixed(2)}% remaining=${(remaining * 100).toFixed(2)}% (need > ${(this.MIN_REMAINING_RATIO * 100).toFixed(0)}%)`);
+
+        return { absorption, remaining, leaderMove, deltaMove, ageMs, signalId: data.signalId };
+    }
+
+    resetF3State(symbol) {
+        const data = this.assets[symbol];
+        data.leaderStart = null;
+        data.deltaStart = null;
+        data.signalSide = null;
+        data.signalId = null;
+        data.triggerTime = null;
+        data._leaderSmallLogged = false;
     }
 
     // =========================================================================
@@ -340,55 +444,43 @@ class MonumentStrategy {
         // Check cooldown
         const cooldownActive = Date.now() - data.lastSignalTime < this.COOLDOWN_MS;
 
-        // If no edge, reset move tracking
+        // If no edge, reset F3 state (thesis died)
         if (!side) {
-            data.moveStartSpread = null;
-            data.edgeTriggeredAt = null;
+            // Edge distribution diagnostic: log what fee threshold would let this through
+            const absEdge = Math.abs(edgePct);
+            if (absEdge >= 0.001) {
+                const hypoBucket = Math.floor(absEdge * 1000) / 1000;
+                const prev = this._lastHypoLog?.[symbol] || 0;
+                if (hypoBucket > prev) {
+                    if (!this._lastHypoLog) this._lastHypoLog = {};
+                    this._lastHypoLog[symbol] = hypoBucket;
+                    this.logger.info(`[F1-HYPO] ${symbol} edge=${edgePct.toFixed(4)}% would pass FEE at ≤${hypoBucket.toFixed(3)}% (current=${(this.FEE*100).toFixed(3)}%)`);
+                }
+            }
+            this.resetF3State(symbol);
             return;
         }
 
         // F1 PASSED - log it
         this.logger.info(`[Monument] ✅ F1 PASSED: ${symbol} ${side.toUpperCase()} edge=${edgePct.toFixed(4)}% (fee=${this.FEE * 100}%)`);
 
-        // Formula 2: Chase safety filter
+        // Formula 2: Chase safety filter (disabled)
         const f2 = this.calculateFormula2(symbol);
         if (!f2) return;
 
-        const { midprice, microprice } = f2;
-
-        // Check microprice confirms direction
-        let flowConfirmed = true;
-        if (this.REQUIRE_FLOW_CONFIRMATION) {
-            if (side === 'buy') {
-                flowConfirmed = microprice > midprice;
-            } else {
-                flowConfirmed = microprice < midprice;
-            }
-        }
-
-        if (!flowConfirmed) {
-            this.logger.info(`[Monument] ${symbol} | Edge=${edgePct.toFixed(4)}% OK but F2 blocked: micro=${microprice.toFixed(4)} vs mid=${midprice.toFixed(4)}`);
-            data.moveStartSpread = null;
-            data.edgeTriggeredAt = null;
-            return;
-        }
-
-        // F2 passed - log
-        this.logger.debug(`[Monument] F2 passed: micro=${microprice.toFixed(4)} mid=${midprice.toFixed(4)}`);
-
-        // Formula 3: Remaining opportunity
-        const f3 = this.calculateFormula3(symbol, pBinance, adjustedEdge);
+        // Formula 3: Absorption ratio (F3 v2) - use real-time mid price
+        const leaderAge = data.lastBinanceTradeTime ? Date.now() - data.lastBinanceTradeTime : Infinity;
+        const pLeaderForF3 = leaderAge < 1000 ? data.binanceTradePrice : pBinance;
+        const f3 = this.calculateFormula3(symbol, pLeaderForF3, pDelta, side);
         if (!f3) {
-            this.logger.info(`[Monument] ${symbol} | F1+F2 OK but F3 null (moveSize too small)`);
+            this.logger.info(`[Monument] ${symbol} | F1 OK but F3 null (guard blocked)`);
             return;
         }
 
-        const { moveSize, lagRatio } = f3;
+        const { absorption, remaining, leaderMove, deltaMove, ageMs, signalId } = f3;
 
-        if (lagRatio <= this.LAG_RATIO_THRESHOLD) {
-            this.logger.info(`[Monument] ${symbol} | Edge OK, F2 OK, but F3 blocked: LagRatio=${lagRatio.toFixed(2)} <= ${this.LAG_RATIO_THRESHOLD}`);
-            data.moveStartSpread = null;
-            data.edgeTriggeredAt = null;
+        if (remaining <= this.MIN_REMAINING_RATIO) {
+            this.logger.info(`[Monument] ${symbol} | Edge OK but F3 blocked: remaining=${(remaining * 100).toFixed(2)}% <= ${(this.MIN_REMAINING_RATIO * 100).toFixed(0)}%`);
             return;
         }
 
@@ -397,11 +489,10 @@ class MonumentStrategy {
             this.logger.info(`[Monument] 🎯 SIGNAL: ${symbol} ${side.toUpperCase()}`);
             this.logger.info(`  Formula 0: Spread=${(spread * 100).toFixed(4)}% | Baseline=${(baseline * 100).toFixed(4)}% | AdjEdge=${(adjustedEdge * 100).toFixed(4)}%`);
             this.logger.info(`  Formula 1: Edge=${edgePct.toFixed(4)}% > ${this.FEE * 100}% fee ✅`);
-            this.logger.info(`  Formula 2: Microprice=${microprice.toFixed(4)} vs Midprice=${midprice.toFixed(4)} ${side === 'buy' ? '>' : '<'} ✅`);
-            this.logger.info(`  Formula 3: LagRatio=${lagRatio.toFixed(2)} > ${this.LAG_RATIO_THRESHOLD} ✅`);
-            this.logger.info(`  [EXEC] Binance=${pBinance.toFixed(4)} | Delta=${pDelta.toFixed(4)} | MoveSize=${moveSize.toFixed(4)}`);
+            this.logger.info(`  Formula 3: Absorption=${(absorption * 100).toFixed(2)}% | Remaining=${(remaining * 100).toFixed(2)}% > ${(this.MIN_REMAINING_RATIO * 100).toFixed(0)}% ✅`);
+            this.logger.info(`  [EXEC] Binance=${pBinance.toFixed(4)} | Delta=${pDelta.toFixed(4)} | leaderMove=${leaderMove.toFixed(6)} | deltaMove=${deltaMove.toFixed(6)} | age=${ageMs}ms`);
 
-            this.executeTrade(symbol, side, pDelta);
+            this.executeTrade(symbol, side, pDelta, signalId);
             data.signalActive = true;
             data.lastSignalTime = Date.now();
             this.stats.signals++;
@@ -412,7 +503,7 @@ class MonumentStrategy {
     // EXECUTION
     // =========================================================================
 
-    async executeTrade(symbol, side, price) {
+    async executeTrade(symbol, side, price, signalId) {
         const spec = this.specs[symbol];
         if (!spec) return;
 
@@ -422,9 +513,12 @@ class MonumentStrategy {
         }
 
         const data = this.assets[symbol];
+        const ageMs = Date.now() - data.triggerTime;
 
         this.logger.info(`[Monument] POSITION LOCK: ${symbol} = true`);
         this.bot.activePositions[symbol] = true;
+        this.lastTradeSignalId = signalId;
+        this.lastTradeAgeMs = ageMs;
 
         // Calculate bracket trail amount (negative for buy, positive for sell)
         const trailAbs = price * this.TRAILING_STOP_PCT;
@@ -492,12 +586,21 @@ class MonumentStrategy {
                 this.logger.info(`[Monument] 🛑 STOP TRIGGERED: ${symbol}`);
                 this.bot.activePositions[symbol] = false;
                 this.assets[symbol].signalActive = false;
+
+                // Log outcome for optimization
+                if (this.lastTradeSignalId) {
+                    this.logger.info(`[F3-OUTCOME] signalId=${this.lastTradeSignalId} ageAtEntry=${this.lastTradeAgeMs}ms entryPrice=${this.lastTradeEntryPrice || 'N/A'} reason=stop`);
+                    this.lastTradeSignalId = null;
+                    this.lastTradeAgeMs = null;
+                    this.lastTradeEntryPrice = null;
+                }
+
+                this.resetF3State(symbol);
             }
         }
     }
 
     onUserTrade(trade) {
-        // Bracket orders handle SL atomically - no separate stop placement needed
         if (trade.reason !== 'normal') return;
         if (!trade.client_order_id || !trade.client_order_id.startsWith('mon_')) return;
 
@@ -506,12 +609,24 @@ class MonumentStrategy {
         if (!symbol) return;
 
         this.logger.info(`[Monument] 🎯 FILL: ${symbol} @ ${trade.price}`);
+        this.lastTradeEntryPrice = parseFloat(trade.price);
     }
 
     onPositionClose(asset) {
         this.logger.info(`[Monument] POSITION CLOSED: ${asset} - resetting lock`);
         this.bot.activePositions[asset] = false;
         this.assets[asset].signalActive = false;
+
+        // Log outcome for optimization
+        if (this.lastTradeSignalId) {
+            this.logger.info(`[F3-OUTCOME] signalId=${this.lastTradeSignalId} ageAtEntry=${this.lastTradeAgeMs}ms entryPrice=${this.lastTradeEntryPrice || 'N/A'}`);
+            this.lastTradeSignalId = null;
+            this.lastTradeAgeMs = null;
+            this.lastTradeEntryPrice = null;
+        }
+
+        // Reset F3 state after position closes
+        this.resetF3State(asset);
     }
 
     // =========================================================================
@@ -532,6 +647,7 @@ class MonumentStrategy {
                             this.logger.info(`[Monument] Unlocking ${symbol}`);
                             this.bot.activePositions[symbol] = false;
                             this.assets[symbol].signalActive = false;
+                            this.resetF3State(symbol);
                         }
                     });
                 }
