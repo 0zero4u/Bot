@@ -80,6 +80,7 @@ class MomentumSimpleStrategy {
         this.TRADING_FEE = 0.0005;  // Actual round-trip fee: 0.05% (scalper offer: 0% closing fee)
         this.EMA_ALPHA = 0.02;
         this.COOLDOWN_MS = 30000;
+        this.EMA_WARMUP_POINTS = 20;  // Don't trade until EMA has converged
         
         // Delta Exchange bracket_trail_amount is ABSOLUTE price, NOT percentage
         // Sign convention: NEGATIVE for buy, POSITIVE for sell (verified via live API)
@@ -112,6 +113,7 @@ class MomentumSimpleStrategy {
                 deltaPrice: null,
                 lastDeltaTradeTime: null,
                 emaBaseline: null,
+                emaDataPoints: 0,
                 lastSignalTime: 0,
                 signalActive: false
             };
@@ -213,8 +215,10 @@ class MomentumSimpleStrategy {
 
         if (data.emaBaseline === null) {
             data.emaBaseline = spread;
+            data.emaDataPoints = 1;
         } else {
             data.emaBaseline = this.EMA_ALPHA * spread + (1 - this.EMA_ALPHA) * data.emaBaseline;
+            data.emaDataPoints++;
         }
 
         const adjustedEdge = spread - data.emaBaseline;
@@ -278,8 +282,9 @@ class MomentumSimpleStrategy {
         }
 
         const cooldownActive = Date.now() - data.lastSignalTime < this.COOLDOWN_MS;
+        const emaWarmedUp = data.emaDataPoints >= this.EMA_WARMUP_POINTS;
 
-        if (!side) return;
+        if (!side || !emaWarmedUp) return;
 
         this.logger.info(`[MomentumSimple] ✅ F1 PASSED: ${symbol} ${side.toUpperCase()} edge=${edgePct.toFixed(4)}% (fee=${this.FEE * 100}%)`);
 
